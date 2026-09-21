@@ -573,6 +573,32 @@ cargo check --workspace
 - 锚点 `#why-uda` / `#为什么需要-uda` 均落在无 emoji 的纯文本标题上，GitHub slug 行为可预期
 - `cargo metadata --no-deps` 对 5 个 crate 的 license 字段解析正常；`cargo check --workspace --all-targets --locked` 通过
 
+### 7.2.3 CI 修复：pe_exports.py 编码兼容（Windows runner 报错）
+
+**问题**：`windows-test` job 执行 `python scripts/pe_exports.py target/debug/uda_ffi.dll` 时报
+`UnicodeEncodeError: 'charmap' codec can't encode characters`。
+
+**根因**：脚本内所有 `print()` 与注释均为中文，而 GitHub Windows runner 默认控制台代码页为
+`cp1252`，无法编码 CJK 字符，首次打印即抛异常。该问题只在 Windows 侧暴露，Linux 侧
+`UTF-8` locale 下完全正常，因此本地验证时未能发现。
+
+**修复**（`scripts/pe_exports.py`，纯构建/测试脚本，不影响运行时）：
+1. 全部中文输出、注释、文档字符串改为等价英文 ASCII
+2. 文件顶部增加 `# -*- coding: utf-8 -*-` 声明
+3. 显式将 `sys.stdout` / `sys.stderr` `reconfigure(encoding="utf-8")`，并包在
+   `try/except (ValueError, OSError)` 内以兼容不支持 `reconfigure` 的解释器
+4. 顺带移除未使用的 `section_count` 变量（读取后仅用于间接推断，删除时一度遗留孤立的
+   `del` 语句导致 `UnboundLocalError`，已被脚本化验证捕获并修正）
+
+**验证**：
+- 非 ASCII 字节数 = 0，全文可通过 `cp1252` 编码
+- 正常调用：exit 0，输出 8 个 `uda_*` 符号
+- `PYTHONIOENCODING=cp1252` 模拟 Windows 控制台：**exit 0，8 个符号，无 UnicodeEncodeError**
+- 三条错误路径：无参 → exit 2；文件不存在 → exit 2；非 PE 文件 → exit 1，且均为英文诊断
+
+**版本号**：本次仅修正构建/测试脚本的字符编码，不触及任何运行时代码、crate 版本或公开 API，
+因此**不更新项目版本号**（仍为各 crate `version = "0.1.0"`）。
+
 ### 7.3 后续待办（Phase 2 及 Phase 1 遗留）
 - [ ] **CLI 跨平台化**：`crates/uda-cli/src/main.rs` 目前硬编码依赖 `uda_platform_linux`，需按 `cfg` 分流以支持 Windows 诊断
 - [ ] **FFI 通知导出**：`uda_send_notification` 尚未导出；需先解决 toast 在非打包进程下的 AppUserModelID 问题
