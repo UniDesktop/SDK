@@ -1,0 +1,16 @@
+{
+  "name": "uda-nodejs-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "UniDesktop API (UDA) C-ABI Node.js example using koffi",
+  "main": "demo.js",
+  "scripts": {
+    "start": "node demo.js"
+  },
+  "dependencies": {
+    "koffi": "^2.9.0"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "uda-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+uda-core = { path = "../uda-core" }
+uda-platform-linux = { path = "../uda-platform-linux" }
+tokio.workspace = true

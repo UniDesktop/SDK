@@ -1,0 +1,14 @@
+[package]
+name = "uda-platform-linux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+uda-core = { path = "../uda-core" }
+zbus = { version = "4.3", features = ["tokio"] }
+zvariant = "4.2"
+tokio.workspace = true
+thiserror.workspace = true
+log.workspace = true
+async-trait.workspace = true

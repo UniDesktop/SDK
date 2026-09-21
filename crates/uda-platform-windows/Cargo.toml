@@ -1,0 +1,27 @@
+[package]
+name = "uda-platform-windows"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+uda-core = { path = "../uda-core" }
+thiserror.workspace = true
+log.workspace = true
+async-trait.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    # `RegCreateKeyExW` and the `HKEY` type live behind this feature in the
+    # `windows` crate; `RegOpenKeyExW`/`RegSetValueExW` do not, but keeping the
+    # whole registry surface behind one feature avoids a split import list.
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "UI_Notifications",
+    "Data_Xml_Dom",
+]

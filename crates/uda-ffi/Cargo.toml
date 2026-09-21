@@ -1,0 +1,24 @@
+[package]
+name = "uda-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C-ABI export layer for the UniDesktop API (UDA)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+# `cdylib` produces the loadable shared library (`libuda_ffi.so` /
+# `uda_ffi.dll`); `rlib` keeps the crate usable from Rust tests and binaries.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+uda-core = { path = "../uda-core" }
+log.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+uda-platform-linux = { path = "../uda-platform-linux" }
+tokio.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+uda-platform-windows = { path = "../uda-platform-windows" }
+tokio.workspace = true

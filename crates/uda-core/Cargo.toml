@@ -1,0 +1,11 @@
+[package]
+name = "uda-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+bitflags.workspace = true
+async-trait.workspace = true
