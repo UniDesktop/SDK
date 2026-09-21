@@ -25,14 +25,41 @@ import pathlib
 import struct
 import sys
 
-#: Force UTF-8 output so that a non-ASCII path echoed by the caller cannot trip
-#: the console code page (for example ``cp1252`` on Windows).
-for _stream in (sys.stdout, sys.stderr):
-    if hasattr(_stream, "reconfigure"):
+#: Force UTF-8 output with a ``replace`` fallback so that a non-ASCII path echoed
+#: by the caller cannot trip the console code page (for example ``cp1252`` on the
+#: GitHub Windows runner). ``errors="replace"`` guarantees the encode step never
+#: raises, so a diagnostic can never abort a CI step.
+for _stream_name in ("stdout", "stderr"):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is None:
+        continue
+    _reconfigure = getattr(_stream, "reconfigure", None)
+    if _reconfigure is not None:
         try:
-            _stream.reconfigure(encoding="utf-8")
-        except (ValueError, OSError):  # pragma: no cover - hostile console
+            _reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError, LookupError):  # pragma: no cover - hostile console
             pass
+        continue
+    # Replaced / legacy stream (some IDEs and harnesses swap stdout). Re-wrap the
+    # underlying buffer so UTF-8 text still reaches the terminal.
+    _buffer = getattr(_stream, "buffer", None)
+    if _buffer is None:
+        continue
+    try:
+        import io
+
+        setattr(
+            sys,
+            _stream_name,
+            io.TextIOWrapper(
+                _buffer,
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=getattr(_stream, "line_buffering", False),
+            ),
+        )
+    except (ValueError, OSError):  # pragma: no cover - hostile console
+        pass
 
 #: Offset of the data-directory table inside a PE32+ optional header (magic 0x20B).
 _PE32_PLUS_DATA_DIRECTORY_OFFSET = 112

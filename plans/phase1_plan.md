@@ -599,6 +599,66 @@ cargo check --workspace
 **版本号**：本次仅修正构建/测试脚本的字符编码，不触及任何运行时代码、crate 版本或公开 API，
 因此**不更新项目版本号**（仍为各 crate `version = "0.1.0"`）。
 
+### 7.2.4 CI 编码兼容系统性修复：examples/python 全景加固
+
+**问题**：§7.2.3 只修了 `scripts/pe_exports.py`，但同样的隐患仍存在于 `examples/python/`
+下的两个脚本——`windows-test` job 运行 `python examples/python/demo.py` 时会再次触发
+`UnicodeEncodeError`。上一轮修复只覆盖了"我们自己的脚本"，没有覆盖"示例代码"，CI 依然会红。
+
+**系统排查结果**（`git ls-files '*.py'` 全量扫描）：
+
+| 文件 | 非 ASCII 行数 | 是否直接 print | 结论 |
+|---|---|---|---|
+| `examples/python/demo.py` | 27 | 是（9 处） | **必须修**：向 stdout 打印中文 |
+| `examples/python/uda.py` | 90 | 否 | **必须修**：异常消息含中文，由调用方打印；导入即建立护栏 |
+| `scripts/pe_exports.py` | 0 | 是（已英文化） | 上一轮已修，本轮补齐护栏 |
+
+**根因**：`demo.py` 的中文输出在 `cp1252` 控制台下于第一行 `print("=== UDA Python 演示 ===")`
+即崩溃。已在 Linux 用 `PYTHONIOENCODING=cp1252` 复现同一栈帧（`demo.py:75` →
+`encodings/cp1252.py:19` → `charmap_encode`），确认与 Windows runner 完全同类。Linux 侧
+`UTF-8` locale 掩盖问题，故此前本地验证全部通过。
+
+**修复内容**：
+
+1. **新建 [`examples/python/_encoding.py`](../examples/python/_encoding.py)** —— 跨平台输出护栏：
+   - `force_utf8_output(errors="replace")`：优先 `reconfigure(encoding="utf-8", errors="replace")`；
+     若流无 `reconfigure`（被 IDE/测试框架替换）则用 `io.TextIOWrapper` 重新包装 `stream.buffer`；
+     连 `buffer` 都没有则静默跳过。三级降级，任何情况下都不抛异常。
+   - `console_supports_unicode()`：优先读 `PYTHONIOENCODING`，其次 `sys.stdout.encoding`；
+     判定为受限代码页时供上层回退文案。
+   - `detect_language(default="zh-CN")`：读 `UDA_LANG` > `LANGUAGE` > `LC_ALL` > `LC_MESSAGES`
+     > `LANG`，返回 `"en"` 或 `"zh-CN"`。
+2. **[`examples/python/demo.py`](../examples/python/demo.py)**：在任何可能产出输出的语句之前调用
+   `force_utf8_output()`；全部 9 处输出改为 `_text(zh, en)` 双语文案，按探测结果切换。
+3. **[`examples/python/uda.py`](../examples/python/uda.py)**：导入时即建立护栏，使库级用户
+   （`from uda import Uda`）无需自行处理编码。
+4. **[`scripts/pe_exports.py`](../scripts/pe_exports.py)**：护栏升级为与 `_encoding.py` 相同的三级
+   降级逻辑，并显式 `errors="replace"`，保证编码步骤永不抛异常。
+5. **[`.github/workflows/ci.yml`](../.github/workflows/ci.yml)**：所有 4 处 Python 步骤统一注入
+   `PYTHONIOENCODING: utf-8` + `PYTHONUTF8: "1"`，使子进程同样处于 UTF-8 模式；并新增
+   `Run Python example in English fallback mode` 步骤（`UDA_LANG: en`）守护语言回退路径——即使编码
+   护栏未来回归，该步骤也能立即发现问题。
+
+**验证结果**（32/32 PASS）：
+
+| 验证项 | 命令 | 结果 |
+|---|---|---|
+| 编码矩阵（7 场景） | `PYTHONIOENCODING ∈ {cp1252, ascii, utf-8}` × `LANG/UDA_LANG ∈ {zh, en}` 交叉运行 `demo.py` | 7/7 exit 0，无 `UnicodeEncodeError` |
+| CI 真实调用（5 处） | 解析 YAML，按各 step 的 `env` 逐条执行 | 5/5 exit 0，无 Traceback |
+| 护栏单元测试 | `_encoding.py` 20 项断言（含幂等、`reconfigure` 抛错、无 `reconfigure`、无 `buffer` 死流） | 20/20 PASS |
+| PE 符号完整性 | `pe_exports.py` 解析真实 32MB 交叉编译 DLL | 8/8 符号齐全，输出 0 非 ASCII |
+| Rust 回归 | `cargo fmt --check` / `clippy -D warnings` / `check --locked` / `test --workspace` | 全绿，73 passed / 0 failed |
+| 工作流合法性 | `yaml.safe_load` + 非 ASCII 审计 | 5 jobs 解析成功，0 非 ASCII 行 |
+
+**版本号**：本次改动仅涉及 `examples/` 示例脚本、构建/测试脚本与 CI 配置，未触及任何
+crate 源码、依赖或公开 API，因此**不更新项目版本号**（仍为各 crate `version = "0.1.0"`）。
+
+**顺带清理**：`examples/python/__pycache__/uda.cpython-312.pyc` 是在 §7.2.3 给
+`.gitignore` 添加 `__pycache__/` **之前**就被提交进仓库的，`.gitignore` 对已跟踪文件无效，
+因此每次运行示例都会让该 `.pyc` 产生 diff、污染 `git status`。本轮用
+`git rm --cached -r examples/python/__pycache__` 将其从索引移除，此后改由
+`.gitignore` 接管。
+
 ### 7.3 后续待办（Phase 2 及 Phase 1 遗留）
 - [ ] **CLI 跨平台化**：`crates/uda-cli/src/main.rs` 目前硬编码依赖 `uda_platform_linux`，需按 `cfg` 分流以支持 Windows 诊断
 - [ ] **FFI 通知导出**：`uda_send_notification` 尚未导出；需先解决 toast 在非打包进程下的 AppUserModelID 问题

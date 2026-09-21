@@ -35,6 +35,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Final
 
+# Windows 控制台默认代码页（cp1252 等）编码不了中文，因此这里尽早把标准输出
+# 切到 UTF-8；`_encoding` 与 `uda` 同目录，直接按模块导入。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _encoding import force_utf8_output  # noqa: E402
+
+force_utf8_output()
+
 __all__ = ["Uda", "UdaError", "Theme", "FillMode", "WakeLockType"]
 
 # --------------------------------------------------------------------------

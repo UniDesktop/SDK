@@ -111,6 +111,12 @@ jobs:
         run: cargo build --locked -p uda-ffi
 
       - name: Run Python example against the freshly built library
+        env:
+          # Ubuntu runners are UTF-8 already; setting it explicitly keeps the
+          # behaviour identical to the Windows job and catches regressions where
+          # a script forgets to install the UTF-8 guard itself.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: python3 examples/python/demo.py
 
       - name: Upload FFI artifacts
@@ -158,6 +164,12 @@ jobs:
 
       - name: Verify the DLL exports the documented ABI symbols
         shell: bash
+        env:
+          # The Windows console defaults to cp1252, which cannot encode CJK text
+          # and raises UnicodeEncodeError. The scripts install their own UTF-8
+          # guard; these variables force UTF-8 for any child process too.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: python scripts/pe_exports.py target/debug/uda_ffi.dll
 
       - name: Run Python example against the freshly built DLL
@@ -166,6 +178,21 @@ jobs:
           # Forward slashes keep the path unambiguous for `ctypes.CDLL` and for
           # bash; Windows accepts them everywhere in filesystem paths.
           UDA_LIBRARY: ${{ github.workspace }}/target/debug/uda_ffi.dll
+          # See the note above: keep Python in UTF-8 mode under the cp1252 console.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: python examples/python/demo.py
+
+      - name: Run Python example in English fallback mode
+        shell: bash
+        env:
+          UDA_LIBRARY: ${{ github.workspace }}/target/debug/uda_ffi.dll
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+          # Simulates a non-CJK console: the demo must fall back to English text
+          # instead of emitting mojibake or crashing. Guards the language
+          # fallback path that shields us if the encoding guard ever regresses.
+          UDA_LANG: en
         run: python examples/python/demo.py
 
       - name: Upload FFI artifacts
@@ -227,6 +254,11 @@ jobs:
           fi
 
       - name: Verify exported ABI symbols (Windows)
+        env:
+          # Parsing a cross-built PE file must not depend on the console locale;
+          # keep Python in UTF-8 mode regardless of the runner's code page.
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: python3 scripts/pe_exports.py target/x86_64-pc-windows-gnu/release/uda_ffi.dll
 
       - name: Package release archives
