@@ -72,22 +72,24 @@ Before writing any platform-specific logic, consult the specifications stored in
 
 ## 4. Phased Roadmap & Deliverables
 
-You must implement features incrementally according to this roadmap. **Do not begin a new phase until all tests in the current phase pass.**
+### Phase 1: MVP Core Foundation (v0.1.0 RELEASED) [COMPLETED]
+- [x] **Core Types & Traits:** Error model, `Capability`, `SupportLevel`, `Theme`, `WallpaperOptions`.
+- [x] **Appearance Module:** Detect & listen to Dark/Light theme, Accent color (Portal + Registry).
+- [x] **Wallpaper Module:** Set & get wallpaper with FillMode (GNOME, KDE, Hyprland, Sway, X11, Win32).
+- [x] **Notification Module:** Native notifications with actions, urgency, and timeout.
+- [x] **WakeLock Module:** Prevent display/system sleep (Inhibit portal, ScreenSaver, Win32).
+- [x] **C-ABI & FFI:** `crates/uda-ffi` + Python & Node.js examples + CI/CD all green.
 
-### Phase 1: MVP Core Foundation & High-Frequency Appearance
-- [ ] **Core Types:** `DesktopTheme`, `ColorMode` (Dark/Light), `WallpaperOptions`, `CapabilityMatrix`.
-- [ ] **Appearance Module:** Detect and listen to system dark/light mode and accent colors.
-- [ ] **Wallpaper Module:** Set static wallpaper (support multi-monitor, fit modes, and dark/light pairing).
-- [ ] **Notification Module:** Send native notifications with title, body, action buttons, and progress.
-- [ ] **WakeLock Module:** Prevent display/system sleep (Inhibit portal + Win32 `SetThreadExecutionState`).
-- [ ] **System Tray Module:** Unified StatusNotifierItem and Win32 NotifyIcon.
-
-### Phase 2: Media, Hardware & Data Pipelines
-- [ ] **Media Control:** MPRIS v2 (Linux) + SMTC (Windows) playback & metadata listener.
-- [ ] **Unified Clipboard:** Multi-format MIME clipboard reader/writer and change listener.
-- [ ] **Audio Control:** Master volume, mute, and default endpoint switching (PipeWire + WASAPI).
-- [ ] **Display Brightness:** ACPI backlight & DDC/CI external monitor controls.
-- [ ] **Session Lifecycle:** Sleep, Reboot, Shutdown, Lock screen, and Graceful Shutdown Hooks.
+### Phase 2: Interactive Shell & System Integration (v0.2.0 TARGET) [IN PROGRESS]
+- [ ] **System Tray Module (Priority #1):**
+  - Cross-platform menu model: Text items, Checkboxes, Separators, Submenus, Disabled states.
+  - Linux: `org.kde.StatusNotifierItem` (SNI) via D-Bus + `com.canonical.dbusmenu`.
+  - Windows: `Shell_NotifyIconW` + internal hidden worker thread for message pump.
+  - Non-blocking: Tray must run on internal worker threads, never hijacking the host's event loop.
+  - Lifecycle: `TrayIcon` implements `Drop` to automatically remove icon on shutdown.
+- [ ] **Media Playback Controls (MPRIS v2 + SMTC):** Dual-way media status listener and player control.
+- [ ] **Global Shortcuts:** Register global key combinations across Portal, X11, and Win32.
+- [ ] **Clipboard Enhancements:** Multi-format MIME clipboard listener.
 
 ### Phase 3: Shell Extensions & Window Topology
 - [ ] **Display Topology:** Screen geometry, HiDPI scale factor, refresh rate, hotplug events (`QScreen` parity).
@@ -114,10 +116,10 @@ You must implement features incrementally according to this roadmap. **Do not be
 Every code change must be strictly verified. You must never claim a task is complete without running and passing verification scripts.
 
 ### Test Execution Command
-Run this script from the workspace root:
-```bash
-./scripts/test-linux-mock.sh
-```
+Every code change must pass:
+1. `cargo check --workspace --all-targets`
+2. `./scripts/test-linux-mock.sh`
+3. `cargo test -p uda-ffi`
 
 ### Verification Criteria
 1. **Compilation Check:** `cargo check --workspace` must pass with zero warnings/errors.

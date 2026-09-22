@@ -17,6 +17,11 @@
 
 ---
 
+> [!WARNING]
+> **🚧 Active Development Branch (`develop`) **
+> 
+> You are viewing the **unstable development branch** for upcoming **v0.2.0**. Code here is actively undergoing experimental integration (System Tray, DBusMenu, Win32 Message Loops) and APIs may break without notice. For the battle-tested stable release, please switch to the [`main`](https://github.com/UniDesktop/SDK/tree/main) branch or check the [latest release (v0.1.0)](https://github.com/UniDesktop/SDK/releases).
+
 ## Why UDA?
 
 Building a cross-platform desktop application today means writing the same feature five times: `SystemParametersInfoW` on Windows, then `gsettings`, `qdbus`, `swww`, and `hyprpaper` on Linux — each with its own failure modes, session assumptions, and no shared type system. UDA replaces that fragmentation with one capability-driven Rust API that probes the environment, picks the working backend, and degrades gracefully instead of crashing.

@@ -13,6 +13,8 @@
 //! - [`wakelock`]: display/system sleep inhibition via `SetThreadExecutionState`.
 //! - [`detection`]: OS release detection via `RtlGetVersion`.
 //! - [`notification`]: native toasts via the WinRT `ToastNotificationManager`.
+//! - [`tray`]: system tray icons via `Shell_NotifyIconW` on a hidden message-only
+//!   window driven by a dedicated worker thread.
 //!
 //! # Fallback tiers
 //!
@@ -36,5 +38,6 @@
 pub mod appearance;
 pub mod detection;
 pub mod notification;
+pub mod tray;
 pub mod wakelock;
 pub mod wallpaper;

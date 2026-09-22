@@ -24,4 +24,13 @@ features = [
     "Win32_System_SystemInformation",
     "UI_Notifications",
     "Data_Xml_Dom",
+    # The tray backend needs three more modules:
+    # * `Win32_UI_Shell` for `Shell_NotifyIconW` and `NOTIFYICONDATAW`.
+    # * `Win32_System_LibraryLoader` for `GetModuleHandleW`.
+    # * `Win32_Graphics_Gdi` for `CreateDIBSection`/`CreateBitmap`/`DeleteObject`
+    #   and for `CreateIconIndirect` + `ICONINFO`, which the `windows` crate
+    #   exports from `WindowsAndMessaging` but gates on GDI.
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
 ]

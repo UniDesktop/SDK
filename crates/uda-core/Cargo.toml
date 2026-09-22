@@ -9,3 +9,4 @@ thiserror.workspace = true
 serde.workspace = true
 bitflags.workspace = true
 async-trait.workspace = true
+log.workspace = true

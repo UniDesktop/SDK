@@ -16,6 +16,11 @@
 
 ---
 
+> [!WARNING]
+> **🚧 正在积极开发的前沿分支 (`develop`)**
+> 
+> 您当前浏览的是正在筹备 **v0.2.0** 的**前沿开发分支**。此分支代码正处于高频实验性开发期（系统托盘、DBusMenu、Win32 消息循环），API 可能会随时发生不兼容变动。如需使用经过全面测试的生产稳定版，请切换至 [`main`](https://github.com/UniDesktop/SDK/tree/main) 稳定分支或查看 [v0.1.0 正式发布版](https://github.com/UniDesktop/SDK/releases)。
+
 ## 为什么需要 UDA？
 
 如今开发跨平台桌面应用，同一个功能往往要写五遍：Windows 上用 `SystemParametersInfoW`，Linux 上则是 `gsettings`、`qdbus`、`swww`、`hyprpaper` 各写一套——失败模式各异、会话假设不同，也没有统一的类型系统。UDA 用一套能力驱动（capability-driven）的 Rust API 取代这种碎片化：探测运行环境、选择可用后端、优雅降级，而不是直接崩溃。

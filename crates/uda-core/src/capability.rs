@@ -12,6 +12,22 @@ impl CapabilityMatrix {
     pub const FOLLOW_SYSTEM_THEME: u32 = 1 << 4;
     pub const SEND_NOTIFICATION: u32 = 1 << 5;
     pub const WAKE_LOCK: u32 = 1 << 6;
+    /// Backend can host at least one system tray (StatusNotifierItem / NotifyIcon).
+    pub const SYSTEM_TRAY: u32 = 1 << 7;
+    /// Tray icon can be shown, hidden, and swapped at runtime.
+    pub const TRAY_ICON: u32 = 1 << 8;
+    /// Tray exposes hover text.
+    pub const TRAY_TOOLTIP: u32 = 1 << 9;
+    /// Tray reports a single primary click.
+    pub const TRAY_CLICK: u32 = 1 << 10;
+    /// Tray reports a native double click (never true on Linux SNI).
+    pub const TRAY_DOUBLE_CLICK: u32 = 1 << 11;
+    /// Tray exposes a context menu.
+    pub const TRAY_CONTEXT_MENU: u32 = 1 << 12;
+    /// Menu rows can render a checkbox state.
+    pub const TRAY_CHECKBOX: u32 = 1 << 13;
+    /// Menu rows can be added, removed, or relabelled at runtime.
+    pub const TRAY_DYNAMIC_MENU: u32 = 1 << 14;
 }
 
 bitflags! {
@@ -24,6 +40,14 @@ bitflags! {
         const FOLLOW_SYSTEM_THEME = CapabilityMatrix::FOLLOW_SYSTEM_THEME;
         const SEND_NOTIFICATION = CapabilityMatrix::SEND_NOTIFICATION;
         const WAKE_LOCK = CapabilityMatrix::WAKE_LOCK;
+        const SYSTEM_TRAY = CapabilityMatrix::SYSTEM_TRAY;
+        const TRAY_ICON = CapabilityMatrix::TRAY_ICON;
+        const TRAY_TOOLTIP = CapabilityMatrix::TRAY_TOOLTIP;
+        const TRAY_CLICK = CapabilityMatrix::TRAY_CLICK;
+        const TRAY_DOUBLE_CLICK = CapabilityMatrix::TRAY_DOUBLE_CLICK;
+        const TRAY_CONTEXT_MENU = CapabilityMatrix::TRAY_CONTEXT_MENU;
+        const TRAY_CHECKBOX = CapabilityMatrix::TRAY_CHECKBOX;
+        const TRAY_DYNAMIC_MENU = CapabilityMatrix::TRAY_DYNAMIC_MENU;
     }
 }
 

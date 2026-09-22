@@ -19,6 +19,9 @@ __pycache__/
 
 # rustc will dump stack traces when hitting an internal compiler error to PWD
 rustc-ice-*.txt
+.tmp
+
+plans
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
