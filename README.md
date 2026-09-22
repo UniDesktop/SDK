@@ -18,7 +18,7 @@
 ---
 
 > [!WARNING]
-> **🚧 Active Development Branch (`develop`) **
+> 🚧 **Active Development Branch (`develop`)**
 > 
 > You are viewing the **unstable development branch** for upcoming **v0.2.0**. Code here is actively undergoing experimental integration (System Tray, DBusMenu, Win32 Message Loops) and APIs may break without notice. For the battle-tested stable release, please switch to the [`main`](https://github.com/UniDesktop/SDK/tree/main) branch or check the [latest release (v0.1.0)](https://github.com/UniDesktop/SDK/releases).
 
