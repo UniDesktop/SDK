@@ -25,6 +25,7 @@ use std::process::Command;
 use uda_core::appearance::AppearanceManager;
 use uda_core::capability::Theme;
 use uda_core::error::UdaError;
+use uda_core::tray::{TrayIcon, TrayIconConfig};
 use uda_core::wakelock::WakeLockType;
 use uda_core::wallpaper::{FillMode, WallpaperManager, WallpaperOptions};
 
@@ -173,6 +174,33 @@ pub(crate) fn acquire_wakelock(
 /// Release a wake lock previously obtained from [`acquire_wakelock`].
 pub(crate) fn release_wakelock(handle: WakeLockHandle) -> Result<(), Failure> {
     crate::wakelocks::release(handle)
+}
+
+/// Register a tray icon through the platform backend.
+///
+/// The manager is a zero-sized unit struct on both platforms, so constructing
+/// one per call is free; `create` is what opens the D-Bus connection (Linux) or
+/// spawns the worker thread (Windows), exactly once per icon.
+pub(crate) fn create_tray(config: TrayIconConfig) -> Result<TrayIcon, Failure> {
+    use uda_core::tray::TrayManager as _;
+
+    #[cfg(target_os = "linux")]
+    {
+        Ok(uda_platform_linux::tray::LinuxTrayManager::new().create(config)?)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(uda_platform_windows::tray::WindowsTrayManager::new().create(config)?)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        let _ = config;
+        Err(Failure::Uda(UdaError::NotSupported(
+            "no tray backend for this target".to_string(),
+        )))
+    }
 }
 
 /// Return a platform appearance manager.

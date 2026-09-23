@@ -1,5 +1,7 @@
 //! UniDesktop API (UDA) C-ABI export layer.
 //!
+//! See [`tray`] for the system-tray surface, which is the newest addition.
+//!
 //! This crate builds the shared library that every non-Rust language links
 //! against: `libuda_ffi.so` on Linux, `uda_ffi.dll` on Windows. The matching C
 //! header lives at [`include/uda.h`](../../include/uda.h) and the ready-made
@@ -49,10 +51,11 @@
 
 mod dispatch;
 mod error;
+mod tray;
 mod util;
 mod wakelocks;
 
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 
 pub use error::{status_message, UdaStatus};
 
@@ -303,6 +306,316 @@ pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
         cache.insert(status, pointer);
         pointer
     })
+}
+
+// ---------------------------------------------------------------------------
+// System tray
+// ---------------------------------------------------------------------------
+
+/// Ownership of the tray surface.
+///
+/// The C caller cannot hold an `Arc`, so every tray icon and every context menu
+/// lives in a process-wide table keyed by an opaque `uint64_t`. Two independent
+/// handle spaces are *not* used - one table with a per-entry kind, so a mistake
+/// is diagnosed ("handle 3 is a menu, not a tray icon") instead of accidentally
+/// resolving to the wrong record.
+///
+/// The invariants the exports below uphold:
+///
+/// * Handles start at `1`; `0` means "no handle" and every entry point rejects it
+///   without touching a pointer.
+/// * A handle is single-use: destroying it removes the entry, and a second
+///   destroy of the same value is `UDA_ERR_INVALID_ARGUMENT` rather than a
+///   silent no-op, so a host cannot "double-release" a shell resource.
+/// * A menu may be attached to an icon and then destroyed; the icon keeps its
+///   own `Arc`, so the tray does not lose its rows.
+
+/// Create a tray icon.
+///
+/// `name` is the application name used for registration (the D-Bus bus name on
+/// Linux, the window class on Windows). `tooltip` may be an empty string; text
+/// longer than 127 `char`s is clamped, and the call still succeeds.
+///
+/// On success `*out_handle` receives a non-zero handle for every other
+/// `uda_tray_*` call. On failure it is left untouched.
+///
+/// # Safety
+///
+/// `out_handle` must be a valid, writable, non-null `uint64_t` slot.
+/// `name` and `tooltip` must be readable, null-terminated UTF-8 strings; a null
+/// `tooltip` is treated as the empty string, a null `name` as the library
+/// default name.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_create(
+    name: *const c_char,
+    tooltip: *const c_char,
+    out_handle: *mut u64,
+) -> c_int {
+    if out_handle.is_null() {
+        util::set_last_message("`out_handle` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: `out_handle` was validated non-null above and the caller
+        // guarantees a writable `uint64_t` there. The two strings are converted
+        // with the null-terminating, UTF-8-checking helper, so the conversion
+        // cannot read past the caller's buffers.
+        let (name, tooltip) = unsafe {
+            // `owned_string_from` rejects null, which is the behaviour wanted
+            // for `name`; `tooltip` is explicitly optional, so it is defaulted
+            // here instead of being rejected.
+            let tooltip = if tooltip.is_null() {
+                String::new()
+            } else {
+                util::owned_string_from(tooltip, "tooltip")?
+            };
+            let name = if name.is_null() {
+                String::new()
+            } else {
+                util::owned_string_from(name, "name")?
+            };
+            (name, tooltip)
+        };
+
+        let handle = tray::create_icon(&name, &tooltip)?;
+        // SAFETY: the slot was validated non-null and is writable.
+        unsafe { *out_handle = handle };
+        Ok(())
+    })
+}
+
+/// Replace a tray icon's tooltip.
+///
+/// # Safety
+///
+/// `tooltip` must be a readable, null-terminated UTF-8 string, or null for the
+/// empty string.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_set_tooltip(handle: u64, tooltip: *const c_char) -> c_int {
+    util::catch_boundary(|| {
+        let tooltip = owned_or_empty(tooltip, "tooltip")?;
+        tray::set_tooltip(handle, &tooltip)
+    })
+}
+
+/// Replace a tray icon's image from a filesystem path or icon-theme name.
+///
+/// On Linux the value is also accepted as a freedesktop icon-theme name, which
+/// is what a themed application wants; on Windows it must be a file path
+/// (`.ico`, `.png`, `.bmp`).
+///
+/// # Safety
+///
+/// `path` must be a readable, null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_set_icon_path(handle: u64, path: *const c_char) -> c_int {
+    if path.is_null() {
+        util::set_last_message("`path` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: null was rejected above; the conversion walks to the
+        // terminator and rejects invalid UTF-8 instead of over-reading.
+        let path = unsafe { util::owned_string_from(path, "path") }?;
+        tray::set_icon_path(handle, &path)
+    })
+}
+
+/// Replace a tray icon's image from raw RGBA pixels.
+///
+/// The buffer is **borrowed**: only `stride * height` bytes are copied, and the
+/// caller keeps ownership of `data`. Pixels are top-down, four bytes per pixel
+/// (red, green, blue, alpha).
+///
+/// # Safety
+///
+/// `data` must be null or point to `len` readable bytes. Anything short of
+/// `stride * height` is rejected with `UDA_ERR_INVALID_ARGUMENT` before a pixel
+/// is read.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_set_icon_rgba(
+    handle: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    if data.is_null() {
+        util::set_last_message("`data` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        tray::set_icon_rgba(handle, width, height, stride, data, len)
+    })
+}
+
+/// Show or hide the icon without unregistering it.
+///
+/// `visible` is a C boolean: `0` hides, any other value shows.
+#[no_mangle]
+pub extern "C" fn uda_tray_set_visible(handle: u64, visible: c_int) -> c_int {
+    util::catch_boundary(|| tray::set_visible(handle, visible != 0))
+}
+
+/// Destroy a tray icon and unregister it from the shell.
+///
+/// Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live icon in this
+/// process. Destroying is terminal: the handle cannot be reused.
+#[no_mangle]
+pub extern "C" fn uda_tray_destroy(handle: u64) -> c_int {
+    util::catch_boundary(|| tray::destroy_icon(handle))
+}
+
+/// Create an empty context menu.
+///
+/// On success `*out_menu_handle` receives a non-zero handle for
+/// `uda_tray_menu_add_*` and `uda_tray_set_menu`.
+///
+/// # Safety
+///
+/// `out_menu_handle` must be a valid, writable, non-null `uint64_t` slot.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_int {
+    if out_menu_handle.is_null() {
+        util::set_last_message("`out_menu_handle` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let handle = tray::create_menu()?;
+        // SAFETY: validated non-null above, and the caller guarantees a
+        // writable `uint64_t` at that address.
+        unsafe { *out_menu_handle = handle };
+        Ok(())
+    })
+}
+
+/// Append a plain text row to a menu.
+///
+/// `callback` is invoked on the **tray worker thread** when the row is
+/// activated. Passing `None` (null) is legal: the row toggles silently, which is
+/// what a host using a polling model wants. `user_data` is handed back to the
+/// callback untouched and is never dereferenced by UDA.
+///
+/// On success `*out_item_id` receives the row's stable, non-zero id, which the
+/// callback also receives so a host does not need its own table.
+///
+/// # Safety
+///
+/// `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
+/// must be a readable, null-terminated UTF-8 string; a blank label is rejected
+/// with `UDA_ERR_NOT_SUPPORTED` because it would render an invisible row.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_menu_add_text(
+    menu_handle: u64,
+    label: *const c_char,
+    callback: Option<tray::TextCallback>,
+    user_data: *mut c_void,
+    out_item_id: *mut u64,
+) -> c_int {
+    if out_item_id.is_null() {
+        util::set_last_message("`out_item_id` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+    if label.is_null() {
+        util::set_last_message("`label` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: `label` was validated non-null above, and the helper stops at
+        // the null terminator and rejects invalid UTF-8 instead of over-reading.
+        let label = unsafe { util::owned_string_from(label, "label") }?;
+        let item_id = tray::menu_add_text(menu_handle, &label, callback, user_data)?;
+        // SAFETY: `out_item_id` was validated non-null and is writable.
+        unsafe { *out_item_id = item_id };
+        Ok(())
+    })
+}
+
+/// Append a visual separator to a menu.
+///
+/// A separator has no label, no callback and no id, so nothing is returned.
+#[no_mangle]
+pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> c_int {
+    util::catch_boundary(|| tray::menu_add_separator(menu_handle))
+}
+
+/// Append a checkbox row to a menu.
+///
+/// The row's own stored value is inverted *before* `callback` runs, so the
+/// `checked` argument is the new state the shell will render - which means the
+/// host and the menu cannot disagree about what the checkbox shows.
+///
+/// `callback` may be null, in which case the row still toggles silently.
+///
+/// # Safety
+///
+/// `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
+/// must be a readable, null-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
+    menu_handle: u64,
+    label: *const c_char,
+    checked: c_int,
+    callback: Option<tray::CheckboxCallback>,
+    user_data: *mut c_void,
+    out_item_id: *mut u64,
+) -> c_int {
+    if out_item_id.is_null() {
+        util::set_last_message("`out_item_id` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+    if label.is_null() {
+        util::set_last_message("`label` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: `label` was validated non-null above.
+        let label = unsafe { util::owned_string_from(label, "label") }?;
+        let item_id = tray::menu_add_checkbox(menu_handle, &label, checked != 0, callback, user_data)?;
+        // SAFETY: `out_item_id` was validated non-null and is writable.
+        unsafe { *out_item_id = item_id };
+        Ok(())
+    })
+}
+
+/// Attach a menu to a tray icon, replacing any menu set earlier.
+///
+/// The menu handle stays valid after this call: the icon holds its own
+/// reference, so `uda_tray_menu_destroy` on the same menu is optional and does
+/// not clear the tray's rows.
+#[no_mangle]
+pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int {
+    util::catch_boundary(|| tray::set_menu(tray_handle, menu_handle))
+}
+
+/// Destroy a menu handle.
+///
+/// Safe to call after `uda_tray_set_menu`, as documented there. Returns
+/// `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live menu.
+#[no_mangle]
+pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> c_int {
+    util::catch_boundary(|| tray::destroy_menu(menu_handle))
+}
+
+/// Convert a nullable C string to an owned `String`, defaulting to empty.
+///
+/// Kept separate from [`util::owned_string_from`] so that "null means empty" is
+/// explicit at each call site instead of being a hidden property of a shared
+/// helper.
+fn owned_or_empty(pointer: *const c_char, parameter: &str) -> Result<String, error::Failure> {
+    if pointer.is_null() {
+        return Ok(String::new());
+    }
+    // SAFETY: null was rejected above; the helper validates the terminator and
+    // the UTF-8 content before returning.
+    unsafe { util::owned_string_from(pointer, parameter) }
 }
 
 thread_local! {

@@ -403,6 +403,19 @@ impl MenuItem {
         matches!(self, Self::Submenu { .. })
     }
 
+    /// Borrow the row's callback, if it has one.
+    ///
+    /// Exposed so a host (or the FFI layer's tests) can tell a row that *fires*
+    /// from one that merely renders, without depending on the variant's private
+    /// field. `Submenu` and `Separator` never carry a callback.
+    #[must_use]
+    pub fn action(&self) -> Option<&TrayAction> {
+        match self {
+            Self::Text { action, .. } | Self::Checkbox { action, .. } => action.as_ref(),
+            Self::Submenu { .. } | Self::Separator => None,
+        }
+    }
+
     /// A copy with the label replaced; separators are unchanged.
     #[must_use]
     pub fn with_label(mut self, label: impl Into<String>) -> Self {

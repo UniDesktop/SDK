@@ -114,7 +114,8 @@ enum IconPayload {
     None,
     /// A freedesktop icon-theme name or a file path.
     Name(String),
-    /// Raw bottom-up ARGB32 rows, as `IconPixmap` expects.
+    /// Raw bottom-up 32bpp rows as `IconPixmap` expects; byte order per pixel
+    /// is B, G, R, A.
     Pixmap(Vec<(i32, i32, Vec<u8>)>),
 }
 
@@ -149,7 +150,7 @@ impl IconPayload {
     }
 }
 
-/// Convert straight RGBA top-down bytes into bottom-up ARGB32 rows.
+/// Convert straight RGBA top-down bytes into bottom-up 32bpp rows (B, G, R, A).
 ///
 /// Returns `None` when the source is not an RGBA buffer or does not match its
 /// declared dimensions. Every access is bounds-checked through slice indexing,
@@ -190,11 +191,16 @@ fn rgba_to_argb(source: &TrayIconSource) -> Option<Vec<(i32, i32, Vec<u8>)>> {
         for column in 0..width {
             let pixel = &src_row[column * 4..column * 4 + 4];
             let base = column * 4;
-            // RGBA -> ARGB little-endian byte order.
-            dst_row[base] = pixel[3];
-            dst_row[base + 1] = pixel[0];
-            dst_row[base + 2] = pixel[1];
-            dst_row[base + 3] = pixel[2];
+            // RGBA -> BGRA little-endian byte order.
+            //
+            // `IconPixmap` is documented as `a(iiay)` "ARGB32 rows" — which in
+            // practice means **byte** order B, G, R, A (see the SNI spec and
+            // `tray_specs.md` §1.4). Writing the channels as A, R, G, B swaps
+            // red and blue, so an icon that should be red arrives blue.
+            dst_row[base] = pixel[2];
+            dst_row[base + 1] = pixel[1];
+            dst_row[base + 2] = pixel[0];
+            dst_row[base + 3] = pixel[3];
         }
     }
 
@@ -1507,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn rgba_is_converted_to_bottom_up_argb() {
+    fn rgba_is_converted_to_bottom_up_bgra() {
         let pixmap = match rgba_to_argb(&padded_rgba()) {
             Some(pixmap) => pixmap,
             None => panic!("a valid icon must transcribe"),
@@ -1518,17 +1524,49 @@ mod tests {
         assert_eq!(*height, 2);
         assert_eq!(bytes.len(), 16);
 
-        // ARGB little-endian is [A, R, G, B]. The output is bottom-up, so the
-        // destination rows are the source rows in reverse order while the
-        // column order inside each row is preserved:
+        // `IconPixmap` is `a(iiay)` documented as "ARGB32", which in **byte**
+        // order means B, G, R, A. The output is bottom-up, so the destination
+        // rows are the source rows in reverse order while the column order
+        // inside each row is preserved:
         //   dst row 0 = src row 1, dst row 1 = src row 0
         // The fixture's pixels are:
         //   src row 0 -> (10, 20, 30, 255) , (40, 50, 60, 255)
         //   src row 1 -> (11, 21, 31, 255) , (41, 51, 61, 255)
-        assert_eq!(&bytes[0..4], &[255, 11, 21, 31]);
-        assert_eq!(&bytes[4..8], &[255, 41, 51, 61]);
-        assert_eq!(&bytes[8..12], &[255, 10, 20, 30]);
-        assert_eq!(&bytes[12..16], &[255, 40, 50, 60]);
+        assert_eq!(&bytes[0..4], &[31, 21, 11, 255]);
+        assert_eq!(&bytes[4..8], &[61, 51, 41, 255]);
+        assert_eq!(&bytes[8..12], &[30, 20, 10, 255]);
+        assert_eq!(&bytes[12..16], &[60, 50, 40, 255]);
+    }
+
+    #[test]
+    fn red_and_blue_are_not_swapped() {
+        // A pure red pixel must come out with the red channel in byte 2 and blue
+        // in byte 0. Writing A, R, G, B instead swaps the two, which turns every
+        // icon's reds blue — the classic "tray icon has the wrong colours"
+        // defect that is invisible in a unit test using evenly spaced channels.
+        let source = TrayIconSource::Rgba {
+            width: 1,
+            height: 1,
+            stride: 4,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        };
+        let pixmap = rgba_to_argb(&source).expect("one pixel must transcribe");
+        let bytes = &pixmap[0].2;
+        assert_eq!(bytes, &vec![0xBE, 0xAD, 0xDE, 0xEF]);
+    }
+
+    #[test]
+    fn a_fully_transparent_pixel_keeps_its_colour_channels() {
+        // Premultiplication is *not* applied by the shell, so a fully
+        // transparent pixel must retain its RGB rather than being zeroed.
+        let source = TrayIconSource::Rgba {
+            width: 1,
+            height: 1,
+            stride: 4,
+            data: vec![0x12, 0x34, 0x56, 0x00],
+        };
+        let pixmap = rgba_to_argb(&source).expect("one pixel must transcribe");
+        assert_eq!(pixmap[0].2, vec![0x56, 0x34, 0x12, 0x00]);
     }
 
     #[test]

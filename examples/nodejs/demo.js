@@ -45,6 +45,12 @@ const WAKELOCK = { DISPLAY: 0, SYSTEM: 1 };
 /** 演示中常亮锁的持有时长（毫秒）。 */
 const WAKELOCK_HOLD_MS = 2000;
 
+/** 托盘图标标题与悬停提示。 */
+const TRAY_NAME = 'UDA Tray Demo';
+
+/** 主循环轮询间隔（毫秒）。 */
+const TRAY_POLL_MS = 200;
+
 /** 交叉编译 Windows DLL 时常见的 target 三元组（用于 WSL 等宿主不同的场景）。 */
 const WINDOWS_TARGET_TRIPLES = [
   'x86_64-pc-windows-msvc',
@@ -175,6 +181,18 @@ function loadUda() {
   const outSlot = (type) => koffi.alloc(type, 1);
   const readSlot = (type, address) => koffi.decode(address, type);
 
+  // 函数指针原型：与 include/uda.h 里的 UdaTrayTextCallback /
+  // UdaTrayCheckboxCallback 逐字段对应。koffi.proto() 会把这些签名注册为
+  // 命名类型，因此类型名必须全局唯一（重复注册会抛 "Duplicate type name"）。
+  // 回调返回 void 而非 int：C 侧本就丢弃返回值，声明成 int 会让 koffi 为
+  // 一个不存在的返回寄存器做无用搬运。
+  const TEXT_CALLBACK_TYPE = koffi.pointer(
+    koffi.proto('void UdaTrayTextCallback(uint64_t item_id, void *user_data)')
+  );
+  const CHECKBOX_CALLBACK_TYPE = koffi.pointer(
+    koffi.proto('void UdaTrayCheckboxCallback(uint64_t item_id, int32_t checked, void *user_data)')
+  );
+
   const lib = {
     detectTheme: (slot) =>
       library.func('uda_detect_theme', 'int32', ['void *'])(slot),
@@ -190,12 +208,57 @@ function loadUda() {
     wakelockRelease: library.func('uda_wakelock_release', 'int32', ['uint64']),
     lastErrorMessage: library.func('uda_last_error_message', 'char *', []),
     statusMessage: library.func('uda_status_message', 'const char *', ['int32']),
+    trayCreate: (name, tooltip, slot) =>
+      library.func('uda_tray_create', 'int32', ['const char *', 'const char *', 'void *'])(
+        name,
+        tooltip,
+        slot
+      ),
+    traySetTooltip: library.func('uda_tray_set_tooltip', 'int32', ['uint64', 'const char *']),
+    traySetIconPath: library.func('uda_tray_set_icon_path', 'int32', ['uint64', 'const char *']),
+    traySetIconRgba: library.func(
+      'uda_tray_set_icon_rgba',
+      'int32',
+      ['uint64', 'uint32', 'uint32', 'uint32', 'uint8 *', 'size_t']
+    ),
+    traySetVisible: library.func('uda_tray_set_visible', 'int32', ['uint64', 'int32']),
+    trayDestroy: library.func('uda_tray_destroy', 'int32', ['uint64']),
+    trayMenuCreate: (slot) => library.func('uda_tray_menu_create', 'int32', ['void *'])(slot),
+    trayMenuAddText: (menuHandle, label, callback, userData, slot) =>
+      library.func(
+        'uda_tray_menu_add_text',
+        'int32',
+        ['uint64', 'const char *', TEXT_CALLBACK_TYPE, 'void *', 'void *']
+      )(menuHandle, label, callback, userData, slot),
+    trayMenuAddCheckbox: (menuHandle, label, checked, callback, userData, slot) =>
+      library.func(
+        'uda_tray_menu_add_checkbox',
+        'int32',
+        ['uint64', 'const char *', 'int32', CHECKBOX_CALLBACK_TYPE, 'void *', 'void *']
+      )(menuHandle, label, checked, callback, userData, slot),
+    trayMenuAddSeparator: library.func('uda_tray_menu_add_separator', 'int32', ['uint64']),
+    traySetMenu: library.func('uda_tray_set_menu', 'int32', ['uint64', 'uint64']),
+    trayMenuDestroy: library.func('uda_tray_menu_destroy', 'int32', ['uint64']),
     outSlot,
     readSlot,
   };
 
+  // 回调蹦床：把 JS 函数变成 C 函数指针。rayons 会保留一份内部引用，但
+  // koffi.unregister() 之后指针立即失效，因此调用方必须自行持有返回值，
+  // 生命周期至少覆盖托盘图标本身（见 createTrayIcon 的 keepalives）。
+  const registerTextCallback = (handler) =>
+    koffi.register((itemId, userData) => handler(BigInt(itemId), userData), TEXT_CALLBACK_TYPE);
+  const registerCheckboxCallback = (handler) =>
+    koffi.register((itemId, checked, userData) => {
+      handler(BigInt(itemId), Number(checked) !== 0, userData);
+    }, CHECKBOX_CALLBACK_TYPE);
+  const unregisterCallback = (handle) => koffi.unregister(handle);
+
   return {
     lib,
+    registerTextCallback,
+    registerCheckboxCallback,
+    unregisterCallback,
     types: koffi.types,
     pointerType: (element = 'char') =>
       koffi.pointer(element === 'void' ? koffi.types.void : koffi.types.char),
@@ -330,6 +393,318 @@ function wakelockRelease(uda, handle) {
 }
 
 // ---------------------------------------------------------------------------
+// 托盘：菜单与图标
+// ---------------------------------------------------------------------------
+
+/**
+ * 创建一个空的右键菜单。
+ *
+ * @param {{ lib: object, registerTextCallback: Function, registerCheckboxCallback: Function }} uda
+ *   已加载的库与回调注册器。
+ * @returns {TrayMenu} 菜单对象；调用方负责最终调用 destroy()。
+ */
+function createTrayMenu(uda) {
+  const slot = uda.lib.outSlot(uda.types.uint64);
+  check(uda, uda.lib.trayMenuCreate(slot), 'uda_tray_menu_create');
+
+  const handle = uda.lib.readSlot(uda.types.uint64, slot);
+  if (handle === 0n) {
+    throw new Error('uda_tray_menu_create 返回了空句柄（违反 ABI 契约）');
+  }
+
+  return new TrayMenu(uda, handle);
+}
+
+/**
+ * 追加一行普通文本项。
+ *
+ * @param {TrayMenu} menu 目标菜单。
+ * @param {string} label 行文本。
+ * @param {(itemId: bigint, userData: unknown) => void} [callback] 点击回调；传 null 即为静默行。
+ * @returns {bigint} 该行的稳定 id，回调也会收到同一个值。
+ */
+function addTrayText(menu, label, callback = null) {
+  // 先注册蹦床再调用 C 侧：注册返回值必须被 menu 持有，否则 JS 函数对象一旦被
+  // GC 回收，C 侧保存的函数指针就会悬空（与 Python 侧 _trampolines 同理）。
+  const trampoline = callback ? menu.uda.registerTextCallback(callback) : null;
+  const slot = menu.uda.lib.outSlot(menu.uda.types.uint64);
+
+  let status;
+  try {
+    status = menu.uda.lib.trayMenuAddText(menu.handle, label, trampoline, null, slot);
+  } catch (error) {
+    // 原型校验失败等同步异常也要释放已注册的蹦床。
+    if (trampoline) {
+      menu.uda.unregisterCallback(trampoline);
+    }
+    throw error;
+  }
+  check(menu.uda, status, `uda_tray_menu_add_text(${label})`);
+
+  if (trampoline) {
+    menu.keepalives.push(trampoline);
+  }
+
+  const itemId = menu.uda.lib.readSlot(menu.uda.types.uint64, slot);
+  if (itemId === 0n) {
+    throw new Error('uda_tray_menu_add_text 返回了空 item id（违反 ABI 契约）');
+  }
+  return itemId;
+}
+
+/**
+ * 追加一行复选框项。
+ *
+ * @param {TrayMenu} menu 目标菜单。
+ * @param {string} label 行文本。
+ * @param {boolean} checked 初始勾选状态。
+ * @param {(itemId: bigint, checked: boolean, userData: unknown) => void} [callback]
+ *   勾选状态变化回调；`checked` 是**翻转后**的新值。
+ * @returns {bigint} 该行的稳定 id。
+ */
+function addTrayCheckbox(menu, label, checked = false, callback = null) {
+  const trampoline = callback ? menu.uda.registerCheckboxCallback(callback) : null;
+  const slot = menu.uda.lib.outSlot(menu.uda.types.uint64);
+
+  let status;
+  try {
+    status = menu.uda.lib.trayMenuAddCheckbox(
+      menu.handle,
+      label,
+      checked ? 1 : 0,
+      trampoline,
+      null,
+      slot
+    );
+  } catch (error) {
+    if (trampoline) {
+      menu.uda.unregisterCallback(trampoline);
+    }
+    throw error;
+  }
+  check(menu.uda, status, `uda_tray_menu_add_checkbox(${label})`);
+
+  if (trampoline) {
+    menu.keepalives.push(trampoline);
+  }
+
+  const itemId = menu.uda.lib.readSlot(menu.uda.types.uint64, slot);
+  if (itemId === 0n) {
+    throw new Error('uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
+  }
+  return itemId;
+}
+
+/**
+ * 追加一条分隔线。
+ *
+ * @param {TrayMenu} menu 目标菜单。
+ */
+function addTraySeparator(menu) {
+  check(menu.uda, menu.uda.lib.trayMenuAddSeparator(menu.handle), 'uda_tray_menu_add_separator');
+}
+
+/**
+ * 创建一个托盘图标。
+ *
+ * @param {{ lib: object }} uda 已加载的库。
+ * @param {string} name 应用名（Linux 上用于 D-Bus bus name，Windows 上用于窗口类名）。
+ * @param {string} [tooltip] 悬停提示。
+ * @returns {TrayIcon} 图标对象；调用方负责最终调用 destroy()。
+ */
+function createTrayIcon(uda, name, tooltip = '') {
+  const slot = uda.lib.outSlot(uda.types.uint64);
+  check(uda, uda.lib.trayCreate(name, tooltip, slot), 'uda_tray_create');
+
+  const handle = uda.lib.readSlot(uda.types.uint64, slot);
+  if (handle === 0n) {
+    throw new Error('uda_tray_create 返回了空句柄（违反 ABI 契约）');
+  }
+  return new TrayIcon(uda, handle);
+}
+
+/**
+ * 把菜单挂到图标上，替换此前挂载的任何菜单。
+ *
+ * 菜单句柄在本调用之后依然有效：图标持有自己的引用，因此 destroy() 菜单是
+ * 可选的，且不会清空托盘已渲染的行（与 include/uda.h 中 uda_tray_set_menu 的
+ * 约定一致）。
+ *
+ * @param {TrayIcon} icon 目标图标。
+ * @param {TrayMenu} menu 要挂载的菜单。
+ */
+function setTrayMenu(icon, menu) {
+  check(icon.uda, icon.uda.lib.traySetMenu(icon.handle, menu.handle), 'uda_tray_set_menu');
+  icon.menu = menu;
+}
+
+/**
+ * 托盘右键菜单：行集合 + 生命周期管理。
+ */
+class TrayMenu {
+  /**
+   * @param {{ lib: object, registerTextCallback: Function, registerCheckboxCallback: Function,
+   *           unregisterCallback: Function }} uda 已加载的库与回调注册器。
+   * @param {bigint} handle uda_tray_menu_create 返回的非零句柄。
+   */
+  constructor(uda, handle) {
+    this.uda = uda;
+    this.handle = handle;
+    /** 由本菜单注册、必须保活到销毁为止的 C 函数指针。 */
+    this.keepalives = [];
+    this.destroyed = false;
+  }
+
+  /**
+   * 追加一行普通文本项。
+   *
+   * @param {string} label 行文本。
+   * @param {(itemId: bigint, userData: unknown) => void} [callback] 点击回调。
+   * @returns {bigint} 行的稳定 id。
+   */
+  addText(label, callback = null) {
+    return addTrayText(this, label, callback);
+  }
+
+  /**
+   * 追加一行复选框项。
+   *
+   * @param {string} label 行文本。
+   * @param {boolean} [checked] 初始状态。
+   * @param {(itemId: bigint, checked: boolean, userData: unknown) => void} [callback] 状态回调。
+   * @returns {bigint} 行的稳定 id。
+   */
+  addCheckbox(label, checked = false, callback = null) {
+    return addTrayCheckbox(this, label, checked, callback);
+  }
+
+  /**
+   * 追加一条分隔线。
+   *
+   * @returns {TrayMenu} this，便于链式调用。
+   */
+  addSeparator() {
+    addTraySeparator(this);
+    return this;
+  }
+
+  /**
+   * 销毁菜单句柄。重复调用是安全的（第二次为空操作）。
+   */
+  destroy() {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    // 先反注册蹦床，再销毁句柄：反注册只是丢弃我们自己持有的 C 函数指针，
+    // 而销毁句柄才会移除注册表记录。顺序反了会让悬空指针短暂留在菜单里。
+    for (const trampoline of this.keepalives) {
+      try {
+        this.uda.unregisterCallback(trampoline);
+      } catch (error) {
+        console.error(`[UDA tray] 反注册菜单回调失败: ${error.message}`);
+      }
+    }
+    this.keepalives = [];
+    check(this.uda, this.uda.lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
+  }
+}
+
+/**
+ * 系统托盘图标。
+ */
+class TrayIcon {
+  /**
+   * @param {{ lib: object }} uda 已加载的库。
+   * @param {bigint} handle uda_tray_create 返回的非零句柄。
+   */
+  constructor(uda, handle) {
+    this.uda = uda;
+    this.handle = handle;
+    /** 当前挂载的菜单；未挂载时为 null。 */
+    this.menu = null;
+    this.destroyed = false;
+  }
+
+  /**
+   * 替换悬停提示。
+   *
+   * @param {string} tooltip 新提示文本；空串表示清除。
+   */
+  setTooltip(tooltip) {
+    check(this.uda, this.uda.lib.traySetTooltip(this.handle, tooltip), `uda_tray_set_tooltip`);
+  }
+
+  /**
+   * 从文件路径或图标主题名设置图标。
+   *
+   * @param {string} path 路径；Linux 也接受 freedesktop 图标主题名。
+   */
+  setIconPath(path) {
+    check(this.uda, this.uda.lib.traySetIconPath(this.handle, path), `uda_tray_set_icon_path(${path})`);
+  }
+
+  /**
+   * 从原始 RGBA 像素设置图标。
+   *
+   * 缓冲区是被借用的：只复制 `stride * height` 个字节，所有权仍归调用方。
+   * 像素为自上而下、每像素四字节（红、绿、蓝、透明度）。
+   *
+   * @param {Uint8Array} pixels 像素缓冲。
+   * @param {number} width 宽，非零。
+   * @param {number} height 高，非零。
+   * @param {number} [stride] 每行字节数，至少 `width * 4`。
+   */
+  setIconRgba(pixels, width, height, stride = width * 4) {
+    const buffer = Buffer.from(pixels.buffer, pixels.byteOffset, pixels.byteLength);
+    check(
+      this.uda,
+      this.uda.lib.traySetIconRgba(
+        this.handle,
+        width,
+        height,
+        stride,
+        buffer,
+        buffer.byteLength
+      ),
+      'uda_tray_set_icon_rgba'
+    );
+  }
+
+  /**
+   * 显示或隐藏图标，但不注销。
+   *
+   * @param {boolean} visible true 显示，false 隐藏。
+   */
+  setVisible(visible) {
+    check(this.uda, this.uda.lib.traySetVisible(this.handle, visible ? 1 : 0), 'uda_tray_set_visible');
+  }
+
+  /**
+   * 挂载菜单，替换此前的菜单。
+   *
+   * @param {TrayMenu} menu 菜单。
+   */
+  setMenu(menu) {
+    setTrayMenu(this, menu);
+  }
+
+  /**
+   * 销毁图标并从系统托盘注销。重复调用是安全的（第二次为空操作）。
+   */
+  destroy() {
+    if (this.destroyed) {
+      return;
+    }
+    this.destroyed = true;
+    check(this.uda, this.uda.lib.trayDestroy(this.handle), 'uda_tray_destroy');
+    // 图标注销之后，菜单自己的句柄仍然有效，由调用方决定何时销毁；
+    // 这里只解除引用，便于 GC 与后续显式 destroy()。
+    this.menu = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 演示
 // ---------------------------------------------------------------------------
 
@@ -341,6 +716,73 @@ function wakelockRelease(uda, handle) {
  */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 睡眠指定毫秒数。
+ *
+ * @param {number} ms 毫秒。
+ * @returns {Promise<void>} Promise。
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 运行托盘演示：建图标、挂菜单、派发事件直到选择"退出程序"。
+ *
+ * 菜单回调由托盘**工作线程**直接调用（见 include/uda.h 的线程模型），因此这里
+ * 用一个普通布尔标志做跨线程信号，主协程只负责轮询与收尾，绝不在回调里做
+ * 阻塞操作。
+ *
+ * @param {{ lib: object }} uda 已加载的库。
+ * @returns {Promise<void>} Promise。
+ */
+async function runTrayDemo(uda) {
+  console.log('');
+  console.log('[托盘] 创建系统托盘图标 ...');
+
+  const icon = createTrayIcon(uda, TRAY_NAME, TRAY_NAME);
+  const menu = createTrayMenu(uda);
+
+  let darkSyncEnabled = false;
+  let quitRequested = false;
+
+  menu.addText('欢迎使用 UniDesktop', (itemId) => {
+    console.log(`[菜单] 欢迎使用 UniDesktop！所有菜单项都能正常工作。(item_id=${itemId})`);
+  });
+
+  menu.addCheckbox('开启深色模式同步', false, (itemId, checked) => {
+    const previous = darkSyncEnabled;
+    darkSyncEnabled = checked;
+    console.log(
+      `[菜单] 深色模式同步已${checked ? '开启' : '关闭'} ` +
+        `(item_id=${itemId}, ${previous} -> ${checked})`
+    );
+  });
+
+  menu.addSeparator();
+
+  menu.addText('退出程序', (itemId) => {
+    console.log(`[菜单] 收到退出指令 (item_id=${itemId})，正在注销托盘 ...`);
+    quitRequested = true;
+  });
+
+  icon.setMenu(menu);
+
+  console.log(`[托盘] 图标已创建: ${TRAY_NAME}`);
+  console.log('[托盘] 右键点击托盘图标查看菜单；选择"退出程序"结束本程序。');
+
+  try {
+    while (!quitRequested) {
+      await sleep(TRAY_POLL_MS);
+    }
+  } finally {
+    // 无论因何种原因退出，都显式注销图标并反注册蹦床。
+    icon.destroy();
+    menu.destroy();
+    console.log('[托盘] 图标已注销');
+  }
 }
 
 /**
@@ -368,6 +810,8 @@ async function main() {
 
   wakelockRelease(uda, handle);
   console.log('      已释放常亮锁');
+
+  await runTrayDemo(uda);
 
   console.log('=== 演示完成 ===');
 }

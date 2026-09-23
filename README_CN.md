@@ -184,9 +184,9 @@ uda/
 
 ## 🤝 社区与赞助
 
-**组织机构：** United Desktop Association
+**组织机构：** Universal Desktop Community
 
-UDA 由 United Desktop Association 开发并维护，这是一个致力于降低跨平台桌面集成成本的开源社区。
+UDA 由 Universal Desktop Community 开发并维护，这是一个致力于降低跨平台桌面集成成本的开源社区。
 
 - 💛 **赞助页面：** [https://afdian.com/a/srinternet](https://afdian.com/a/srinternet)
 - 🌐 **官方网站：** [https://unidesktop.sr-studio.cn](https://unidesktop.sr-studio.cn)

@@ -79,7 +79,7 @@ the watcher is absent -> fall through to Tier 2.
 | `Status` | `s` | `"Active"`/`"Passive"`/`"NeedsAttention"`. |
 | `WindowId` | `u` | 0 when the item has no X window (Wayland case). |
 | `IconName` | `s` | Freedesktop icon-theme name; empty when a pixmap is supplied. |
-| `IconPixmap` | `a(iiay)` | **ARGB32 rows**, bottom-to-top: `[width, height, argb_bytes]`. |
+| `IconPixmap` | `a(iiay)` | **32bpp rows**, bottom-to-top: `[width, height, arggb_bytes]`. Byte order per pixel is **B, G, R, A** — not A, R, G, B. |
 | `OverlayIconName` / `OverlayIconPixmap` | `s` / pixmap | Optional overlay badge. |
 | `AttentionIconName` / `AttentionIconPixmap` | `s` / pixmap | Optional attention icon. |
 | `ToolTip` | `(sa(iiay)ss)` | `[icon_name, pixmap, title, description]`. |
@@ -87,15 +87,23 @@ the watcher is absent -> fall through to Tier 2.
 | `ItemIsMenu` | `b` | `true` when `Activate`/`SecondaryActivate` open menus instead of firing events. |
 
 ### 1.4 Icon encoding gotcha (critical)
-`IconPixmap` is `a(iiay)` where each row is **ARGB, little-endian, bottom-up**.
+`IconPixmap` is `a(iiay)` where each row is **32 bits per pixel, little-endian,
+bottom-up**. The "ARGB32" in the spec refers to a 32-bit pixel, but the **bytes
+of each pixel are ordered B, G, R, A**.
 UDA's `TrayIcon::from_rgba()` takes straight **RGBA top-down** bytes, so the
 platform backend must:
 
 1. validate `width`, `height`, `stride` and `data.len()` (see 3.1);
-2. swap R and A channels (RGBA -> ARGB);
+2. reorder each pixel from R, G, B, A to **B, G, R, A** (this swaps R with B;
+   alpha keeps its place at the end);
 3. reverse row order (top-down -> bottom-up);
 4. honour `stride` (bytes per row, `>= width * 4`); if the stride is larger than
    the pixel width, the padding bytes must be skipped, not copied.
+
+Do **not** write A, R, G, B: that keeps the red and blue channels in each
+other's slots, so a red icon arrives blue and vice versa. The regression test
+`red_and_blue_are_not_swapped` in `uda-platform-linux/src/tray.rs` pins this
+down with a single asymmetric pixel.
 
 ### 1.5 Menus: `com.canonical.dbusmenu`
 

@@ -49,6 +49,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     DIB_RGB_COLORS, HBITMAP, HDC, HBRUSH,
 };
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 // `Shell_NotifyIconW`, `NOTIFYICONDATAW` and the `NIM_*`/`NIF_*` constants live in
 // `Win32::UI::Shell`; the icon-creation and window APIs (`CreateIcon`,
@@ -61,11 +62,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    ICONINFO, KillTimer, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage, UnregisterClassW, GWLP_USERDATA,
-    HCURSOR, HICON, HMENU, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING,
-    MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW, WNDCLASS_STYLES, WS_OVERLAPPED,
+    ICONINFO, IMAGE_ICON, KillTimer, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadImageW, PostMessageW,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx,
+    TranslateMessage, UnregisterClassW, GWLP_USERDATA, HCURSOR, HICON, HMENU, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    WNDCLASS_STYLES, WS_OVERLAPPED,
 };
 
 use uda_core::capability::{Capability, SupportLevel};
@@ -158,20 +160,150 @@ fn to_fixed_utf16<const N: usize>(text: &str) -> [u16; N] {
 }
 
 // ---------------------------------------------------------------------------
+// Callback message layout
+// ---------------------------------------------------------------------------
+
+/// A tray callback message, unpacked from its `wParam` / `lParam` pair.
+///
+/// Under `NOTIFYICON_VERSION_4` the shell packs two values into `lParam` and puts
+/// a third into `wParam` (`tray_specs.md` §2.3):
+///
+/// | Slot | Contents |
+/// |------|----------|
+/// | `lParam` low 16 bits  | the mouse message (`WM_LBUTTONUP`, ...) |
+/// | `lParam` high 16 bits | the icon id from `NOTIFYICONDATAW::uID` |
+/// | `wParam`             | the cursor position, `x` low / `y` high, signed 16-bit |
+///
+/// Keeping this in a struct with a parser means the packing contract is stated
+/// once, tested on its own, and never re-derived inline at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallbackPayload {
+    /// The mouse message the shell reported.
+    event: u32,
+    /// The icon id the notification is addressed to.
+    icon_id: u32,
+    /// The cursor position in screen coordinates.
+    cursor: POINT,
+}
+
+/// Unpack a tray callback message.
+fn unpack_callback(wparam: WPARAM, lparam: LPARAM) -> CallbackPayload {
+    // The words are unsigned 16-bit lanes; reinterpreting them as signed only
+    // happens at the very end, where they become a `POINT`.
+    let packed = lparam.0 as u32;
+    // `wParam` is an `isize` on 64-bit Windows, so a plain shift would drag the
+    // upper half of `y` into the result; the `as u32` truncates to the low word
+    // first, which is the documented width of `x`.
+    let coordinates = wparam.0 as u32;
+    CallbackPayload {
+        event: packed & 0xFFFF,
+        icon_id: (packed >> 16) & 0xFFFF,
+        cursor: POINT {
+            x: (coordinates & 0xFFFF) as i16 as i32,
+            y: ((coordinates >> 16) & 0xFFFF) as i16 as i32,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Icon transcoding
 // ---------------------------------------------------------------------------
 
-/// Convert a validated RGBA buffer into a Win32 `HICON`.
+/// The tray icon size Win32 wants, in pixels.
+///
+/// The shell draws the notification area at the small-icon size, which
+/// `GetSystemMetrics(SM_CXSMICON)` reports (16x16 at 96 DPI, larger when the user
+/// scales up). It is captured once, lazily, rather than cached in a `const`,
+/// because a DPI change or a theme switch can move it while the process lives.
+///
+/// `LoadImageW` is handed the same pair so a multi-resolution `.ico` picks the
+/// entry closest to what the shell will actually draw instead of its largest
+/// frame.
+fn tray_icon_extent() -> (i32, i32) {
+    // SAFETY: `GetSystemMetrics` only reads process-wide window metrics and has
+    // no failure mode to report.
+    let extent = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if extent > 0 {
+        (extent, extent)
+    } else {
+        // Defensive: a zero or negative extent would make `LoadImageW` fail, so
+        // fall back to the documented default rather than passing it through.
+        (16, 16)
+    }
+}
+
+/// Load a Win32 `HICON` from a file path.
+///
+/// `LoadImageW` with `LR_LOADFROMFILE | LR_DEFAULTSIZE` is the documented route
+/// for a `.ico` / `.cur` / `.bmp` on disk, and `LR_DEFAULTSIZE` makes it fall
+/// back to the system's small-icon size when the resource carries no size of
+/// its own. Without this branch a `TrayIconSource::Path` produced no image at
+/// all: the shell still reserved taskbar space for the item (hence the empty
+/// placeholder) but had nothing to draw.
+///
+/// Returns `None` when the file is missing, unreadable or not an image, so the
+/// caller can degrade instead of failing registration.
+fn icon_from_path(path: &str) -> Option<HICON> {
+    // The source contract already rejects blank and whitespace-only paths
+    // (`tray_specs.md` §3.1); re-checking here keeps the helper honest when it
+    // is called directly.
+    if path.trim().is_empty() {
+        log::warn!("tray icon path is blank; no icon will be set");
+        return None;
+    }
+
+    let wide = to_utf16(path);
+    let (width, height) = tray_icon_extent();
+
+    // A null module handle is what makes `LoadImageW` read `name` as a *file
+    // name* instead of a resource ordinal. windows-rs 0.58 does not implement
+    // `Param<HINSTANCE>` for `Option<HINSTANCE>`, so the null handle is spelled
+    // as a default `HINSTANCE` rather than `None`.
+    let module = windows::Win32::Foundation::HINSTANCE::default();
+
+    // SAFETY: `wide` is a live, null-terminated UTF-16 buffer for the duration of
+    // the call, and `module` is a null handle, so the name parameter is read as
+    // the file name above. `LoadImageW` copies the image it decodes into an icon
+    // handle the caller owns.
+    let handle = unsafe {
+        LoadImageW(
+            module,
+            windows::core::PCWSTR(wide.as_ptr()),
+            IMAGE_ICON,
+            width,
+            height,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+    };
+
+    match handle {
+        Ok(handle) => Some(HICON(handle.0)),
+        Err(error) => {
+            log::warn!("LoadImageW({path}) failed: {error}");
+            None
+        }
+    }
+}
+
+/// Convert a validated source into a Win32 `HICON`.
 ///
 /// `tray_specs.md` §2.6 says an RGBA icon is wrapped in a bitmap and scaled; the
 /// smallest faithful path is a 32bpp top-down DIB section fed to
 /// `CreateIconIndirect` with an opaque mask. The DIB is created from the
 /// *validated source* rather than through the Linux transcoder, because Win32
-/// wants top-down BGRA while the Linux path produces bottom-up ARGB.
+/// wants top-down BGRA while the Linux path produces bottom-up B, G, R, A rows
+/// for `IconPixmap`.
 ///
-/// Returns `None` when the source is not RGBA or fails validation, so the
-/// caller can degrade instead of failing registration.
+/// Returns `None` when the source cannot be turned into an icon, so the caller
+/// can degrade instead of failing registration.
 fn icon_from_source(source: &TrayIconSource) -> Option<HICON> {
+    // A path icon is decoded by Win32 itself rather than transcoded here: the
+    // loader understands `.ico`, `.cur` and `.bmp`, including the multi-image
+    // entries an author packs for several DPI levels.
+    if let TrayIconSource::Path(path) = source {
+        return icon_from_path(path);
+    }
+
     let TrayIconSource::Rgba {
         width,
         height,
@@ -836,7 +968,9 @@ impl Worker {
         //
         // SAFETY: `hwnd` was created by this thread and `GWLP_USERDATA` is a
         // documented per-window slot on a window this thread owns. The worker
-        // outlives the window (teardown destroys the window first).
+        // outlives the window (teardown destroys the window first), and it is
+        // heap-pinned by `spawn_worker`, so `self` never moves after this write
+        // and the pointer stays valid for the window's whole life.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut Worker as isize);
         }
@@ -1077,15 +1211,28 @@ impl Worker {
 
     /// Handle the shell's callback message.
     ///
-    /// `lParam` carries the real mouse message, which is how one callback id
-    /// fans out into every tray event (`tray_specs.md` §2.3).
+    /// Under `NOTIFYICON_VERSION_4` (which this worker requests with
+    /// `NIM_SETVERSION`; `tray_specs.md` §2.2) **both** the event and the icon id
+    /// travel packed into `lParam`:
+    ///
+    /// * **low 16 bits of `lParam`** - the mouse message (`WM_LBUTTONUP`, ...).
+    /// * **high 16 bits of `lParam`** - the icon id from `NOTIFYICONDATAW::uID`.
+    /// * **`wParam`** - the cursor's **screen coordinates**, `x` in the low word
+    ///   and `y` in the high word. It is *not* an id, so comparing it against
+    ///   `icon_id` silently drops every notification: the id never matches a
+    ///   coordinate pair, which is exactly the "icon appears but nothing
+    ///   responds" symptom.
+    ///
+    /// `wParam` is still forwarded to [`Worker::show_menu`], because a popup
+    /// anchored at the mouse position needs those coordinates.
     fn on_callback(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-        // The icon id travels in `wParam`; ignore anything addressed elsewhere.
-        if wparam.0 as u32 != self.icon_id {
+        let payload = unpack_callback(wparam, lparam);
+        // Ignore anything addressed to a different icon in this window's set.
+        if payload.icon_id != self.icon_id {
             return LRESULT(0);
         }
 
-        match lparam.0 as u32 {
+        match payload.event {
             x if x == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
                 self.dispatch(TrayEvent::Click);
             }
@@ -1098,7 +1245,11 @@ impl Worker {
             {
                 // A menu request is not a `TrayEvent`; it is handled inline so
                 // the shell's own event ordering is respected.
-                self.show_menu();
+                //
+                // `wParam` is the only place the shell reports *where* the click
+                // happened, so the popup can open at the cursor instead of
+                // wherever a separate `GetCursorPos` happens to read.
+                self.show_menu(payload.cursor);
             }
             _ => {
                 // SAFETY: fall through to the default handler for everything
@@ -1137,7 +1288,12 @@ impl Worker {
     /// The focus dance in `tray_specs.md` §2.5 item 3 is mandatory: without
     /// `SetForegroundWindow` the popup does not dismiss on an outside click, and
     /// without the trailing `WM_NULL` some shells leave it stuck open.
-    fn show_menu(&mut self) {
+    ///
+    /// `anchor` is the cursor position the shell reported in the callback's
+    /// `wParam`. It is only a hint: some shells deliver (0, 0) for keyboard
+    /// invocations (the `Shift+F10` path), so a zero anchor falls back to a live
+    /// `GetCursorPos` query instead of pinning the menu to the screen's origin.
+    fn show_menu(&mut self, anchor: POINT) {
         let menu = {
             let shared = lock_or_recover(&self.shared, "show menu");
             shared.menu.clone()
@@ -1155,13 +1311,19 @@ impl Worker {
             None => return,
         };
 
-        // A cursor query failure is not fatal; (0, 0) with the alignment flags
-        // below still puts the menu on screen.
-        let mut point = POINT::default();
-        let point = if unsafe { GetCursorPos(&mut point) }.is_ok() {
-            point
+        // A zero anchor means "no position was supplied" (keyboard invocation, or
+        // a shell that reports only the icon rectangle); the live cursor position
+        // is then the better guess. A cursor query failure is not fatal either:
+        // the alignment flags below still keep the menu on screen.
+        let point = if anchor.x != 0 || anchor.y != 0 {
+            anchor
         } else {
-            POINT { x: 0, y: 0 }
+            let mut cursor = POINT::default();
+            if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
+                cursor
+            } else {
+                POINT { x: 0, y: 0 }
+            }
         };
 
         // SAFETY: `hwnd` is this thread's window; making it foreground is the
@@ -1431,18 +1593,28 @@ impl WindowsTrayManager {
         let (ready, ready_rx) = mpsc::sync_channel(1);
         // Every backend-facing field starts invalid/empty; only the shared state
         // and the shell-side id come from the caller.
-        let worker = Worker {
+        //
+        // The `Box` is load-bearing, not stylistic: `setup` writes
+        // `self as *mut Worker` into the window's `GWLP_USERDATA`, and the
+        // window procedure later dereferences it. A stack-resident `Worker`
+        // would make that address depend on the closure's stack frame, which
+        // the compiler is free to relocate or reclaim. Boxing pins the struct to
+        // one heap allocation for the whole thread, so the pointer stays valid
+        // until `teardown` clears the slot.
+        let worker = Box::new(Worker {
             shared,
             icon_id,
             ..Worker::default()
-        };
+        });
         let worker_name = class_name.clone();
 
         let handle = std::thread::Builder::new()
             .name("uda-tray-worker".to_string())
             .spawn(move || {
                 // `setup` and the message loop are separate so a failure can be
-                // reported before the (blocking) loop starts.
+                // reported before the (blocking) loop starts. Moving the `Box`
+                // here moves only the pointer word; the heap `Worker` stays put,
+                // which is what keeps the `GWLP_USERDATA` pointer honest.
                 let mut worker = worker;
                 if let Err(error) = worker.setup(&worker_name) {
                     log::warn!("tray worker could not start: {error}");
@@ -1965,6 +2137,61 @@ mod tests {
         let mut recovered = lock_or_recover(&mutex, "test");
         *recovered += 1;
         assert_eq!(*recovered, 8);
+    }
+
+    #[test]
+    fn the_callback_payload_splits_lparam_into_event_and_icon_id() {
+        // `NOTIFYICON_VERSION_4` packing: the mouse message in the low word of
+        // `lParam`, the icon id in the high word. Getting this wrong is what made
+        // every notification silently drop on a real Windows machine.
+        const WM_LBUTTONUP: u32 = 0x0202;
+        let payload = unpack_callback(WPARAM(0), LPARAM(((7u32 << 16) | WM_LBUTTONUP) as isize));
+        assert_eq!(payload.event, WM_LBUTTONUP);
+        assert_eq!(payload.icon_id, 7);
+        // No coordinates were supplied, so the cursor stays at the origin.
+        assert_eq!(payload.cursor, POINT { x: 0, y: 0 });
+    }
+
+    #[test]
+    fn the_icon_id_never_comes_from_wparam() {
+        // The bug this guards against: `wParam` holds screen *coordinates*, so an
+        // id read from it never matches and every event is discarded. The two
+        // fields must stay independent.
+        let payload = unpack_callback(
+            WPARAM(((300u32 << 16) | 640) as usize),
+            LPARAM(((2u32 << 16) | 0x0205) as isize),
+        );
+        assert_eq!(payload.icon_id, 2, "the id comes from the high word of lParam");
+        assert_eq!(payload.cursor, POINT { x: 640, y: 300 });
+        assert_ne!(payload.icon_id as i32, payload.cursor.x);
+    }
+
+    #[test]
+    fn the_cursor_is_signed_so_a_negative_coordinate_survives() {
+        // A multi-monitor desktop puts the tray at negative coordinates, and the
+        // 16-bit lanes are signed. Sign-extending them is what keeps the menu
+        // anchored on the correct monitor.
+        //
+        // x = -100 -> 0xFF9C, y = -1200 -> 0xFB50. Each is a 16-bit two's
+        // complement, so the low word of `wParam` is 0xFF9C and the high word is
+        // 0xFB50; `wParam` itself is their concatenation.
+        let x_lane: u32 = 0xFF9C;
+        let y_lane: u32 = 0xFB50;
+        let payload = unpack_callback(WPARAM(((y_lane << 16) | x_lane) as usize), LPARAM(0));
+        assert_eq!(payload.cursor.x, -100);
+        assert_eq!(payload.cursor.y, -1200);
+    }
+
+    #[test]
+    fn the_callback_payload_is_addressable_by_icon_id() {
+        // The worker discards a notification whose id does not match its own, so
+        // two icons sharing a window cannot steal each other's clicks.
+        const WM_RBUTTONUP: u32 = 0x0205;
+        let mine = unpack_callback(WPARAM(0), LPARAM(((3u32 << 16) | WM_RBUTTONUP) as isize));
+        let theirs = unpack_callback(WPARAM(0), LPARAM(((4u32 << 16) | WM_RBUTTONUP) as isize));
+        assert_eq!(mine.icon_id, 3);
+        assert_eq!(theirs.icon_id, 4);
+        assert_ne!(mine.icon_id, theirs.icon_id);
     }
 
     #[test]

@@ -182,9 +182,9 @@ Later phases cover clipboard, audio routing, display brightness, session lifecyc
 
 ## 🤝 Community & Sponsorship
 
-**Organization:** United Desktop Association
+**Organization:** Universal Desktop Community
 
-UDA is developed and maintained under the United Desktop Association, an open community focused on lowering the cost of cross-platform desktop integration.
+UDA is developed and maintained under the Universal Desktop Community, an open community focused on lowering the cost of cross-platform desktop integration.
 
 - 💛 **Sponsor:** [https://afdian.com/a/srinternet](https://afdian.com/a/srinternet)
 - 🌐 **Official website:** [https://unidesktop.sr-studio.cn](https://unidesktop.sr-studio.cn)
