@@ -1,26 +1,31 @@
-"""ctypes 封装：UniDesktop API (UDA) C-ABI 层。
+"""UniDesktop API (UDA) 的 Python SDK。
 
-纯 Python 标准库实现（`ctypes`），无任何第三方依赖。加载平台对应的动态库：
+一行 ``from uda import Uda`` 即可使用全部桌面能力::
 
-- Linux   -> ``libuda_ffi.so``
-- macOS   -> ``libuda_ffi.dylib``
-- Windows -> ``uda_ffi.dll``
-
-动态库按以下顺序定位：``UDA_LIBRARY`` 环境变量 > ``cargo metadata`` 报告的
-target 目录 > 仓库内常见构建目录 > 系统动态库搜索路径。
-
-约定见 ``include/uda.h``：所有函数返回 ``int32_t`` 状态码（0 成功，负数失败），
-库返回的字符串必须用 :meth:`Uda.free_string` 释放。
-
-用法::
-
-    from uda import Uda
+    from uda import Uda, Theme
 
     with Uda() as uda:
-        theme = uda.detect_theme()          # "dark" / "light" / "unknown"
-        path = uda.get_wallpaper()          # str 或 None
-        handle = uda.wakelock_acquire("display", "示例")
-        uda.wakelock_release(handle)
+        print(uda.theme)                    # "dark" / "light" / "unknown"
+        uda.wallpaper = "~/Pictures/a.png"  # 设置壁纸
+        uda.notify("标题", "正文内容")        # 发一条系统通知
+
+设计原则
+--------
+**零依赖**：只用 Python 标准库（``ctypes`` + ``zlib``），不引入 Pillow 等
+第三方包，也不要求安装 Rust 工具链之外的任何东西。
+
+**不泄漏底层细节**：调用方看不到 ``ctypes.byref``、``c_void_p``、裸指针或
+十六进制状态码。所有指针出参、字符串内存释放、函数指针保活都封装在本模块内，
+失败时抛出带诊断消息的 :class:`UdaError`。
+
+**图标可以只给一个路径**：托盘图标可以直接传 ``.png`` 文件路径，SDK 内部会用
+:mod:`_png`（纯标准库 PNG 解码器）读成 RGBA 再提交。之所以需要这一步：Linux 的
+``StatusNotifierItem`` 把 ``Path`` 当作 **freedesktop 图标主题名**而不是文件
+路径，直接传仓库内的 PNG 路径在 Linux 上什么都不会显示；RGBA 通道在两端语义
+一致。
+
+动态库定位顺序：``UDA_LIBRARY`` 环境变量 > ``cargo metadata`` 报告的 target
+目录 > 仓库内常见构建目录 > 系统动态库搜索路径。
 """
 
 from __future__ import annotations
@@ -43,6 +48,8 @@ from _encoding import force_utf8_output  # noqa: E402
 
 force_utf8_output()
 
+from _png import PngError, load_icon_rgba  # noqa: E402
+
 __all__ = [
     "Uda",
     "UdaError",
@@ -51,7 +58,6 @@ __all__ = [
     "WakeLockType",
     "TrayIcon",
     "TrayMenu",
-    "TrayItem",
 ]
 
 # --------------------------------------------------------------------------
@@ -73,32 +79,6 @@ ERR_INTERNAL: Final[int] = -5
 #: panic 在 FFI 边界被捕获（正常不应出现）。
 ERR_PANIC: Final[int] = -6
 
-#: 主题对应的 C 状态码。
-THEME_UNKNOWN: Final[int] = 0
-THEME_DARK: Final[int] = 1
-THEME_LIGHT: Final[int] = 2
-
-_THEME_NAMES: Final[dict[int, str]] = {
-    THEME_UNKNOWN: "unknown",
-    THEME_DARK: "dark",
-    THEME_LIGHT: "light",
-}
-
-#: 填充模式对应的 C 状态码。
-FILL_CROP: Final[int] = 0
-FILL_FILL: Final[int] = 1
-FILL_FIT: Final[int] = 2
-FILL_STRETCH: Final[int] = 3
-
-#: 常亮锁类型对应的 C 状态码。
-WAKELOCK_DISPLAY: Final[int] = 0
-WAKELOCK_SYSTEM: Final[int] = 1
-
-#: 托盘菜单文本项回调签名：``(item_id: int, user_data) -> None``。
-TrayTextCallback = Callable[[int, Any], None]
-#: 托盘菜单复选框项回调签名：``(item_id: int, checked: bool, user_data) -> None``。
-TrayCheckboxCallback = Callable[[int, bool, Any], None]
-
 #: 各平台的动态库文件名（与 ``crates/uda-ffi`` 的 ``cdylib`` 产物一致）。
 _LIBRARY_FILENAME_BY_PLATFORM: Final[dict[str, str]] = {
     "linux": "libuda_ffi.so",
@@ -110,12 +90,21 @@ _LIBRARY_FILENAME_BY_PLATFORM: Final[dict[str, str]] = {
 _LIBRARY_CANDIDATES: Final[tuple[str, ...]] = (
     "../../target/debug/libuda_ffi.so",
     "../../target/release/libuda_ffi.so",
+    "../../target/debug/uda_ffi.dylib",
+    "../../target/release/uda_ffi.dylib",
     "../../target/debug/uda_ffi.dll",
     "../../target/release/uda_ffi.dll",
 )
 
 #: 调用 ``cargo metadata`` 查询真实 target 目录时的超时（秒）。
 _CARGO_METADATA_TIMEOUT: Final[float] = 10.0
+
+#: 提交给 shell 的托盘图标最长边像素数。
+#: ``docs/internals/tray_specs.md`` §2.6 规定托盘图标为 ``SM_CXSMICON``（16px
+#: @96dpi），HiDPI 下常见 32px。把一张 1254x1254 的原图直接提交，会让
+#: ``IconPixmap`` 往会话总线广播 6 MB 数据、Windows 端还得为整张位图建 DIB，
+#: 因此先在这里降到两端都无需再缩放的大小。
+TRAY_ICON_MAX_EXTENT: Final[int] = 32
 
 
 class UdaError(RuntimeError):
@@ -128,7 +117,7 @@ class UdaError(RuntimeError):
 
 
 class Theme:
-    """主题名称常量，便于 ``from uda import Theme`` 后使用具名字面量。"""
+    """主题名称常量。"""
 
     UNKNOWN: Final[str] = "unknown"
     DARK: Final[str] = "dark"
@@ -152,16 +141,27 @@ class WakeLockType:
 
 
 _FILL_CODES: Final[dict[str, int]] = {
-    FillMode.CROP: FILL_CROP,
-    FillMode.FILL: FILL_FILL,
-    FillMode.FIT: FILL_FIT,
-    FillMode.STRETCH: FILL_STRETCH,
+    FillMode.CROP: 0,
+    FillMode.FILL: 1,
+    FillMode.FIT: 2,
+    FillMode.STRETCH: 3,
 }
 
 _WAKELOCK_CODES: Final[dict[str, int]] = {
-    WakeLockType.DISPLAY: WAKELOCK_DISPLAY,
-    WakeLockType.SYSTEM: WAKELOCK_SYSTEM,
+    WakeLockType.DISPLAY: 0,
+    WakeLockType.SYSTEM: 1,
 }
+
+_THEME_NAMES: Final[dict[int, str]] = {
+    0: Theme.UNKNOWN,
+    1: Theme.DARK,
+    2: Theme.LIGHT,
+}
+
+#: 托盘菜单文本项回调签名：``(item_id: int, user_data) -> None``。
+TrayTextCallback = Callable[[int, Any], None]
+#: 托盘菜单复选框项回调签名：``(item_id: int, checked: bool, user_data) -> None``。
+TrayCheckboxCallback = Callable[[int, bool, Any], None]
 
 
 @lru_cache(maxsize=1)
@@ -209,12 +209,7 @@ def _cargo_target_directory() -> Path | None:
 
 
 def _candidate_paths() -> list[Path]:
-    """按优先级返回动态库候选路径。
-
-    优先使用环境变量 ``UDA_LIBRARY``，其次询问 Cargo 得到真实 target 目录，
-    再尝试仓库常见构建目录，最后交给系统的动态库搜索路径（由
-    :func:`ctypes.CDLL` 解析裸库名）。
-    """
+    """按优先级返回动态库候选路径。"""
     candidates: list[Path] = []
 
     override = os.environ.get("UDA_LIBRARY")
@@ -251,9 +246,9 @@ def _load_library() -> ctypes.CDLL:
 
     # 回落到系统搜索路径，便于库已安装到系统的场景。
     try:
-        return ctypes.CDLL(filename)
+        return ctypes.CDLL(_LIBRARY_FILENAME_BY_PLATFORM.get(sys.platform, "libuda_ffi.so"))
     except OSError as exc:
-        errors.append(f"{filename} (system path): {exc}")
+        errors.append(f"(system path): {exc}")
 
     raise UdaError(
         ERR_NOT_SUPPORTED,
@@ -262,22 +257,79 @@ def _load_library() -> ctypes.CDLL:
     )
 
 
-class Uda:
-    """UDA C-ABI 的 Python 封装。
+class _Int32Slot:
+    """一个可写的 ``int32_t`` 出参槽位。
 
-    使用 ``with`` 语句可确保退出前释放本对象持有的全部常亮锁，避免
-    ``systemd-inhibit`` 子进程残留::
+    ctypes 的 ``byref`` 必须被调用方显式写出，这会把"指针"这个概念泄漏到业务
+    代码里。把槽位包成对象后，SDK 内部调用，业务侧只见 :meth:`value`。
+    """
+
+    __slots__ = ("_slot",)
+
+    def __init__(self) -> None:
+        self._slot = ctypes.c_int32(0)
+
+    @property
+    def value(self) -> int:
+        """读回写入的整数值。"""
+        return int(self._slot.value)
+
+
+class _UInt64Slot:
+    """一个可写的 ``uint64_t`` 出参槽位（句柄、菜单行 id）。"""
+
+    __slots__ = ("_slot",)
+
+    def __init__(self) -> None:
+        self._slot = ctypes.c_uint64(0)
+
+    @property
+    def value(self) -> int:
+        """读回写入的句柄值。"""
+        return int(self._slot.value)
+
+
+class _UInt32Slot:
+    """一个可写的 ``uint32_t`` 出参槽位（通知 id）。"""
+
+    __slots__ = ("_slot",)
+
+    def __init__(self) -> None:
+        self._slot = ctypes.c_uint32(0)
+
+    @property
+    def value(self) -> int:
+        """读回写入的通知 id。"""
+        return int(self._slot.value)
+
+
+class _RgbaSlot:
+    """一段可写的四字节出参（强调色的 R, G, B, A）。"""
+
+    __slots__ = ("_buffer",)
+
+    def __init__(self) -> None:
+        self._buffer = (ctypes.c_uint8 * 4)(0, 0, 0, 0)
+
+    @property
+    def value(self) -> tuple[int, int, int, int]:
+        """读回 ``(r, g, b, a)``；未写入时是 ``(0, 0, 0, 0)``。"""
+        return tuple(self._buffer)  # type: ignore[return-value]
+
+
+class Uda:
+    """UniDesktop API 入口。
+
+    使用 ``with`` 语句可确保退出前释放本对象持有的全部常亮锁与托盘资源::
 
         with Uda() as uda:
-            ...
+            print(uda.theme)
+
+    Args:
+        library_path: 显式指定动态库路径；为 ``None`` 时按默认顺序查找。
     """
 
     def __init__(self, library_path: str | os.PathLike[str] | None = None) -> None:
-        """加载动态库并声明全部导出函数的原型。
-
-        Args:
-            library_path: 显式指定动态库路径；为 ``None`` 时按默认顺序查找。
-        """
         if library_path is not None:
             try:
                 self._lib = ctypes.CDLL(str(library_path))
@@ -299,11 +351,10 @@ class Uda:
         #:
         #: ctypes 的 ``CFUNCTYPE`` 实例必须被强引用：一旦被 GC，底层函数指针
         #: 悬空，而库端仍持有该地址，托盘线程回调时就会跳进已释放的内存。
-        #: 这里集中持有，直到 ``TrayIcon`` / ``TrayMenu`` 被销毁。
         self._trampolines: list[Any] = []
 
     # ------------------------------------------------------------------
-    # ctypes 原型声明
+    # ctypes 原型声明（内部实现，业务代码不应触碰）
     # ------------------------------------------------------------------
     def _declare_prototypes(self) -> None:
         """声明每个导出函数的参数与返回类型。
@@ -314,6 +365,7 @@ class Uda:
         c_int32_p = ctypes.POINTER(ctypes.c_int32)
         c_char_p_p = ctypes.POINTER(ctypes.c_char_p)
         c_uint64_p = ctypes.POINTER(ctypes.c_uint64)
+        c_uint32_p = ctypes.POINTER(ctypes.c_uint32)
 
         self._lib.uda_detect_theme.argtypes = [c_int32_p]
         self._lib.uda_detect_theme.restype = ctypes.c_int32
@@ -342,6 +394,24 @@ class Uda:
 
         self._lib.uda_status_message.argtypes = [ctypes.c_int32]
         self._lib.uda_status_message.restype = ctypes.c_char_p
+
+        # ---- 通知 ----
+        # `uda_notify(app_name, title, body, icon, actions, out_id)`：
+        # app_name 是 Windows 的 toast 身份（AppUserModelID），未打包进程靠它
+        # 才能弹 toast。
+        self._lib.uda_notify.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            c_uint32_p,
+        ]
+        self._lib.uda_notify.restype = ctypes.c_int32
+
+        # ---- 强调色 ----
+        self._lib.uda_get_accent_color.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
+        self._lib.uda_get_accent_color.restype = ctypes.c_int32
 
         # ---- 托盘（Tray） ----
         self._lib.uda_tray_create.argtypes = [
@@ -390,8 +460,7 @@ class Uda:
         # ``Option<extern "C" fn(..)>``，即一个裸函数指针；而
         # ``LP_CFunctionType`` 要求的是"指向函数指针的指针"，ctypes 在转换时
         # 会交出 CFUNCTYPE 实例对象在 Python 堆上的地址而非函数入口本身，
-        # Rust 端把它当函数指针调用就会跳到 Python 堆上并直接段错误
-        # （实测复现：注册成功、item_id 正常返回，直到工作线程回调进来才崩）。
+        # Rust 端把它当函数指针调用就会跳到 Python 堆上并直接段错误。
         self._lib.uda_tray_menu_add_text.argtypes = [
             ctypes.c_uint64,
             ctypes.c_char_p,
@@ -442,25 +511,81 @@ class Uda:
         return f"{action} 失败"
 
     # ------------------------------------------------------------------
-    # 公共 API
+    # 外观
     # ------------------------------------------------------------------
-    def detect_theme(self) -> str:
-        """检测系统深浅色。
+    @property
+    def theme(self) -> str:
+        """系统深浅色：``"dark"`` / ``"light"`` / ``"unknown"``。
 
-        Returns:
-            ``"dark"``、``"light"`` 或 ``"unknown"``。
+        示例::
+
+            print(uda.theme)
         """
-        out = ctypes.c_int32(-1)
-        status = self._lib.uda_detect_theme(ctypes.byref(out))
-        self._check(status, "detect_theme")
-        return _THEME_NAMES.get(out.value, "unknown")
+        slot = _Int32Slot()
+        self._check(
+            self._lib.uda_detect_theme(ctypes.byref(slot._slot)), "detect_theme"
+        )
+        return _THEME_NAMES.get(slot.value, Theme.UNKNOWN)
 
-    def set_wallpaper(self, path: str, fill_mode: str = FillMode.FILL) -> None:
+    @property
+    def accent_color(self) -> tuple[int, int, int, int] | None:
+        """系统强调色，返回 ``(r, g, b, a)``；平台不支持时为 ``None``。
+
+        示例::
+
+            color = uda.accent_color
+            if color:
+                print(f"#{color[0]:02x}{color[1]:02x}{color[2]:02x}")
+        """
+        slot = _RgbaSlot()
+        self._check(
+            self._lib.uda_get_accent_color(ctypes.cast(slot._buffer, ctypes.POINTER(ctypes.c_uint8))),
+            "get_accent_color",
+        )
+        # 平台不暴露强调色时（多数 Linux 桌面）库不会写入，四字节保持 0。
+        return slot.value if any(slot.value) else None
+
+    # ------------------------------------------------------------------
+    # 壁纸
+    # ------------------------------------------------------------------
+    @property
+    def wallpaper(self) -> str | None:
+        """当前壁纸路径；未设置或平台不支持时返回 ``None``。"""
+        out = ctypes.c_char_p()
+        self._check(
+            self._lib.uda_get_wallpaper(ctypes.byref(out)), "get_wallpaper"
+        )
+        if not out.value:
+            return None
+        try:
+            return out.value.decode("utf-8", errors="replace")
+        finally:
+            # 无论解码是否成功都必须释放，避免泄漏。
+            self._lib.uda_free_string(out)
+
+    @wallpaper.setter
+    def wallpaper(self, path: str | os.PathLike[str]) -> None:
         """设置桌面壁纸。
 
         Args:
-            path: 图片文件路径（UTF-8）。
+            path: 图片文件路径。
+        """
+        self.set_wallpaper(path)
+
+    def set_wallpaper(
+        self,
+        path: str | os.PathLike[str],
+        fill_mode: str = FillMode.FILL,
+    ) -> None:
+        """设置桌面壁纸。
+
+        Args:
+            path: 图片文件路径。
             fill_mode: ``"crop"`` / ``"fill"`` / ``"fit"`` / ``"stretch"``。
+
+        示例::
+
+            uda.set_wallpaper("~/Pictures/a.png", FillMode.FIT)
         """
         try:
             code = _FILL_CODES[fill_mode]
@@ -470,56 +595,81 @@ class Uda:
                 f"未知填充模式 {fill_mode!r}；可选：{sorted(_FILL_CODES)}",
             ) from None
 
-        encoded = path.encode("utf-8")
+        encoded = os.fspath(path).encode("utf-8")
         status = self._lib.uda_set_wallpaper(encoded, code)
-        self._check(status, f"set_wallpaper({path!r})")
+        self._check(status, f"set_wallpaper({os.fspath(path)!r})")
 
-    def get_wallpaper(self) -> str | None:
-        """读取当前壁纸路径。
-
-        Returns:
-            壁纸路径；未设置壁纸或平台不支持时返回 ``None``。
-        """
-        out = ctypes.c_char_p()
-        status = self._lib.uda_get_wallpaper(ctypes.byref(out))
-        self._check(status, "get_wallpaper")
-
-        if not out.value:
-            return None
-
-        try:
-            return out.value.decode("utf-8", errors="replace")
-        finally:
-            # 无论解码是否成功都必须释放，避免泄漏。
-            self._lib.uda_free_string(out)
-
-    def free_string(self, pointer: ctypes.c_char_p | None) -> None:
-        """释放由库分配的字符串。
-
-        ``uda_free_string`` 接受 NULL，因此空指针安全跳过；ctypes 的
-        ``c_char_p`` 取值为 ``None`` 时即对应 C 的 NULL。
+    # ------------------------------------------------------------------
+    # 通知
+    # ------------------------------------------------------------------
+    def notify(
+        self,
+        title: str,
+        body: str = "",
+        icon: str = "",
+        actions: dict[str, str] | None = None,
+        app_name: str = "",
+    ) -> int:
+        """发送一条系统通知，返回服务器分配的 id。
 
         Args:
-            pointer: 由本库（例如 :meth:`get_wallpaper`）返回的指针。
+            title: 单行标题。
+            body: 多行正文，可为空。
+            icon: 图标路径或 URI，可为空。
+            actions: 按钮表，键为动作标识、值为按钮文字，如
+                ``{"open": "查看详情"}``。Windows 上 toast *按钮*需要 MSIX 打包
+                身份，因此该参数在 Windows 上不呈现按钮（toast 本身正常显示）。
+            app_name: 发送方应用名。在 Windows 上它就是 toast 的
+                AppUserModelID，而未打包进程没有该身份；UDA 会在第一次弹 toast
+                前用它注册进程的显式 AUMID。留空则使用通用身份
+                ``"UniDesktop.Notification"``。
+
+        示例::
+
+            uda.notify("下载完成", "report.pdf 已保存到 ~/Downloads")
+            uda.notify("更新可用", "v0.2.0 已发布", actions={"open": "查看详情"},
+                       app_name="我的应用")
         """
-        if pointer:
-            self._lib.uda_free_string(pointer)
+        flat = ""
+        if actions:
+            flat = "\n".join(f"{key}\n{label}" for key, label in actions.items())
+
+        slot = _UInt32Slot()
+        status = self._lib.uda_notify(
+            app_name.encode("utf-8"),
+            title.encode("utf-8"),
+            body.encode("utf-8"),
+            icon.encode("utf-8"),
+            flat.encode("utf-8"),
+            ctypes.byref(slot._slot),
+        )
+        self._check(status, f"notify({title!r})")
+        return slot.value
 
     # ------------------------------------------------------------------
     # 常亮锁
     # ------------------------------------------------------------------
-    def wakelock_acquire(
-        self, lock_type: str = WakeLockType.DISPLAY, reason: str = "UDA"
-    ) -> int:
-        """申请防休眠常亮锁。
+    def wakelock(
+        self,
+        lock_type: str = WakeLockType.DISPLAY,
+        reason: str = "UDA",
+    ) -> "WakeLock":
+        """申请防休眠常亮锁，返回可作 with 语句使用的 :class:`WakeLock`。
+
+        退出 ``with`` 块（或调用 :meth:`WakeLock.release`）时自动释放，因此
+        不必担心忘记释放导致 ``systemd-inhibit`` 子进程残留::
+
+            with uda.wakelock() as lock:
+                ...          # 这三秒屏幕不会休眠
 
         Args:
             lock_type: ``"display"`` 或 ``"system"``。
             reason: 诊断用描述文本。
-
-        Returns:
-            非零句柄，需传给 :meth:`wakelock_release`。
         """
+        return WakeLock(self, lock_type, reason)
+
+    def _acquire_wakelock(self, lock_type: str, reason: str) -> int:
+        """底层申请；业务代码请用 :meth:`wakelock`。"""
         try:
             code = _WAKELOCK_CODES[lock_type]
         except KeyError:
@@ -528,25 +678,21 @@ class Uda:
                 f"未知常亮锁类型 {lock_type!r}；可选：{sorted(_WAKELOCK_CODES)}",
             ) from None
 
-        out = ctypes.c_uint64(0)
+        slot = _UInt64Slot()
         status = self._lib.uda_wakelock_acquire(
-            code, reason.encode("utf-8"), ctypes.byref(out)
+            code, reason.encode("utf-8"), ctypes.byref(slot._slot)
         )
         self._check(status, f"wakelock_acquire({lock_type!r})")
 
-        handle = int(out.value)
+        handle = slot.value
         if handle == 0:
             # 库保证成功时返回非零句柄；为 0 说明契约被破坏。
             raise UdaError(ERR_INTERNAL, "wakelock_acquire 返回了空句柄")
         self._handles.append(handle)
         return handle
 
-    def wakelock_release(self, handle: int) -> None:
-        """释放常亮锁。
-
-        Args:
-            handle: :meth:`wakelock_acquire` 返回的句柄。
-        """
+    def _release_wakelock(self, handle: int) -> None:
+        """底层释放；业务代码请用 :meth:`WakeLock.release`。"""
         status = self._lib.uda_wakelock_release(handle)
         self._check(status, f"wakelock_release({handle})")
         if handle in self._handles:
@@ -556,22 +702,28 @@ class Uda:
     # 托盘（Tray）
     # ------------------------------------------------------------------
     def create_tray_icon(
-        self, name: str = "UDA", tooltip: str = ""
+        self, name: str = "UDA", tooltip: str = "", icon: str | os.PathLike[str] = ""
     ) -> "TrayIcon":
         """创建托盘图标。
 
-        返回的 :class:`TrayIcon` 由调用方持有；销毁它才会真正从系统托盘注销。
-
         Args:
             name: 应用名（用于 D-Bus 总线名 / 窗口类注册）。
-            tooltip: 悬停提示文本，可为空；超过 127 字符会被截断。
+            tooltip: 悬停提示文本，可为空。
+            icon: 图标文件路径（``.png`` 等），SDK 会自动解码成 RGBA 后提交；
+                传空串则创建时无图标，可稍后设置。
 
         Returns:
-            :class:`TrayIcon` 实例。
+            :class:`TrayIcon` 实例，由调用方持有；销毁它才会从系统托盘注销。
+
+        示例::
+
+            icon = uda.create_tray_icon("我的应用", "提示文本", "icons/logo.png")
         """
-        icon = TrayIcon(self, name, tooltip)
-        self._tray_icons.append(icon)
-        return icon
+        tray_icon = TrayIcon(self, name, tooltip)
+        self._tray_icons.append(tray_icon)
+        if icon:
+            tray_icon.icon = icon
+        return tray_icon
 
     def create_tray_menu(self) -> "TrayMenu":
         """创建空的托盘右键菜单。
@@ -609,7 +761,7 @@ class Uda:
         """
         for handle in list(self._handles):
             try:
-                self.wakelock_release(handle)
+                self._release_wakelock(handle)
             except UdaError:
                 # 句柄已失效时无需再报错，调用方可按需查询。
                 pass
@@ -642,6 +794,46 @@ class Uda:
             pass
 
 
+class WakeLock:
+    """防休眠常亮锁。
+
+    建议用 ``with`` 语句持有，退出时自动释放::
+
+        with uda.wakelock() as lock:
+            ...  # 屏幕不会休眠
+    """
+
+    def __init__(self, uda: Uda, lock_type: str, reason: str) -> None:
+        self._uda = uda
+        self._type = lock_type
+        self._handle = uda._acquire_wakelock(lock_type, reason)
+
+    @property
+    def handle(self) -> int:
+        """库分配的句柄。"""
+        return self._handle
+
+    def release(self) -> None:
+        """释放常亮锁。重复调用是安全的。"""
+        if self._handle == 0:
+            return
+        handle = self._handle
+        self._handle = 0
+        self._uda._release_wakelock(handle)
+
+    def __enter__(self) -> "WakeLock":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.release()
+
+    def __del__(self) -> None:  # pragma: no cover - 仅在忘记释放时兜底
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------
 # 托盘（Tray）
 # --------------------------------------------------------------------------
@@ -653,8 +845,14 @@ class TrayMenu:
     菜单是"先构造、后挂载"的数据对象：先 ``add_text`` / ``add_checkbox`` /
     ``add_separator`` 逐行添加，再交给 :meth:`TrayIcon.set_menu` 挂到图标上。
 
-    Args:
-        uda: 拥有该菜单的 :class:`Uda` 实例。
+    示例::
+
+        menu = uda.create_tray_menu()
+        menu.add_text("打招呼", lambda item_id, data: print("你好"))
+        menu.add_checkbox("深色模式", checked=False, callback=on_toggle)
+        menu.add_separator()
+        menu.add_text("退出", lambda item_id, data: icon.stop())
+        icon.menu = menu
     """
 
     def __init__(self, uda: "Uda") -> None:
@@ -665,10 +863,12 @@ class TrayMenu:
         self._create()
 
     def _create(self) -> None:
-        out = ctypes.c_uint64(0)
-        status = self._uda._lib.uda_tray_menu_create(ctypes.byref(out))
-        self._uda._check(status, "uda_tray_menu_create")
-        self._handle = int(out.value)
+        slot = _UInt64Slot()
+        self._uda._check(
+            self._uda._lib.uda_tray_menu_create(ctypes.byref(slot._slot)),
+            "uda_tray_menu_create",
+        )
+        self._handle = slot.value
         if self._handle == 0:
             raise UdaError(ERR_INTERNAL, "uda_tray_menu_create 返回了空句柄")
         self._uda._register_tray_menu(self)
@@ -693,15 +893,7 @@ class TrayMenu:
         Returns:
             代表该行的 :class:`TrayItem`。
         """
-        return self._add_text(label, callback, user_data)
-
-    def _add_text(
-        self,
-        label: str,
-        callback: TrayTextCallback | None,
-        user_data: Any,
-    ) -> "TrayItem":
-        out_item = ctypes.c_uint64(0)
+        slot = _UInt64Slot()
         raw_callback, keepalive = self._make_text_trampoline(callback, user_data)
 
         status = self._uda._lib.uda_tray_menu_add_text(
@@ -709,10 +901,10 @@ class TrayMenu:
             label.encode("utf-8"),
             raw_callback,
             None,
-            ctypes.byref(out_item),
+            ctypes.byref(slot._slot),
         )
         self._uda._check(status, f"uda_tray_menu_add_text({label!r})")
-        item_id = int(out_item.value)
+        item_id = slot.value
         item = TrayItem(self, item_id, "text", label, callback)
         self._items.append(item)
         # 保活蹦床与用户回调对象，防止被 GC 后函数指针悬空。
@@ -753,7 +945,7 @@ class TrayMenu:
         Returns:
             代表该行的 :class:`TrayItem`。
         """
-        out_item = ctypes.c_uint64(0)
+        slot = _UInt64Slot()
         raw_callback, keepalive = self._make_checkbox_trampoline(callback, user_data)
 
         status = self._uda._lib.uda_tray_menu_add_checkbox(
@@ -762,10 +954,10 @@ class TrayMenu:
             1 if checked else 0,
             raw_callback,
             None,
-            ctypes.byref(out_item),
+            ctypes.byref(slot._slot),
         )
         self._uda._check(status, f"uda_tray_menu_add_checkbox({label!r})")
-        item_id = int(out_item.value)
+        item_id = slot.value
         item = TrayItem(self, item_id, "checkbox", label, callback)
         self._items.append(item)
         if keepalive is not None:
@@ -773,7 +965,7 @@ class TrayMenu:
         return item
 
     # ------------------------------------------------------------------
-    # 回调蹦床
+    # 回调蹦床（内部）
     # ------------------------------------------------------------------
     def _make_text_trampoline(
         self,
@@ -923,36 +1115,33 @@ class TrayItem:
 class TrayIcon:
     """系统托盘图标。
 
-    Args:
-        uda: 拥有该图标的 :class:`Uda` 实例。
-        name: 应用名（注册用）。
-        tooltip: 悬停提示文本，可为空。
+    示例::
 
-    用法::
-
-        with uda.create_tray_icon("UDA", "提示") as icon:
-            menu = uda.create_tray_menu()
-            menu.add_text("欢迎使用 UniDesktop", lambda item, data: print("你好"))
-            menu.add_checkbox("开启深色模式同步", checked=False,
-                              callback=lambda item, checked, data: print(checked))
-            menu.add_separator()
-            menu.add_text("退出程序", lambda item, data: icon.stop_event.set())
-            icon.set_menu(menu)
-            icon.run_until_stopped()
+        icon = uda.create_tray_icon("我的应用", "提示", "icons/logo.png")
+        menu = uda.create_tray_menu()
+        menu.add_text("退出", lambda item_id, data: icon.destroy())
+        icon.menu = menu
+        icon.wait()          # 阻塞，直到 destroy() 被调用
     """
 
     def __init__(self, uda: "Uda", name: str, tooltip: str = "") -> None:
         self._uda = uda
         self._handle = 0
         self._menu: TrayMenu | None = None
-        out = ctypes.c_uint64(0)
+        self._stopped = False
+        # 本封装记录的最近一次外观设置值。库侧不提供 getter，因此这些字段表示
+        # "调用方最后一次设置成什么"，而不是"shell 当前渲染成什么"。
+        self._tooltip = tooltip
+        self._icon_source = ""
+        self._visible = True
+        slot = _UInt64Slot()
         status = self._uda._lib.uda_tray_create(
             name.encode("utf-8"),
             tooltip.encode("utf-8"),
-            ctypes.byref(out),
+            ctypes.byref(slot._slot),
         )
         self._uda._check(status, "uda_tray_create")
-        self._handle = int(out.value)
+        self._handle = slot.value
         if self._handle == 0:
             raise UdaError(ERR_INTERNAL, "uda_tray_create 返回了空句柄")
         self._uda._register_tray_icon(self)
@@ -965,40 +1154,55 @@ class TrayIcon:
     # ------------------------------------------------------------------
     # 外观
     # ------------------------------------------------------------------
-    def set_tooltip(self, tooltip: str) -> None:
+    @property
+    def tooltip(self) -> str:
+        """悬停提示文本（本封装记录的最近一次设置值）。"""
+        return self._tooltip
+
+    @tooltip.setter
+    def tooltip(self, text: str) -> None:
         """修改悬停提示文本。超过 127 字符会被库截断。"""
         self._require_handle()
         status = self._uda._lib.uda_tray_set_tooltip(
-            self._handle, tooltip.encode("utf-8")
+            self._handle, text.encode("utf-8")
         )
-        self._uda._check(status, f"uda_tray_set_tooltip({tooltip!r})")
+        self._uda._check(status, f"uda_tray_set_tooltip({text!r})")
+        self._tooltip = text
 
-    def set_icon_path(self, path: str) -> None:
-        """从文件路径或图标主题名设置图标。
+    @property
+    def icon(self) -> str:
+        """当前图标来源（本封装记录的路径；未设置时为空串）。"""
+        return self._icon_source
 
-        Linux 接受 freedesktop 图标主题名；Windows 需要文件路径。
+    @icon.setter
+    def icon(self, source: str | os.PathLike[str]) -> None:
+        """从图片文件设置托盘图标。
+
+        传入 ``.png`` 等路径即可，SDK 内部会读文件、解码成 RGBA、降采样后提交。
+
+        之所以不直接把路径交给 ``uda_tray_set_icon_path``：Linux 后端把该参数
+        当作 **freedesktop 图标主题名**（见
+        ``crates/uda-platform-linux/src/tray.rs`` 的 ``IconPayload::Name``），
+        Windows 后端才按文件路径交给 ``LoadImageW``。仓库内的 PNG 路径在 Linux
+        上只会解析成一个不存在的主题名，托盘依旧是空的；RGBA 通道两端语义一致。
+
+        解码失败只记录一条日志并保持原图标：托盘的事件与菜单都不依赖图标，
+        不该让整个应用因此退出。
         """
         self._require_handle()
-        status = self._uda._lib.uda_tray_set_icon_path(
-            self._handle, path.encode("utf-8")
-        )
-        self._uda._check(status, f"uda_tray_set_icon_path({path!r})")
+        path = Path(source).expanduser()
+        try:
+            width, height, rgba = load_icon_rgba(path, TRAY_ICON_MAX_EXTENT)
+        except PngError as error:
+            print(f"[UDA tray] 无法加载图标 {path}: {error}", file=sys.stderr)
+            return
 
-    def set_icon_rgba(
-        self, width: int, height: int, data: bytes, stride: int | None = None
-    ) -> None:
-        """从 RGBA 像素缓冲区设置图标。
+        self._set_icon_rgba(width, height, rgba)
+        self._icon_source = str(source)
 
-        Args:
-            width: 像素宽，非零。
-            height: 像素高，非零。
-            data: 自上而下、每像素 4 字节（R, G, B, A）的原始字节。
-            stride: 每行字节数，默认 ``width * 4``。若缓冲区行间有填充，
-                需显式给出。
-        """
-        self._require_handle()
-        if stride is None:
-            stride = width * 4
+    def _set_icon_rgba(self, width: int, height: int, data: bytes) -> None:
+        """提交 RGBA 像素（内部路径，业务代码请用 :attr:`icon`）。"""
+        stride = width * 4
         if len(data) < stride * height:
             raise UdaError(
                 ERR_INVALID_ARGUMENT,
@@ -1015,18 +1219,31 @@ class TrayIcon:
         )
         self._uda._check(status, "uda_tray_set_icon_rgba")
 
-    def set_visible(self, visible: bool) -> None:
+    @property
+    def visible(self) -> bool:
+        """图标当前是否可见（本封装记录的最近一次设置值）。"""
+        return self._visible
+
+    @visible.setter
+    def visible(self, value: bool) -> None:
         """显示 / 隐藏图标（不注销，可随时恢复）。"""
         self._require_handle()
         status = self._uda._lib.uda_tray_set_visible(
-            self._handle, 1 if visible else 0
+            self._handle, 1 if value else 0
         )
-        self._uda._check(status, f"uda_tray_set_visible({visible})")
+        self._uda._check(status, f"uda_tray_set_visible({value})")
+        self._visible = bool(value)
 
     # ------------------------------------------------------------------
     # 菜单
     # ------------------------------------------------------------------
-    def set_menu(self, menu: TrayMenu) -> None:
+    @property
+    def menu(self) -> TrayMenu | None:
+        """当前挂载的菜单。"""
+        return self._menu
+
+    @menu.setter
+    def menu(self, menu: TrayMenu) -> None:
         """把菜单挂到图标上（替换已有菜单）。
 
         挂载后 ``menu`` 仍可独立销毁；图标持有自己的引用。
@@ -1038,14 +1255,24 @@ class TrayIcon:
         self._uda._check(status, "uda_tray_set_menu")
         self._menu = menu
 
-    @property
-    def menu(self) -> TrayMenu | None:
-        """当前挂载的菜单。"""
-        return self._menu
-
     # ------------------------------------------------------------------
     # 生命周期
     # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """请求 :meth:`wait` 返回，但**不**注销图标。"""
+        self._stopped = True
+
+    def wait(self) -> None:
+        """阻塞当前线程，直到 :meth:`stop` 或 :meth:`destroy` 被调用。
+
+        菜单回调运行在托盘工作线程上，因此这里只需等待标志位，绝不能在回调
+        线程里做阻塞操作。
+        """
+        import time
+
+        while not self._stopped and self._handle:
+            time.sleep(0.2)
+
     def _require_handle(self) -> None:
         if self._handle == 0:
             raise UdaError(ERR_INVALID_ARGUMENT, "托盘图标已被销毁")
@@ -1062,6 +1289,7 @@ class TrayIcon:
         finally:
             self._uda._unregister_tray_icon(self)
             self._menu = None
+            self._stopped = True
 
     def __enter__(self) -> "TrayIcon":
         return self

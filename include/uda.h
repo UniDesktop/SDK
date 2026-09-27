@@ -180,6 +180,66 @@ int32_t uda_wakelock_acquire(int32_t lock_type, const char *reason, uint64_t *ou
  */
 int32_t uda_wakelock_release(uint64_t handle);
 
+/* ------------------------------------------------------------------------- */
+/* Notifications                                                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Send a system notification.
+ *
+ * The five strings cover what a notification needs: the sending app's
+ * `app_name`, a one-line `title`, a multi-line `body`, an optional `icon`
+ * (path or URI; empty means none), and `actions` as a flat newline-separated
+ * list of `key\nlabel` records. Any string may be null, which is treated as the
+ * empty string.
+ *
+ * `app_name` is not cosmetic: on Windows it is the AppUserModelID the toast is
+ * addressed to, and an unpackaged process has none. UDA registers it as the
+ * process's explicit AUMID before the first toast is shown, which is what lets
+ * a plain `node script.js` display a native toast. Passing null or "" selects
+ * the generic "UniDesktop.Notification" identity.
+ *
+ * The remaining FreeDesktop fields keep their defaults: `replaces_id` is 0 (a
+ * new notification), the expiry is the server default, and the urgency is
+ * normal. Callers needing those must use the Rust API.
+ *
+ * A trailing `key` without its `label` is dropped rather than rendered as a
+ * blank button.
+ *
+ * On Windows, toast *buttons* still require a packaged (MSIX) identity, so
+ * `actions` is accepted for parity but not surfaced; the toast itself displays
+ * normally. Use `WindowsNotificationManager::availability()` to probe further.
+ *
+ * @param app_name  Sending application name; the Windows toast identity.
+ *                  Null or "" selects "UniDesktop.Notification".
+ * @param title     One-line summary. Null is treated as "".
+ * @param body      Multi-line detail. Null is treated as "".
+ * @param icon      Path or URI for the notification image, or null.
+ * @param actions   Flat "key\nlabel" records separated by '\n', or null.
+ * @param out_id    Receives the id the notification server assigned. Must not
+ *                  be null. Left untouched on failure.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_notify(const char *app_name,
+                   const char *title,
+                   const char *body,
+                   const char *icon,
+                   const char *actions,
+                   uint32_t *out_id);
+
+/**
+ * Read the system accent colour as four channels.
+ *
+ * Writes R, G, B, A (each 0..=255) to the four bytes at `out_rgba`. A platform
+ * that exposes no accent colour - most Linux desktops - leaves the bytes
+ * untouched and still returns UDA_OK, so a zeroed slot means "no accent",
+ * not failure.
+ *
+ * @param out_rgba  Pointer to four writable `uint8_t` values. Must not be null.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_get_accent_color(uint8_t *out_rgba);
+
 /**
  * Return the message describing the most recent failure on the calling thread.
  *

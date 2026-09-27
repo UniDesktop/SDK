@@ -23,7 +23,7 @@ use std::process::Command;
 // rather than exposing inherent methods, and calling them without the traits in
 // scope is the most common way to make this dispatch layer fail to compile.
 use uda_core::appearance::AppearanceManager;
-use uda_core::capability::Theme;
+use uda_core::capability::{RgbaColor, Theme};
 use uda_core::error::UdaError;
 use uda_core::tray::{TrayIcon, TrayIconConfig};
 use uda_core::wakelock::WakeLockType;
@@ -66,6 +66,16 @@ impl WakeLockHandle {
 pub(crate) fn detect_theme_code() -> Result<i32, Failure> {
     let theme = appearance().detect_theme()?;
     Ok(theme_code(theme))
+}
+
+/// Read the system accent colour as four `u8` channels.
+///
+/// Returns `None` when the platform does not expose one (most Linux desktops)
+/// or when the value cannot be parsed. A C caller cannot tell "no accent" from
+/// "failed to read" apart, which is why this is a plain option rather than an
+/// error: the demo prints one message for both.
+pub(crate) fn accent_color() -> Option<RgbaColor> {
+    appearance().get_accent_color().ok()
 }
 
 /// Translate a [`Theme`] into the C ABI code.

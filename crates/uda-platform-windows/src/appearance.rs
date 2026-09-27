@@ -15,9 +15,13 @@
 //! first; `SystemUsesLightTheme` (added in Windows 1809) governs the taskbar and
 //! is consulted only as a graceful fallback when the primary value is absent.
 //!
-//! Accent color detection is not implemented in this phase and returns
-//! [`UdaError::NotSupported`], mirroring the "degrade gracefully" rule of
-//! `AGENTS.md` Principle 1.
+//! The accent colour lives under `HKCU\Software\Microsoft\Windows\DWM` as the
+//! `AccentColor` DWORD. Windows stores it as a 32-bit integer whose bytes are
+//! ordered **A, B, G, R** from most to least significant, so reading it as a
+//! `u32` and slicing the bytes is the documented way to recover the channels.
+//! Writing them back in the other order swaps red and blue, which is invisible
+//! in a unit test that uses evenly spaced channels — hence the dedicated
+//! `accent_dword_is_split_into_rgba` regression test below.
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -41,6 +45,12 @@ const APPS_USE_LIGHT_THEME: &str = "AppsUseLightTheme";
 
 /// DWORD value describing the system (taskbar) light/dark preference.
 const SYSTEM_USES_LIGHT_THEME: &str = "SystemUsesLightTheme";
+
+/// Sub-key holding the Desktop Window Manager values, including the accent colour.
+const DWM_SUBKEY: &str = "Software\\Microsoft\\Windows\\DWM";
+
+/// DWORD value holding the accent colour, packed as A, B, G, R.
+const ACCENT_COLOR: &str = "AccentColor";
 
 /// Windows appearance manager.
 ///
@@ -190,6 +200,20 @@ impl WindowsAppearanceManager {
             }
         }
     }
+
+    /// Split the `AccentColor` DWORD into its R, G, B, A channels.
+    ///
+    /// Windows packs the value as **A, B, G, R** from the most to the least
+    /// significant byte, so the byte at index 0 is alpha and index 3 is red.
+    /// Reading `u32::to_le_bytes` and slicing in that order is the documented
+    /// recovery; any other pairing swaps red and blue, which no caller can
+    /// detect because both are valid channel values.
+    fn accent_from_dword(packed: u32) -> RgbaColor {
+        // Index 0 is the least significant byte on a little-endian target, which
+        // is where Windows puts the red channel.
+        let [r, g, b, a] = packed.to_le_bytes();
+        RgbaColor { r, g, b, a }
+    }
 }
 
 /// Close a registry key handle, ignoring the result.
@@ -237,21 +261,25 @@ impl AppearanceManager for WindowsAppearanceManager {
     }
 
     fn get_accent_color(&self) -> Result<RgbaColor, UdaError> {
-        // The accent color is stored in `HKCU\Software\Microsoft\Windows\DWM`
-        // as `AccentColor` (ABGR packed) since Windows 10 1903, but the layout
-        // is not stable across builds. Phase 1 keeps this unimplemented rather
-        // than guessing, which matches the "never panic, degrade gracefully"
-        // contract in AGENTS.md Principle 1.
-        Err(UdaError::NotSupported(
-            "Accent color detection is not supported on Windows in this phase".to_string(),
-        ))
+        // A missing value is a normal condition on builds that predate the DWM
+        // accent colour (or on images with DWM disabled), so it degrades to
+        // `NotSupported` rather than an internal error. `read_registry_dword`
+        // already maps every Win32 failure onto `Ok(None)`.
+        match Self::read_registry_dword(DWM_SUBKEY, ACCENT_COLOR)? {
+            Some(packed) => Ok(Self::accent_from_dword(packed)),
+            None => Err(UdaError::NotSupported(
+                "Windows accent colour is not available in the registry".to_string(),
+            )),
+        }
     }
 
     fn capabilities(&self) -> Result<Capability, UdaError> {
         // Theme detection is a plain registry read that works on every supported
-        // Windows build, so the capability is reported unconditionally rather
-        // than being probed by a speculative read at startup.
-        Ok(Capability::DETECT_THEME)
+        // Windows build, and the accent colour is read from the same registry
+        // through the same helper. Neither needs a speculative probe at startup:
+        // both are reported unconditionally and degrade to `NotSupported` per
+        // call when the value is absent.
+        Ok(Capability::DETECT_THEME | Capability::READ_ACCENT_COLOR)
     }
 }
 
@@ -304,14 +332,18 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_reports_theme_detection() {
+    fn capabilities_reports_theme_detection_and_accent_colour() {
         let manager = WindowsAppearanceManager::new();
         let caps = match manager.capabilities() {
             Ok(caps) => caps,
             Err(e) => panic!("capabilities failed: {e}"),
         };
-        assert_eq!(caps, Capability::DETECT_THEME);
-        assert!(!caps.contains(Capability::READ_ACCENT_COLOR));
+        assert!(caps.contains(Capability::DETECT_THEME));
+        // Reporting the flag is what lets a host decide to *call*
+        // `get_accent_color`; the per-call `NotSupported` still covers a host
+        // whose registry lacks the value.
+        assert!(caps.contains(Capability::READ_ACCENT_COLOR));
+        assert_eq!(caps, Capability::DETECT_THEME | Capability::READ_ACCENT_COLOR);
     }
 
     #[test]
@@ -320,6 +352,42 @@ mod tests {
             PERSONALIZE_SUBKEY,
             "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"
         );
+    }
+
+    #[test]
+    fn dwm_subkey_matches_specification() {
+        assert_eq!(DWM_SUBKEY, "Software\\Microsoft\\Windows\\DWM");
+        assert_eq!(ACCENT_COLOR, "AccentColor");
+    }
+
+    #[test]
+    fn accent_dword_is_split_into_rgba() {
+        // Windows packs the DWORD as A, B, G, R from the most to the least
+        // significant byte. A value whose four bytes are all distinct proves the
+        // channels are not transposed: `0xDDCCBBAA` has red `0xAA`, green
+        // `0xBB`, blue `0xCC`, alpha `0xDD`.
+        let color = WindowsAppearanceManager::accent_from_dword(0xDDCC_BBAA);
+        assert_eq!(color.r, 0xAA);
+        assert_eq!(color.g, 0xBB);
+        assert_eq!(color.b, 0xCC);
+        assert_eq!(color.a, 0xDD);
+    }
+
+    #[test]
+    fn accent_channels_survive_a_realistic_opaque_colour() {
+        // A fully opaque mid-blue, the shape Windows actually writes for the
+        // default accent: alpha `0xFF`, blue `0x00`, green `0x78`, red `0xD7`.
+        let color = WindowsAppearanceManager::accent_from_dword(0xFF00_78D7);
+        assert_eq!(color, RgbaColor { r: 0xD7, g: 0x78, b: 0x00, a: 0xFF });
+    }
+
+    #[test]
+    fn accent_red_and_blue_are_never_swapped() {
+        // Pure red must stay red. Byte-swapping the two channels yields blue,
+        // which is exactly the defect this test exists to catch.
+        let color = WindowsAppearanceManager::accent_from_dword(0xFF00_00FF);
+        assert_eq!(color.r, 0xFF);
+        assert_eq!(color.b, 0x00);
     }
 
     #[test]

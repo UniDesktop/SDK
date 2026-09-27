@@ -51,6 +51,7 @@
 
 mod dispatch;
 mod error;
+mod notify;
 mod tray;
 mod util;
 mod wakelocks;
@@ -249,6 +250,95 @@ pub extern "C" fn uda_wakelock_release(handle: u64) -> c_int {
         let handle = dispatch::WakeLockHandle::from_raw(handle)
             .ok_or_else(|| error::Failure::InvalidArgument("`handle` must not be 0".to_string()))?;
         dispatch::release_wakelock(handle)
+    })
+}
+
+/// Send a system notification.
+///
+/// The five strings cover what a notification needs: the sending app's
+/// `app_name`, a one-line `title`, a multi-line `body`, an optional `icon`
+/// (path or URI; empty means none), and `actions` as a flat newline-separated
+/// list of `key\nlabel` records. Any string may be null, which is treated as the
+/// empty string.
+///
+/// `app_name` is not cosmetic: on Windows it is the AppUserModelID the toast is
+/// addressed to, and an unpackaged process has none. UDA registers it as the
+/// process's explicit AUMID before the first toast is shown, which is what lets
+/// a plain `node script.js` display a native toast. Leaving it empty (or null)
+/// selects the generic `UniDesktop.Notification` identity.
+///
+/// On success `*out_id` receives the id the notification server assigned; it is
+/// left untouched on failure.
+///
+/// # Safety
+///
+/// `out_id` must be a valid, writable, non-null `uint32_t` location. The five
+/// strings must each be null or readable, null-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn uda_notify(
+    app_name: *const c_char,
+    title: *const c_char,
+    body: *const c_char,
+    icon: *const c_char,
+    actions: *const c_char,
+    out_id: *mut u32,
+) -> c_int {
+    if out_id.is_null() {
+        util::set_last_message("`out_id` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // Every string goes through the same null-terminating, UTF-8-checking
+        // conversion, so none of them can read past the caller's buffers; null
+        // is accepted and becomes the empty string.
+        let app_name = owned_or_empty(app_name, "app_name")?;
+        let title = owned_or_empty(title, "title")?;
+        let body = owned_or_empty(body, "body")?;
+        let icon = owned_or_empty(icon, "icon")?;
+        let actions = owned_or_empty(actions, "actions")?;
+
+        let mut id = 0u32;
+        notify::notify(&app_name, &title, &body, &icon, &actions, &mut id)?;
+        // SAFETY: the slot was validated non-null and is writable.
+        unsafe { *out_id = id };
+        Ok(())
+    })
+}
+
+/// Read the system accent colour.
+///
+/// Writes the four 0..=255 channels to `*out_rgba` as R, G, B, A. A platform
+/// that exposes no accent colour (most Linux desktops) leaves the slot
+/// untouched and still returns [`UDA_OK`], so check the returned status only
+/// for hard failures and treat a zeroed slot as "no accent".
+///
+/// # Safety
+///
+/// `out_rgba` must point at four writable `uint8_t` values.
+#[no_mangle]
+pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> c_int {
+    if out_rgba.is_null() {
+        util::set_last_message("`out_rgba` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let Some(color) = dispatch::accent_color() else {
+            log::debug!("no accent colour reported by the platform");
+            return Ok(());
+        };
+
+        // SAFETY: the pointer was validated non-null and the caller guarantees
+        // four writable bytes. The four writes happen before any other UDA call
+        // could observe a partially written slot.
+        unsafe {
+            *out_rgba = color.r;
+            *out_rgba.add(1) = color.g;
+            *out_rgba.add(2) = color.b;
+            *out_rgba.add(3) = color.a;
+        }
+        Ok(())
     })
 }
 
@@ -821,5 +911,86 @@ mod tests {
             .to_str()
             .expect("static ASCII message");
         assert_eq!(text, "feature not supported on this platform");
+    }
+
+    #[test]
+    fn notify_rejects_a_null_out_parameter() {
+        let title = CString::new("title").expect("ascii");
+        // SAFETY: passing null for the out slot is exactly the case under test.
+        let status = unsafe {
+            uda_notify(
+                title.as_ptr(),
+                title.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn notify_accepts_null_strings_as_empty() {
+        // A notification with no app name, body, icon or actions is still a
+        // notification. On a host without a notification daemon this reports
+        // "not supported" rather than "invalid argument", which is the
+        // distinction under test.
+        let title = CString::new("UDA test").expect("ascii");
+        let mut id: u32 = 0;
+        // SAFETY: `id` is a live, writable local; the strings are null, which the
+        // contract explicitly allows.
+        let status = unsafe {
+            uda_notify(
+                title.as_ptr(),
+                title.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut id,
+            )
+        };
+        assert_ne!(status, UDA_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn notify_transports_actions_as_a_flat_list() {
+        let app = CString::new("UDA Notification Demo").expect("ascii");
+        let title = CString::new("标题").expect("ascii");
+        let body = CString::new("正文").expect("ascii");
+        let actions = CString::new("open\n查看详情\nclose\n关闭").expect("ascii");
+        let mut id: u32 = 0;
+        // SAFETY: all five are live C strings and `id` a writable local.
+        let status = unsafe {
+            uda_notify(
+                app.as_ptr(),
+                title.as_ptr(),
+                body.as_ptr(),
+                std::ptr::null(),
+                actions.as_ptr(),
+                &mut id,
+            )
+        };
+        assert_ne!(status, UDA_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn accent_color_rejects_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_get_accent_color(std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn accent_color_either_writes_four_channels_or_reports_none() {
+        let mut rgba = [0u8; 4];
+        // SAFETY: `rgba` is four writable bytes on this stack frame.
+        let status = unsafe { uda_get_accent_color(rgba.as_mut_ptr()) };
+        assert_eq!(status, UDA_OK);
+        // Whatever the platform reports, a zeroed slot is the documented
+        // "no accent colour" answer and must not be mistaken for a failure.
+        let _ = rgba;
     }
 }

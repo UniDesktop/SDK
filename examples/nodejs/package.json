@@ -1,14 +1,18 @@
 {
   "name": "uda-nodejs-example",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "UniDesktop API (UDA) C-ABI Node.js example using koffi",
-  "main": "demo.js",
+  "description": "UniDesktop API (UDA) Node.js examples using koffi",
   "scripts": {
-    "start": "node demo.js"
+    "start": "node 01_appearance.js",
+    "appearance": "node 01_appearance.js",
+    "wallpaper": "node 02_wallpaper.js",
+    "notification": "node 03_notification.js",
+    "wakelock": "node 04_wakelock.js",
+    "tray": "node 05_tray.js"
   },
   "dependencies": {
-    "koffi": "^2.9.0"
+    "koffi": "^2.16.3"
   },
   "engines": {
     "node": ">=16"

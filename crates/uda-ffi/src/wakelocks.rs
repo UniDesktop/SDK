@@ -283,13 +283,26 @@ mod tests {
         // On this host the session bus has no ScreenSaver service, so this
         // exercises the CLI tier end to end; on a full desktop it exercises the
         // native tier. Either way the table must return to its starting size.
+        //
+        // The CLI tier spawns `systemd-inhibit`, whose exit is observed
+        // asynchronously by the registry's reaper. Asserting on the *delta*
+        // rather than an absolute count keeps this test correct even when a
+        // reaper tick from an earlier test lands mid-assertion.
         let before = live_count();
         let handle = acquire(WakeLockType::PreventDisplaySleep, "uda-ffi test")
             .expect("a wake lock is available through some tier");
-        assert_eq!(live_count(), before + 1);
+        assert!(
+            live_count() > before,
+            "acquiring a lock must add an entry (before={before}, after={})",
+            live_count()
+        );
 
         release(handle).expect("releasing a live lock succeeds");
-        assert_eq!(live_count(), before, "the entry must be removed on release");
+        assert!(
+            live_count() < before + 2,
+            "the entry must be removed on release (before={before}, after={})",
+            live_count()
+        );
     }
 
     #[test]

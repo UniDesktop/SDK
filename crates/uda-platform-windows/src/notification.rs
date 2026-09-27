@@ -9,27 +9,57 @@
 //!    produces an XML document with the standard title/body text nodes.
 //! 2. The `text` nodes are located with XPath and filled from the
 //!    [`Notification`] fields.
-//! 3. `ToastNotificationManager::CreateToastNotifier()` + `ToastNotifier::Show()`
-//!    displays the toast.
+//! 3. `ToastNotificationManager::CreateToastNotifierWithId(app_name)` +
+//!    `ToastNotifier::Show()` displays the toast. The explicit id (rather than
+//!    the parameterless `CreateToastNotifier()`) is what lets an unpackaged
+//!    process show a toast at all; see "App identity" below.
+//!
+//! # App identity
+//!
+//! A packaged (MSIX/APPX) application is addressed by its package identity. A
+//! classic Win32 process has none, so the parameterless
+//! `CreateToastNotifier()` fails with `ELEMENT_NOT_FOUND` (`0x80070490`) and no
+//! toast ever appears - which is what an unpackaged `node script.js` hits.
+//!
+//! UDA fixes that two ways, and **both are required**:
+//!
+//! 1. `CreateToastNotifierWithId(app_name)` addresses the toast to an explicit
+//!    id instead of letting WinRT resolve one from the process. This is the call
+//!    that actually succeeds for an unpackaged binary; the parameterless
+//!    `CreateToastNotifier()` keeps failing even after an AUMID is registered,
+//!    because the process still has no *resolved* identity.
+//! 2. `SetCurrentProcessExplicitAppUserModelID(app_name)` records the same id on
+//!    the process so the shell can match it when deciding where to display the
+//!    toast. Registered once per process (see [`ensure_app_identity`]); a host
+//!    that already set its own AUMID keeps it, because overwriting it would
+//!    break that host's activation routing.
+//!
+//! Neither requires a Start-menu shortcut, so a plain `node script.js` or a
+//! Python interpreter shows a native toast.
+//!
+//! The caller can still probe the outcome through
+//! [`WindowsNotificationManager::availability`], which reports
+//! [`NotificationSetting`].
 //!
 //! # Limitations (Phase 1)
 //!
-//! - **App identity.** A packaged (MSIX/APPX) application is addressed by its
-//!   package identity; a classic Win32 process must register an AppUserModelID
-//!   and a Start-menu shortcut, otherwise the toast may not appear. UDA calls
-//!   `CreateToastNotifier()` with the default identity and reports
-//!   [`NotificationSetting`] through [`WindowsNotificationManager::availability`]
-//!   so the caller can detect this before relying on toasts.
-//! - **Actions.** Toast *buttons* require the `actions` content plus an activated
-//!   handler that only a packaged app can register, so `Notification::actions`
-//!   is accepted for trait parity but not surfaced as buttons in Phase 1.
+//! - **Actions.** Toast *buttons* require the `actions` content plus an
+//!   activated handler that only a packaged app can register, so
+//!   `Notification::actions` is accepted for trait parity but not surfaced as
+//!   buttons in Phase 1.
 //! - **Progress.** The FreeDesktop progress concept has no direct toast
 //!   equivalent; it is intentionally ignored rather than approximated.
 
-use windows::core::HSTRING;
+use std::sync::OnceLock;
+
+use windows::core::{HSTRING, PCWSTR};
 use windows::Data::Xml::Dom::{XmlDocument, XmlNodeList};
 use windows::UI::Notifications::{
     ToastNotification, ToastNotificationManager, ToastNotifier, ToastTemplateType,
+};
+use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::UI::Shell::{
+    GetCurrentProcessExplicitAppUserModelID, SetCurrentProcessExplicitAppUserModelID,
 };
 
 use uda_core::capability::Capability;
@@ -106,26 +136,131 @@ fn set_text_node(nodes: &XmlNodeList, text: &str, field: &str) -> Result<(), Uda
     Ok(())
 }
 
-impl WindowsNotificationManager {
-    /// Create the notifier for the calling process.
-    ///
-    /// An unpackaged Win32 process that has no Start-menu shortcut carrying an
-    /// AppUserModelID cannot be resolved to an app identity, and WinRT reports
-    /// `ELEMENT_NOT_FOUND` (`0x80070490`). That is an expected, diagnosable
-    /// condition rather than a bug, so it is mapped to
-    /// [`UdaError::NotSupported`] per `AGENTS.md` Principle 1 (degrade
-    /// gracefully): the caller can then register an AUMID or fall back to
-    /// another channel instead of receiving an opaque internal error.
-    fn create_notifier() -> Result<ToastNotifier, UdaError> {
-        let notifier = ToastNotificationManager::CreateToastNotifier().map_err(|e| {
-            if is_element_not_found(&e) {
-                UdaError::NotSupported(
-                    "no toast app identity is registered for this process; toasts require a packaged app or an AppUserModelID".to_string(),
-                )
-            } else {
-                UdaError::Internal(format!("CreateToastNotifier failed: {e}"))
+/// Fallback AppUserModelID used when the caller supplies no `app_name`.
+///
+/// AUMIDs are dotted reverse-DNS strings by convention; a fixed value keeps
+/// every UDA notification from an unnamed host grouped under one identity
+/// instead of one toast per empty name.
+const FALLBACK_AUMID: &str = "UniDesktop.Notification";
+
+/// The AUMID this process has already registered, if any.
+///
+/// `OnceLock` rather than a `Mutex<bool>`: the registration must happen exactly
+/// once and before the first notifier is created, and `get_or_init` gives that
+/// without a lock on the read path. A second notification with a different
+/// `app_name` keeps the first id rather than switching mid-process, because the
+/// shell has already associated the running process with it.
+static REGISTERED_AUMID: OnceLock<String> = OnceLock::new();
+
+/// Normalise a caller-supplied `app_name` into a usable AUMID.
+///
+/// An empty or whitespace-only name cannot be registered (Win32 rejects it), so
+/// it becomes [`FALLBACK_AUMID`]. Everything else is passed through verbatim:
+/// the shell treats the AUMID as an opaque string, and a caller that already
+/// uses a real identity (MSIX package name, or its own AUMID) must keep it.
+fn resolve_aumid(app_name: &str) -> String {
+    let trimmed = app_name.trim();
+    if trimmed.is_empty() {
+        FALLBACK_AUMID.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Register the process's toast identity exactly once.
+///
+/// `SetCurrentProcessExplicitAppUserModelID` is the documented way to let an
+/// unpackaged Win32 process receive toasts; without it
+/// `CreateToastNotifier()` fails with `ELEMENT_NOT_FOUND` and nothing is shown.
+///
+/// The first call wins. A host that registered its own AUMID before UDA ran is
+/// detected through `GetCurrentProcessExplicitAppUserModelID` and left alone,
+/// because overwriting it would break that host's own activation routing.
+fn ensure_app_identity(app_name: &str) -> Result<(), UdaError> {
+    // An already-initialised cell means this process registered an identity,
+    // either through UDA or through the host before UDA ran.
+    if REGISTERED_AUMID.get().is_some() {
+        return Ok(());
+    }
+
+    // A host that set its own AUMID keeps it: overwriting would break that
+    // host's activation routing. `GetCurrentProcessExplicitAppUserModelID`
+    // returns a borrowed string the shell owns, so it is only inspected here.
+    if let Ok(existing) = unsafe { GetCurrentProcessExplicitAppUserModelID() } {
+        if !existing.is_null() {
+            // SAFETY: the shell hands back a null-terminated UTF-16 string that
+            // stays valid for the lifetime of the process identity; it is read
+            // once into an owned `String` before anything else touches it.
+            let text = unsafe { existing.to_string() };
+            if let Ok(text) = text {
+                if !text.is_empty() {
+                    log::debug!("process already has AppUserModelID {text}; leaving it untouched");
+                    let _ = REGISTERED_AUMID.set(text);
+                    return Ok(());
+                }
             }
-        })?;
+            // SAFETY: the string was allocated by the shell with the COM task
+            // allocator, so it is released exactly once with the matching call.
+            unsafe {
+                let _ = CoTaskMemFree(Some(existing.0.cast()));
+            }
+        }
+    }
+
+    let aumid = resolve_aumid(app_name);
+    let wide = to_wide(&aumid);
+
+    // SAFETY: `wide` is a null-terminated `Vec<u16>` that outlives the call, and
+    // `SetCurrentProcessExplicitAppUserModelID` only reads the string to record
+    // the process's identity. No pointer escapes this function.
+    let result = unsafe { SetCurrentProcessExplicitAppUserModelID(PCWSTR(wide.as_ptr())) };
+    if let Err(error) = result {
+        // A rejected AUMID (for example one the shell cannot parse) is a caller
+        // mistake; anything else is an OS-level failure. Both degrade to a
+        // diagnostic and let the notifier call report the real consequence.
+        log::warn!("SetCurrentProcessExplicitAppUserModelID({aumid}) failed: {error}");
+        return Err(UdaError::Internal(format!(
+            "could not register the toast identity {aumid}: {error}"
+        )));
+    }
+
+    log::debug!("registered process AppUserModelID {aumid}");
+    let _ = REGISTERED_AUMID.set(aumid);
+    Ok(())
+}
+
+impl WindowsNotificationManager {
+    /// Create the notifier for an explicit toast identity.
+    ///
+    /// `CreateToastNotifierWithId` is what makes an unpackaged process work: the
+    /// parameterless `CreateToastNotifier()` resolves the identity from the
+    /// process, and a plain `node script.js` has none, so it fails with
+    /// `ELEMENT_NOT_FOUND` no matter what AUMID was registered. Passing the id
+    /// explicitly addresses the toast directly.
+    ///
+    /// `ensure_app_identity` still runs first, because the shell also matches
+    /// the id against the process's registered AUMID when it decides where to
+    /// show the toast; keeping both in step avoids a toast that is created but
+    /// silently dropped.
+    ///
+    /// A failure to resolve the identity is mapped to [`UdaError::NotSupported`]
+    /// per `AGENTS.md` Principle 1 (degrade gracefully), so the caller gets a
+    /// diagnosis instead of an opaque WinRT error.
+    fn create_notifier(app_name: &str) -> Result<ToastNotifier, UdaError> {
+        ensure_app_identity(app_name)?;
+        let application_id: HSTRING = resolve_aumid(app_name).into();
+
+        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&application_id)
+            .map_err(|e| {
+                if is_element_not_found(&e) {
+                    UdaError::NotSupported(format!(
+                        "no toast app identity could be resolved for {application_id:?}; \
+                         toasts require a packaged app or an AppUserModelID"
+                    ))
+                } else {
+                    UdaError::Internal(format!("CreateToastNotifierWithId failed: {e}"))
+                }
+            })?;
 
         Ok(notifier)
     }
@@ -139,12 +274,34 @@ impl WindowsNotificationManager {
     pub fn availability(
         &self,
     ) -> Result<windows::UI::Notifications::NotificationSetting, UdaError> {
-        let notifier = Self::create_notifier()?;
+        // Probe with the same fallback identity a send with no `app_name` uses,
+        // so the probe answers the same question the send would ask.
+        let notifier = Self::create_notifier("")?;
 
-        notifier
-            .Setting()
-            .map_err(|e| UdaError::Internal(format!("NotificationSetting query failed: {e}")))
+        notifier.Setting().map_err(|e| {
+            // `Setting` resolves the identity a second time, so an unresolved
+            // id surfaces here as `ELEMENT_NOT_FOUND` just as it does in
+            // `create_notifier`. Mapping it to the same `NotSupported` keeps a
+            // probe consistent with a send rather than reporting an internal
+            // failure for a condition the caller can act on.
+            if is_element_not_found(&e) {
+                UdaError::NotSupported(
+                    "toast availability cannot be resolved: the process has no app identity"
+                        .to_string(),
+                )
+            } else {
+                UdaError::Internal(format!("NotificationSetting query failed: {e}"))
+            }
+        })
     }
+}
+
+/// Convert a UTF-8 Rust string into a null-terminated UTF-16 buffer.
+///
+/// The Win32 shell calls take `PCWSTR`, which is a borrowed pointer to exactly
+/// this layout. The caller must keep the returned `Vec` alive across the call.
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// HRESULT for Win32 `ERROR_NOT_FOUND` (`0x80070490`), surfaced by WinRT as
@@ -174,7 +331,12 @@ impl NotificationManager for WindowsNotificationManager {
         let toast = ToastNotification::CreateToastNotification(&document)
             .map_err(|e| UdaError::Internal(format!("CreateToastNotification failed: {e}")))?;
 
-        let notifier = Self::create_notifier()?;
+        // The identity is registered and then passed explicitly to
+        // `CreateToastNotifierWithId`. The parameterless
+        // `CreateToastNotifier()` resolves the identity from the process, which
+        // for an unpackaged binary means "none" and fails with
+        // `ELEMENT_NOT_FOUND` - registering an AUMID alone does not change that.
+        let notifier = Self::create_notifier(&notification.app_name)?;
 
         notifier
             .Show(&toast)
@@ -255,6 +417,54 @@ mod tests {
             Err(e) => panic!("capabilities failed: {e}"),
         };
         assert_eq!(caps, Capability::SEND_NOTIFICATION);
+    }
+
+    #[test]
+    fn a_supplied_app_name_becomes_the_aumid() {
+        assert_eq!(
+            resolve_aumid("UDA Notification Demo"),
+            "UDA Notification Demo"
+        );
+    }
+
+    #[test]
+    fn an_empty_app_name_falls_back_to_the_generic_identity() {
+        // `SetCurrentProcessExplicitAppUserModelID` rejects an empty string, so
+        // the fallback has to be substituted before the Win32 call.
+        assert_eq!(resolve_aumid(""), FALLBACK_AUMID);
+        assert_eq!(resolve_aumid("   "), FALLBACK_AUMID);
+    }
+
+    #[test]
+    fn a_surrounding_whitespace_is_trimmed_off_the_aumid() {
+        assert_eq!(resolve_aumid("  UDA  "), "UDA");
+    }
+
+    #[test]
+    fn the_fallback_aumid_is_a_dotted_identity() {
+        // AUMIDs are dotted reverse-DNS strings by convention; the shell treats
+        // them as opaque, but a bare word is easy to collide with another app.
+        assert_eq!(FALLBACK_AUMID, "UniDesktop.Notification");
+        assert!(FALLBACK_AUMID.contains('.'));
+    }
+
+    #[test]
+    fn to_wide_is_null_terminated_for_the_shell_calls() {
+        let wide = to_wide("UniDesktop.Notification");
+        assert_eq!(wide.last().copied(), Some(0));
+        assert!(!wide[..wide.len() - 1].contains(&0));
+    }
+
+    #[test]
+    fn to_wide_round_trips_a_non_ascii_aumid() {
+        // The id crosses into WinRT as UTF-16, so a non-ASCII app name must
+        // survive the conversion rather than being mangled at the first
+        // multi-byte character.
+        let wide = to_wide("应用.通知");
+        assert_eq!(
+            wide,
+            "应用.通知".encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>()
+        );
     }
 
     #[test]
