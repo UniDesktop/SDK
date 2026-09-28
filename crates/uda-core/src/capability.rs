@@ -28,6 +28,8 @@ impl CapabilityMatrix {
     pub const TRAY_CHECKBOX: u32 = 1 << 13;
     /// Menu rows can be added, removed, or relabelled at runtime.
     pub const TRAY_DYNAMIC_MENU: u32 = 1 << 14;
+    /// A media playback backend exists (MPRIS v2 on Linux, SMTC on Windows).
+    pub const MEDIA_CONTROL: u32 = 1 << 15;
 }
 
 bitflags! {
@@ -48,6 +50,7 @@ bitflags! {
         const TRAY_CONTEXT_MENU = CapabilityMatrix::TRAY_CONTEXT_MENU;
         const TRAY_CHECKBOX = CapabilityMatrix::TRAY_CHECKBOX;
         const TRAY_DYNAMIC_MENU = CapabilityMatrix::TRAY_DYNAMIC_MENU;
+        const MEDIA_CONTROL = CapabilityMatrix::MEDIA_CONTROL;
     }
 }
 

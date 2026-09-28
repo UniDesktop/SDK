@@ -140,6 +140,30 @@ class WakeLockType:
     SYSTEM: Final[str] = "system"
 
 
+class MediaCommand:
+    """媒体播控指令常量。"""
+
+    PLAY: Final[str] = "play"
+    PAUSE: Final[str] = "pause"
+    TOGGLE: Final[str] = "toggle"
+    NEXT: Final[str] = "next"
+    PREVIOUS: Final[str] = "previous"
+    STOP: Final[str] = "stop"
+
+
+class PlaybackStatus:
+    """播放状态常量。
+
+    ``UNKNOWN`` 同时表示"没有播放器在运行"和"状态无法判定"，两者都不是错
+    误；切勿把它渲染成"已暂停"。
+    """
+
+    PLAYING: Final[str] = "playing"
+    PAUSED: Final[str] = "paused"
+    STOPPED: Final[str] = "stopped"
+    UNKNOWN: Final[str] = "unknown"
+
+
 _FILL_CODES: Final[dict[str, int]] = {
     FillMode.CROP: 0,
     FillMode.FILL: 1,
@@ -150,6 +174,24 @@ _FILL_CODES: Final[dict[str, int]] = {
 _WAKELOCK_CODES: Final[dict[str, int]] = {
     WakeLockType.DISPLAY: 0,
     WakeLockType.SYSTEM: 1,
+}
+
+#: 指令名 -> C-ABI 码，与 ``include/uda.h`` 的 UDA_MEDIA_CMD_* 一致。
+_MEDIA_COMMAND_CODES: Final[dict[str, int]] = {
+    MediaCommand.PLAY: 0,
+    MediaCommand.PAUSE: 1,
+    MediaCommand.TOGGLE: 2,
+    MediaCommand.NEXT: 3,
+    MediaCommand.PREVIOUS: 4,
+    MediaCommand.STOP: 5,
+}
+
+#: C-ABI 状态码 -> 状态名，与 ``include/uda.h`` 的 UDA_MEDIA_* 一致。
+_MEDIA_STATUS_NAMES: Final[dict[int, str]] = {
+    0: PlaybackStatus.PLAYING,
+    1: PlaybackStatus.PAUSED,
+    2: PlaybackStatus.STOPPED,
+    3: PlaybackStatus.UNKNOWN,
 }
 
 _THEME_NAMES: Final[dict[int, str]] = {
@@ -413,6 +455,23 @@ class Uda:
         self._lib.uda_get_accent_color.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
         self._lib.uda_get_accent_color.restype = ctypes.c_int32
 
+        # ---- 媒体播控（Media） ----
+        # 三个字符串出参各自独立分配，业务侧统一由 :class:`_MediaTrack` 释放。
+        self._lib.uda_media_get_metadata.argtypes = [
+            c_char_p_p,
+            c_char_p_p,
+            c_char_p_p,
+            c_uint64_p,
+            c_uint64_p,
+        ]
+        self._lib.uda_media_get_metadata.restype = ctypes.c_int32
+
+        self._lib.uda_media_get_status.argtypes = [c_int32_p]
+        self._lib.uda_media_get_status.restype = ctypes.c_int32
+
+        self._lib.uda_media_send_command.argtypes = [ctypes.c_int32]
+        self._lib.uda_media_send_command.restype = ctypes.c_int32
+
         # ---- 托盘（Tray） ----
         self._lib.uda_tray_create.argtypes = [
             ctypes.c_char_p,
@@ -544,6 +603,23 @@ class Uda:
         )
         # 平台不暴露强调色时（多数 Linux 桌面）库不会写入，四字节保持 0。
         return slot.value if any(slot.value) else None
+
+    # ------------------------------------------------------------------
+    # 媒体播控（Media）
+    # ------------------------------------------------------------------
+    @property
+    def media(self) -> "_MediaController":
+        """媒体播控入口。
+
+        返回一个绑定到本 :class:`Uda` 实例的控制器，业务侧通过它查询正在播放
+        的曲目并发送播控指令::
+
+            track = uda.media.now_playing
+            if track:
+                print(f"{track.title} - {track.artist}")
+            uda.media.play_pause()
+        """
+        return _MediaController(self)
 
     # ------------------------------------------------------------------
     # 壁纸
@@ -792,6 +868,183 @@ class Uda:
         except Exception:
             # 解释器关闭时属性可能已被回收，静默忽略。
             pass
+
+
+def _decode_or_empty(pointer: ctypes.c_char_p) -> str:
+    """把库返回的 ``char *`` 解成 Python 字符串；``NULL`` 视为空串。
+
+    媒体元数据的每个字段都是独立分配的可空指针：播放器没发布该字段（例如电台
+    流没有专辑）时是 ``NULL``，而不是空字符串。业务侧判断 ``if track.album``
+    即可，不必关心指针是否为空。
+    """
+    if not pointer.value:
+        return ""
+    return pointer.value.decode("utf-8", errors="replace")
+
+
+class MediaTrack:
+    """一条"正在播放"快照。
+
+    所有字段都是纯 Python 值，不持有任何 C 端资源；播放器的 C 字符串已由
+    :class:`_MediaController` 解码并释放。
+    """
+
+    __slots__ = ("title", "artist", "album", "duration_ms", "position_ms")
+
+    def __init__(
+        self,
+        title: str,
+        artist: str,
+        album: str,
+        duration_ms: int,
+        position_ms: int,
+    ) -> None:
+        #: 曲名；播放器未发布时为空串。
+        self.title = title
+        #: 艺人；播放器发布多位时已用 ``", "`` 连接。
+        self.artist = artist
+        #: 专辑名。
+        self.album = album
+        #: 曲目时长（毫秒）；直播流等未知时长为 0。
+        self.duration_ms = duration_ms
+        #: 当前播放位置（毫秒）；后端无法上报时为 0。
+        self.position_ms = position_ms
+
+    def __repr__(self) -> str:
+        return (
+            f"MediaTrack(title={self.title!r}, artist={self.artist!r}, "
+            f"album={self.album!r}, duration_ms={self.duration_ms})"
+        )
+
+
+class _MediaController:
+    """媒体播控命名空间（``uda.media``）。
+
+    把三个 C 导出函数与"字符串出参由库分配、需释放"的细节收在一处：调用方
+    只见到 :class:`MediaTrack`、状态名常量与 :class:`MediaCommand` 指令名。
+    """
+
+    __slots__ = ("_uda",)
+
+    def __init__(self, uda: "Uda") -> None:
+        self._uda = uda
+
+    @property
+    def now_playing(self) -> MediaTrack | None:
+        """当前播放的曲目快照；没有播放器运行时返回 ``None``。
+
+        示例::
+
+            track = uda.media.now_playing
+            if track is None:
+                print("当前没有播放器")
+            else:
+                print(f"{track.title} - {track.artist}")
+        """
+        title = ctypes.c_char_p()
+        artist = ctypes.c_char_p()
+        album = ctypes.c_char_p()
+        duration = _UInt64Slot()
+        position = _UInt64Slot()
+
+        status = self._uda._lib.uda_media_get_metadata(
+            ctypes.byref(title),
+            ctypes.byref(artist),
+            ctypes.byref(album),
+            ctypes.byref(duration._slot),
+            ctypes.byref(position._slot),
+        )
+        self._uda._check(status, "media_get_metadata")
+
+        try:
+            title_text = _decode_or_empty(title)
+            artist_text = _decode_or_empty(artist)
+            album_text = _decode_or_empty(album)
+
+            # 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个
+            # NULL + 时长 0），SDK 必须同样归一成 None：否则调用方拿到一个空壳
+            # 对象，无法与"没有播放器"区分，示例里就会打印出一堆"(未发布)"。
+            if (
+                not title_text
+                and not artist_text
+                and not album_text
+                and duration.value == 0
+            ):
+                return None
+
+            return MediaTrack(
+                title=title_text,
+                artist=artist_text,
+                album=album_text,
+                duration_ms=duration.value,
+                position_ms=position.value,
+            )
+        finally:
+            # 无论解码是否成功都要释放；uda_free_string(NULL) 是空操作。
+            self._uda._lib.uda_free_string(title)
+            self._uda._lib.uda_free_string(artist)
+            self._uda._lib.uda_free_string(album)
+
+    @property
+    def status(self) -> str:
+        """当前播放状态，返回 :class:`PlaybackStatus` 常量之一。
+
+        ``unknown`` 同时覆盖"没有播放器"与"状态无法判定"，均非错误。
+        """
+        slot = _Int32Slot()
+        self._uda._check(
+            self._uda._lib.uda_media_get_status(ctypes.byref(slot._slot)),
+            "media_get_status",
+        )
+        return _MEDIA_STATUS_NAMES.get(slot.value, PlaybackStatus.UNKNOWN)
+
+    def send(self, command: str) -> None:
+        """发送一条播控指令。
+
+        Args:
+            command: :class:`MediaCommand` 常量之一。
+
+        Raises:
+            UdaError: 指令名无法识别（状态码 -1），或没有播放器可接收、播放器
+                拒绝执行（状态码 -2）。
+        """
+        try:
+            code = _MEDIA_COMMAND_CODES[command]
+        except KeyError:
+            known = "、".join(sorted(_MEDIA_COMMAND_CODES))
+            raise UdaError(
+                ERR_INVALID_ARGUMENT,
+                f"未知的播控指令 {command!r}；可用指令：{known}",
+            ) from None
+
+        self._uda._check(
+            self._uda._lib.uda_media_send_command(code),
+            f"media_send_command({command})",
+        )
+
+    def play(self) -> None:
+        """开始播放。"""
+        self.send(MediaCommand.PLAY)
+
+    def pause(self) -> None:
+        """暂停播放。"""
+        self.send(MediaCommand.PAUSE)
+
+    def play_pause(self) -> None:
+        """在播放与暂停之间切换。"""
+        self.send(MediaCommand.TOGGLE)
+
+    def next(self) -> None:
+        """切到下一曲。"""
+        self.send(MediaCommand.NEXT)
+
+    def previous(self) -> None:
+        """切到上一曲。"""
+        self.send(MediaCommand.PREVIOUS)
+
+    def stop(self) -> None:
+        """停止播放。"""
+        self.send(MediaCommand.STOP)
 
 
 class WakeLock:

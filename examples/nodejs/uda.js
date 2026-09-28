@@ -44,6 +44,19 @@ const FILL_CODES = { crop: 0, fill: 1, fit: 2, stretch: 3 };
 /** 常亮锁类型名 -> C 状态码。 */
 const WAKELOCK_CODES = { display: 0, system: 1 };
 
+/** 播控指令名 -> C 状态码，与 `include/uda.h` 的 UDA_MEDIA_CMD_* 一致。 */
+const MEDIA_COMMAND_CODES = {
+  play: 0,
+  pause: 1,
+  toggle: 2,
+  next: 3,
+  previous: 4,
+  stop: 5,
+};
+
+/** C 播放状态码 -> SDK 字符串，与 `include/uda.h` 的 UDA_MEDIA_* 一致。 */
+const MEDIA_STATUS_NAMES = { 0: 'playing', 1: 'paused', 2: 'stopped', 3: 'unknown' };
+
 /** 提交给 shell 的托盘图标最长边像素数（见 docs/internals/tray_specs.md §2.6）。 */
 const TRAY_ICON_MAX_EXTENT = 32;
 
@@ -196,6 +209,17 @@ function loadUda() {
       ])(appName, title, body, icon, actions, slot),
     getAccentColor: (slot) =>
       library.func('uda_get_accent_color', 'int32', ['void *'])(slot),
+    // 媒体播控：三个字符串出参各自独立分配，SDK 侧统一读取后释放。
+    mediaGetMetadata: (titleSlot, artistSlot, albumSlot, durationSlot, positionSlot) =>
+      library.func('uda_media_get_metadata', 'int32', [
+        'void *',
+        'void *',
+        'void *',
+        'void *',
+        'void *',
+      ])(titleSlot, artistSlot, albumSlot, durationSlot, positionSlot),
+    mediaGetStatus: (slot) => library.func('uda_media_get_status', 'int32', ['void *'])(slot),
+    mediaSendCommand: library.func('uda_media_send_command', 'int32', ['int32']),
     trayCreate: (name, tooltip, slot) =>
       library.func('uda_tray_create', 'int32', ['const char *', 'const char *', 'void *'])(
         name,
@@ -625,6 +649,20 @@ class Uda {
   }
 
   /**
+   * 媒体播控入口。
+   *
+   * 返回一个绑定到本实例的控制器，用于查询正在播放的曲目并发送播控指令。
+   *
+   * @returns {MediaController}
+   */
+  get media() {
+    if (!this._media) {
+      this._media = new MediaController(this);
+    }
+    return this._media;
+  }
+
+  /**
    * 当前壁纸路径。
    *
    * @returns {string | null} 未设置或平台不支持时为 `null`。
@@ -819,6 +857,141 @@ class Uda {
    */
   [Symbol.dispose]() {
     this.dispose();
+  }
+}
+
+/**
+ * 媒体播控命名空间（`uda.media`）。
+ *
+ * 把三个 C 导出函数与"字符串出参由库分配、需释放"的细节收在一处：调用方只看
+ * 到纯 JS 对象的曲目快照、状态字符串与指令名。
+ *
+ * @example
+ * const track = uda.media.nowPlaying;
+ * if (track) {
+ *   console.log(`${track.title} - ${track.artist}`);
+ * }
+ * uda.media.playPause();
+ */
+class MediaController {
+  /** @param {Uda} uda 拥有该控制器的 Uda 实例。 */
+  constructor(uda) {
+    this._uda = uda;
+  }
+
+  /**
+   * 当前播放的曲目快照。
+   *
+   * 没有播放器运行时返回 `null`（而非抛错），某字段播放器未发布时是空串，例如
+   * 电台流通常没有专辑名。
+   *
+   * @returns {{ title: string, artist: string, album: string,
+   *             durationMs: number, positionMs: number } | null}
+   */
+  get nowPlaying() {
+    const titleSlot = this._uda._lib.outSlot('char *');
+    const artistSlot = this._uda._lib.outSlot('char *');
+    const albumSlot = this._uda._lib.outSlot('char *');
+    const durationSlot = this._uda._lib.outSlot(this._uda._types.uint64);
+    const positionSlot = this._uda._lib.outSlot(this._uda._types.uint64);
+
+    this._uda._check(
+      this._uda._lib.mediaGetMetadata(
+        titleSlot,
+        artistSlot,
+        albumSlot,
+        durationSlot,
+        positionSlot
+      ),
+      'media_get_metadata'
+    );
+
+    // koffi 读 `char **out` 需要分两次调用：一次按 `char *` 解出字符串，一次按
+    // `void *` 拿原始地址交给 `uda_free_string` 释放（与 _readWallpaper 同理）。
+    const charSlotType = 'char *';
+    const voidSlotType = 'void *';
+    const readAndFree = (valueSlot) => {
+      const text = this._uda._lib.readSlot(charSlotType, valueSlot);
+      const address = this._uda._lib.readSlot(voidSlotType, valueSlot);
+      if (address) {
+        this._uda._lib.freeString(address);
+      }
+      return text ? String(text) : '';
+    };
+
+    const title = readAndFree(titleSlot);
+    const artist = readAndFree(artistSlot);
+    const album = readAndFree(albumSlot);
+    const durationMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, durationSlot));
+    const positionMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, positionSlot));
+
+    // 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个 NULL +
+    // 时长 0），SDK 必须同样归一成 null：否则调用方拿到一个空壳对象，无法与
+    // "没有播放器"区分，示例里就会打印出一堆"(未发布)"。
+    if (!title && !artist && !album && durationMs === 0) {
+      return null;
+    }
+
+    return { title, artist, album, durationMs, positionMs };
+  }
+
+  /**
+   * 当前播放状态。
+   *
+   * `unknown` 同时覆盖"没有播放器"与"状态无法判定"，两种情况都不是错误。
+   *
+   * @returns {'playing' | 'paused' | 'stopped' | 'unknown'}
+   */
+  get status() {
+    const slot = this._uda._lib.outSlot(this._uda._types.int32);
+    this._uda._check(this._uda._lib.mediaGetStatus(slot), 'media_get_status');
+    return MEDIA_STATUS_NAMES[this._uda._lib.readSlot(this._uda._types.int32, slot)] ?? 'unknown';
+  }
+
+  /**
+   * 发送一条播控指令。
+   *
+   * @param {'play' | 'pause' | 'toggle' | 'next' | 'previous' | 'stop'} command
+   * @throws {Error} 指令名无法识别，或没有播放器可接收、播放器拒绝执行。
+   */
+  send(command) {
+    const code = MEDIA_COMMAND_CODES[command];
+    if (code === undefined) {
+      throw new Error(
+        `未知播控指令 ${command}；可选：${Object.keys(MEDIA_COMMAND_CODES).join(', ')}`
+      );
+    }
+    this._uda._check(this._uda._lib.mediaSendCommand(code), `media_send_command(${command})`);
+  }
+
+  /** 开始播放。 */
+  play() {
+    this.send('play');
+  }
+
+  /** 暂停播放。 */
+  pause() {
+    this.send('pause');
+  }
+
+  /** 在播放与暂停之间切换。 */
+  playPause() {
+    this.send('toggle');
+  }
+
+  /** 切到下一曲。 */
+  next() {
+    this.send('next');
+  }
+
+  /** 切到上一曲。 */
+  previous() {
+    this.send('previous');
+  }
+
+  /** 停止播放。 */
+  stop() {
+    this.send('stop');
   }
 }
 
@@ -1162,5 +1335,8 @@ module.exports = {
   WakeLock,
   TrayIcon,
   TrayMenu,
+  MediaController,
+  MEDIA_COMMANDS: Object.freeze(Object.keys(MEDIA_COMMAND_CODES)),
+  MEDIA_STATUS: Object.freeze(MEDIA_STATUS_NAMES),
   TRAY_ICON_MAX_EXTENT,
 };

@@ -37,6 +37,7 @@
 
 pub mod appearance;
 pub mod detection;
+pub mod media;
 pub mod notification;
 pub mod tray;
 pub mod wakelock;

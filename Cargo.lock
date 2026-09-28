@@ -961,6 +961,7 @@ dependencies = [
  "async-trait",
  "log",
  "thiserror",
+ "tokio",
  "uda-core",
  "windows",
 ]

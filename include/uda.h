@@ -112,6 +112,32 @@ extern "C" {
 /** Prevent the system from idling or suspending. */
 #define UDA_WAKELOCK_SYSTEM 1
 
+/** Media playback is progressing. */
+#define UDA_MEDIA_PLAYING 0
+/** A track is loaded and halted. */
+#define UDA_MEDIA_PAUSED 1
+/** Nothing is loaded, or playback reached the end. */
+#define UDA_MEDIA_STOPPED 2
+/**
+ * The state could not be determined. This is ALSO the code for "no media player
+ * is running", which is not an error: uda_media_get_status() reports it with a
+ * UDA_OK status. Never render it as a paused track.
+ */
+#define UDA_MEDIA_UNKNOWN 3
+
+/** Start or resume playback. */
+#define UDA_MEDIA_CMD_PLAY 0
+/** Halt playback, keeping the position. */
+#define UDA_MEDIA_CMD_PAUSE 1
+/** Switch between playing and paused. */
+#define UDA_MEDIA_CMD_TOGGLE 2
+/** Advance to the next track. */
+#define UDA_MEDIA_CMD_NEXT 3
+/** Return to the previous track. */
+#define UDA_MEDIA_CMD_PREVIOUS 4
+/** Stop playback and unload the track. */
+#define UDA_MEDIA_CMD_STOP 5
+
 /* ------------------------------------------------------------------------- */
 /* Functions                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -239,6 +265,71 @@ int32_t uda_notify(const char *app_name,
  * @return UDA_OK on success, otherwise a negative status code.
  */
 int32_t uda_get_accent_color(uint8_t *out_rgba);
+
+/**
+ * Read the now-playing metadata of the active media player.
+ *
+ * On Linux the backend scans the session bus for an `org.mpris.MediaPlayer2.*`
+ * service; on Windows it asks the Global System Media Transport Controls session
+ * manager. Both answer `Ok(None)` when no player is running, which this function
+ * turns into: `*out_title`, `*out_artist` and `*out_album` set to NULL, and
+ * `*out_duration_ms` / `*out_position_ms` set to 0 - with a UDA_OK status. A
+ * now-playing card therefore renders as empty rather than as a failure.
+ *
+ * The three strings are allocated by the library and must each be released with
+ * uda_free_string(). Freeing NULL is a no-op, so callers may free
+ * unconditionally. A field the player does not publish (a radio stream with no
+ * album, say) is NULL rather than an empty string, which lets a binding skip it.
+ *
+ * @param out_title         Receives the track title, or NULL. Must not be null.
+ * @param out_artist        Receives the artist(s), already joined with ", " when
+ *                          the player publishes several, or NULL. Must not be
+ *                          null.
+ * @param out_album         Receives the album name, or NULL. Must not be null.
+ * @param out_duration_ms   Receives the track length in milliseconds, or 0 when
+ *                          unknown (a live stream). Must not be null.
+ * @param out_position_ms   Optional; pass NULL to skip. Receives the playback
+ *                          position in milliseconds, or 0 when the backend
+ *                          cannot report it.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_media_get_metadata(char **out_title,
+                               char **out_artist,
+                               char **out_album,
+                               uint64_t *out_duration_ms,
+                               uint64_t *out_position_ms);
+
+/**
+ * Read the playback status of the active media player.
+ *
+ * Writes UDA_MEDIA_PLAYING, UDA_MEDIA_PAUSED, UDA_MEDIA_STOPPED or
+ * UDA_MEDIA_UNKNOWN to `*out_status`. UDA_MEDIA_UNKNOWN covers both "no player is
+ * running" and "the state could not be determined", and is reported with UDA_OK:
+ * it is an answer, not a failure. A negative status code means the platform has
+ * no media backend at all.
+ *
+ * @param out_status  Receives one of the UDA_MEDIA_* status codes. Must not be
+ *                    null.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_media_get_status(int32_t *out_status);
+
+/**
+ * Send a transport command to the active media player.
+ *
+ * `command` is one of UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PAUSE,
+ * UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PREVIOUS or
+ * UDA_MEDIA_CMD_STOP. An unrecognised code returns UDA_ERR_INVALID_ARGUMENT and
+ * nothing is sent.
+ *
+ * A player that refuses the command (an app that disables "next track") and a
+ * machine with no player running both report UDA_ERR_NOT_SUPPORTED, so a caller
+ * can tell "not delivered" from "delivered" without inspecting the player.
+ *
+ * @param command  One of the UDA_MEDIA_CMD_* codes.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_media_send_command(int32_t command);
 
 /**
  * Return the message describing the most recent failure on the calling thread.

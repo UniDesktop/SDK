@@ -9,6 +9,11 @@ uda-core = { path = "../uda-core" }
 thiserror.workspace = true
 log.workspace = true
 async-trait.workspace = true
+# The SMTC async completion (`IAsyncOperation::get()`) is driven by a
+# current-thread runtime built per call, exactly like the Linux backend builds
+# one per MPRIS query. Keeping the trait synchronous avoids parking a runtime
+# for the lifetime of the process.
+tokio.workspace = true
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
@@ -24,6 +29,12 @@ features = [
     "Win32_System_SystemInformation",
     "UI_Notifications",
     "Data_Xml_Dom",
+    # The media backend (SMTC) needs the WinRT session manager, its session
+    # list/property interfaces, and `Foundation` for `TimeSpan`, `Uri` and the
+    # `IAsync*` results those calls return.
+    "Media_Control",
+    "Foundation",
+    "Foundation_Collections",
     # The tray backend needs three more modules:
     # * `Win32_UI_Shell` for `Shell_NotifyIconW` and `NOTIFYICONDATAW`.
     # * `Win32_System_LibraryLoader` for `GetModuleHandleW`.

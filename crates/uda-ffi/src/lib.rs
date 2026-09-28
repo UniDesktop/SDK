@@ -51,6 +51,7 @@
 
 mod dispatch;
 mod error;
+mod media;
 mod notify;
 mod tray;
 mod util;
@@ -59,6 +60,15 @@ mod wakelocks;
 use std::os::raw::{c_char, c_int, c_void};
 
 pub use error::{status_message, UdaStatus};
+
+// Re-exported from the media module: these numbers are part of the C ABI (they
+// appear verbatim in include/uda.h), so a binding should read them from the
+// library rather than hard-coding its own copies.
+pub use media::{
+    UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PAUSE, UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PREVIOUS,
+    UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
+    UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
+};
 
 /// Status code for "success".
 pub const UDA_OK: c_int = 0;
@@ -130,8 +140,10 @@ pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut c_int) -> c_int {
 
 /// Set the desktop wallpaper.
 ///
-/// `path` must be a null-terminated UTF-8 filesystem path. `fill_mode` is one
-/// of the [`UDA_FILL_CROP`] family.
+/// `path` accepts both a plain filesystem path and a `file://` URI; an empty path
+/// is rejected as an invalid argument rather than being sent to the backend.
+///
+/// On failure a negative status code is returned and no wallpaper is changed.
 ///
 /// # Safety
 ///
@@ -149,6 +161,120 @@ pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: c_int
         let path = unsafe { util::owned_string_from(path, "path") }?;
         let fill_mode = fill_mode_from_c(fill_mode)?;
         dispatch::set_wallpaper(&path, fill_mode)
+    })
+}
+
+/// Read the metadata of the active media player.
+///
+/// Writes three owned strings - `*out_title`, `*out_artist`, `*out_album` - and
+/// the track length to `*out_duration_ms`. A field the player does not publish is
+/// written as a null pointer (title, artist, album) or zero (duration), so a
+/// caller must check each pointer before reading it rather than assuming the
+/// struct is fully populated.
+///
+/// The returned strings are allocated by Rust and must be released with
+/// [`uda_free_string`]. Freeing a null pointer is a no-op.
+///
+/// When no player is running (the normal case on a desktop with no media app),
+/// all four out-parameters are set to null/zero and [`UDA_OK`] is returned: an
+/// empty now-playing card, not a failure.
+///
+/// `out_position_ms` is optional: pass null to skip it. When supplied it receives
+/// the playback position in milliseconds, or zero when the backend cannot report
+/// it (MPRIS on a player that has never been queried, SMTC on a session with no
+/// timeline).
+///
+/// # Safety
+///
+/// `out_title`, `out_artist` and `out_album` must each point at a writable
+/// `char *` location; `out_duration_ms` must point at a writable `uint64_t`;
+/// `out_position_ms` must be null or point at a writable `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_get_metadata(
+    out_title: *mut *mut c_char,
+    out_artist: *mut *mut c_char,
+    out_album: *mut *mut c_char,
+    out_duration_ms: *mut u64,
+    out_position_ms: *mut u64,
+) -> c_int {
+    if out_title.is_null() || out_artist.is_null() || out_album.is_null() || out_duration_ms.is_null()
+    {
+        util::set_last_message("`out_title`, `out_artist`, `out_album` and `out_duration_ms` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let metadata = media::active_metadata()?.unwrap_or_default();
+
+        // Each field becomes its own allocation, so a caller can free them one at
+        // a time (or free null, which is a no-op). Writing null rather than an
+        // empty string lets a binding use `x is None` to skip the field.
+        let title = util::c_string_from(&metadata.title);
+        let artist = util::c_string_from(&metadata.artist);
+        let album = util::c_string_from(&metadata.album);
+
+        // SAFETY: all four pointers were validated non-null and writable above;
+        // `out_position_ms` is checked before the optional write.
+        unsafe {
+            *out_title = title;
+            *out_artist = artist;
+            *out_album = album;
+            *out_duration_ms = metadata.duration_ms.unwrap_or(0);
+            if !out_position_ms.is_null() {
+                *out_position_ms = metadata.position_ms.unwrap_or(0);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Read the playback status of the active media player.
+///
+/// Writes one of [`UDA_MEDIA_PLAYING`], [`UDA_MEDIA_PAUSED`],
+/// [`UDA_MEDIA_STOPPED`] or [`UDA_MEDIA_UNKNOWN`] to `*out_status`.
+///
+/// [`UDA_MEDIA_UNKNOWN`] covers both "no player is running" and "the state could
+/// not be determined"; it is never an error, so [`UDA_OK`] is still returned. A
+/// negative status means the platform has no media backend at all.
+///
+/// # Safety
+///
+/// `out_status` must point at a writable `int32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_get_status(out_status: *mut c_int) -> c_int {
+    if out_status.is_null() {
+        util::set_last_message("`out_status` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let status = media::playback_status()?;
+
+        // SAFETY: the pointer was validated non-null and writable.
+        unsafe { *out_status = status.code() };
+        Ok(())
+    })
+}
+
+/// Send a transport command to the active media player.
+///
+/// `command` is one of [`UDA_MEDIA_CMD_PLAY`], [`UDA_MEDIA_CMD_PAUSE`],
+/// [`UDA_MEDIA_CMD_TOGGLE`], [`UDA_MEDIA_CMD_NEXT`],
+/// [`UDA_MEDIA_CMD_PREVIOUS`] or [`UDA_MEDIA_CMD_STOP`]. An unknown code returns
+/// [`UDA_ERR_INVALID_ARGUMENT`] and nothing is sent, because forwarding a
+/// malformed instruction to the user's player is worse than rejecting it.
+///
+/// A player that refuses the command (an app that disables `Next`) returns
+/// [`UDA_ERR_NOT_SUPPORTED`], which is also the answer when no player is running.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
+    util::catch_boundary(|| {
+        let command = media::command_from_c(command)?;
+        media::send_command(command)
     })
 }
 
