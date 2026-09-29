@@ -138,6 +138,26 @@ extern "C" {
 /** Stop playback and unload the track. */
 #define UDA_MEDIA_CMD_STOP 5
 
+/**
+ * A session backend exists on this platform.
+ *
+ * This bit says nothing by itself: it only means at least one of the six actions
+ * below is reachable. Test the action's own bit before offering it.
+ */
+#define UDA_SESSION_CAP_MANAGEMENT 0x00010000u
+/** The session can be locked - the only action safe to automate. */
+#define UDA_SESSION_CAP_LOCK 0x00020000u
+/** The calling user's session can be ended. */
+#define UDA_SESSION_CAP_LOGOUT 0x00040000u
+/** The machine can be suspended to RAM. */
+#define UDA_SESSION_CAP_SUSPEND 0x00080000u
+/** The machine can be hibernated to disk. */
+#define UDA_SESSION_CAP_HIBERNATE 0x00100000u
+/** The machine can be rebooted. */
+#define UDA_SESSION_CAP_REBOOT 0x00200000u
+/** The machine can be powered off. */
+#define UDA_SESSION_CAP_SHUTDOWN 0x00400000u
+
 /* ------------------------------------------------------------------------- */
 /* Functions                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -330,6 +350,114 @@ int32_t uda_media_get_status(int32_t *out_status);
  * @return UDA_OK on success, otherwise a negative status code.
  */
 int32_t uda_media_send_command(int32_t command);
+
+/**
+ * Report which session and power actions this platform can perform.
+ *
+ * Writes a bitmask made of the UDA_SESSION_CAP_* flags to `*out_capabilities`;
+ * 0 means "no session backend exists on this target".
+ *
+ * The query is static and side-effect-free - it never touches the machine's
+ * power state - so a host may call it freely to decide which menu entries to
+ * draw, and *must* call it before drawing one that could shut the machine down.
+ *
+ * A set bit means "the code path exists", not "the account is allowed": a
+ * machine with hibernation switched off still reports UDA_SESSION_CAP_HIBERNATE,
+ * and the attempt then fails with UDA_ERR_NOT_SUPPORTED. Likewise, Windows
+ * reboot and shutdown need the SeShutdownPrivilege, which is a runtime answer.
+ *
+ * @param out_capabilities  Receives the bitmask. Must not be null.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_capabilities(uint32_t *out_capabilities);
+
+/**
+ * Lock the session.
+ *
+ * Linux: `org.freedesktop.ScreenSaver.Lock()` on the session bus, falling back to
+ * `loginctl lock-session`. Windows: `LockWorkStation()`.
+ *
+ * This is the only session action that is safe to automate: it is reversible
+ * (the user unlocks with their password) and it destroys nothing. The other five
+ * `uda_session_*` actions below must be gated behind an explicit user
+ * confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_lock(void);
+
+/**
+ * End the calling user's session.
+ *
+ * Linux: `org.freedesktop.login1.Manager.TerminateSession("")` on the system
+ * bus, falling back to the desktop's own session manager (GNOME, KDE, XFCE).
+ * Windows: `ExitWindowsEx(EWX_LOGOFF, 0)`.
+ *
+ * WARNING: this logs the user out. Unsaved work in applications that do not
+ * refuse is lost. Never call it without an explicit user confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_logout(void);
+
+/**
+ * Suspend the machine to RAM.
+ *
+ * Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
+ * `SetSuspendState(false, ...)`.
+ *
+ * WARNING: this changes the machine's power state. Never call it without an
+ * explicit user confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_suspend(void);
+
+/**
+ * Hibernate the machine to disk.
+ *
+ * Linux: `org.freedesktop.login1.Manager.Hibernate(false)`. Windows:
+ * `SetSuspendState(true, ...)`, which the platform rejects with
+ * ERROR_FILE_NOT_FOUND when hibernation is disabled - reported as
+ * UDA_ERR_NOT_SUPPORTED.
+ *
+ * WARNING: this changes the machine's power state. Never call it without an
+ * explicit user confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_hibernate(void);
+
+/**
+ * Restart the machine.
+ *
+ * Linux: `org.freedesktop.login1.Manager.Reboot(false)`. Windows:
+ * `ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)` after enabling
+ * SeShutdownPrivilege, which needs an elevated process or an administrator
+ * account; without it the call fails with UDA_ERR_NOT_SUPPORTED rather than
+ * half-rebooting.
+ *
+ * WARNING: this restarts the machine and unsaved work is lost. Never call it
+ * without an explicit user confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_reboot(void);
+
+/**
+ * Power the machine off.
+ *
+ * Linux: `org.freedesktop.login1.Manager.PowerOff(false)`. Windows:
+ * `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)` after enabling
+ * SeShutdownPrivilege, with the same elevation requirement as
+ * uda_session_reboot().
+ *
+ * WARNING: this shuts the machine down and unsaved work is lost. Never call it
+ * without an explicit user confirmation.
+ *
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_session_shutdown(void);
 
 /**
  * Return the message describing the most recent failure on the calling thread.

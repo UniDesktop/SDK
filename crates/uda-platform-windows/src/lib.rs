@@ -15,7 +15,7 @@
 //! - [`notification`]: native toasts via the WinRT `ToastNotificationManager`.
 //! - [`tray`]: system tray icons via `Shell_NotifyIconW` on a hidden message-only
 //!   window driven by a dedicated worker thread.
-//!
+
 //! # Fallback tiers
 //!
 //! Unlike Linux (see `AGENTS.md` Principle 2), Windows has a single tier per
@@ -39,6 +39,7 @@ pub mod appearance;
 pub mod detection;
 pub mod media;
 pub mod notification;
+pub mod session;
 pub mod tray;
 pub mod wakelock;
 pub mod wallpaper;

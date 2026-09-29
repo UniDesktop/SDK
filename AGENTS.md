@@ -80,20 +80,29 @@ Before writing any platform-specific logic, consult the specifications stored in
 - [x] **WakeLock Module:** Prevent display/system sleep (Inhibit portal, ScreenSaver, Win32).
 - [x] **C-ABI & FFI:** `crates/uda-ffi` + Python & Node.js examples + CI/CD all green.
 
-### Phase 2: Interactive Shell & System Integration (v0.2.0 TARGET) [IN PROGRESS]
-- [ ] **System Tray Module (Priority #1):**
+### Phase 2: Interactive Shell & System Integration (v0.2.0 RELEASED) [COMPLETED]
+- [x] **System Tray Module (Priority #1):**
   - Cross-platform menu model: Text items, Checkboxes, Separators, Submenus, Disabled states.
   - Linux: `org.kde.StatusNotifierItem` (SNI) via D-Bus + `com.canonical.dbusmenu`.
   - Windows: `Shell_NotifyIconW` + internal hidden worker thread for message pump.
-  - Non-blocking: Tray must run on internal worker threads, never hijacking the host's event loop.
+  - Non-blocking: Tray runs on internal worker threads, never hijacking the host's event loop.
   - Lifecycle: `TrayIcon` implements `Drop` to automatically remove icon on shutdown.
-- [ ] **Media Playback Controls (MPRIS v2 + SMTC):** Dual-way media status listener and player control.
-- [ ] **Global Shortcuts:** Register global key combinations across Portal, X11, and Win32.
-- [ ] **Clipboard Enhancements:** Multi-format MIME clipboard listener.
+- [x] **Media Playback Controls (MPRIS v2 + SMTC):** Metadata read (title, artists, album, duration) plus playback commands and status.
+- [x] **Session & Power Lifecycle:** Lock / logout / suspend / hibernate / reboot / shutdown, with a capability bit per action and a safe token-privilege dance on Windows.
+- [x] **Modular demos:** `examples/` reorganised into `01_appearance` … `07_session`, aligned across Rust / Python / Node.js.
+- [x] **Notification icon support on Windows:** `app_icon` is normalised into a `file://` URI and written into the toast template's `<image>` node.
 
-### Phase 3: Shell Extensions & Window Topology
+### Phase 3: Shell Extensions & Window Topology (v0.3.0 TARGET) [IN PROGRESS]
+Focus areas, in implementation order:
+
+- [ ] **Global Shortcuts:** Listen to key combinations across the Wayland GlobalShortcuts portal, X11 (`XGrabKey`), and Win32 (`RegisterHotKey`).
+- [ ] **Advanced Clipboard:** Multi-format MIME read/write with a change listener; owns the clipboard on both platforms.
+- [ ] **Audio Endpoint Routing:** Enumerate output endpoints, switch the default, and read/set the master volume (PipeWire / WASAPI).
+- [ ] **Display Brightness:** ACPI backlight for internal panels and DDC/CI for external monitors.
+
+Carried over from the original Phase 3 scope, to be scheduled after the four focus areas land:
+
 - [ ] **Display Topology:** Screen geometry, HiDPI scale factor, refresh rate, hotplug events (`QScreen` parity).
-- [ ] **Global Shortcuts:** Listen to key combinations across Wayland Portal, X11, and Win32.
 - [ ] **Taskbar Enhancements:** Taskbar icon badge numbers, progress bars, and JumpLists.
 - [ ] **Native Dialogs:** Portal FileChooser and Win32 IFileDialog abstractions.
 - [ ] **Live Wallpaper Engine (Foundation):** Transparent window layer on Wayland (`layer-shell`) and Windows (`WorkerW`).

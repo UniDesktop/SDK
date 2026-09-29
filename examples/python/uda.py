@@ -164,6 +164,37 @@ class PlaybackStatus:
     UNKNOWN: Final[str] = "unknown"
 
 
+class SessionAction:
+    """会话与电源动作常量（``uda.session`` 命名空间的动作名）。
+
+    仅 ``LOCK`` 可以安全地自动化；其余五个会结束用户会话或停止机器，必须由宿
+    主应用先取得用户**显式确认**再调用。
+    """
+
+    LOCK: Final[str] = "lock"
+    LOGOUT: Final[str] = "logout"
+    SUSPEND: Final[str] = "suspend"
+    HIBERNATE: Final[str] = "hibernate"
+    REBOOT: Final[str] = "reboot"
+    SHUTDOWN: Final[str] = "shutdown"
+
+
+class SessionCapability:
+    """会话能力位常量，与 ``include/uda.h`` 的 UDA_SESSION_CAP_* 一致。
+
+    能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器仍置位
+    ``HIBERNATE``，真正拒绝发生在调用时（抛 :class:`UdaError` 状态码 -2）。
+    """
+
+    MANAGEMENT: Final[int] = 0x00010000
+    LOCK: Final[int] = 0x00020000
+    LOGOUT: Final[int] = 0x00040000
+    SUSPEND: Final[int] = 0x00080000
+    HIBERNATE: Final[int] = 0x00100000
+    REBOOT: Final[int] = 0x00200000
+    SHUTDOWN: Final[int] = 0x00400000
+
+
 _FILL_CODES: Final[dict[str, int]] = {
     FillMode.CROP: 0,
     FillMode.FILL: 1,
@@ -192,6 +223,26 @@ _MEDIA_STATUS_NAMES: Final[dict[int, str]] = {
     1: PlaybackStatus.PAUSED,
     2: PlaybackStatus.STOPPED,
     3: PlaybackStatus.UNKNOWN,
+}
+
+#: 会话动作名 -> C-ABI 函数名后缀，用于 ``uda_session_*``。
+_SESSION_ACTIONS: Final[dict[str, str]] = {
+    SessionAction.LOCK: "lock",
+    SessionAction.LOGOUT: "logout",
+    SessionAction.SUSPEND: "suspend",
+    SessionAction.HIBERNATE: "hibernate",
+    SessionAction.REBOOT: "reboot",
+    SessionAction.SHUTDOWN: "shutdown",
+}
+
+#: 会话动作名 -> 能力位，便于调用方在不查询掩码的情况下做单点判断。
+_SESSION_ACTION_CAPABILITY: Final[dict[str, int]] = {
+    SessionAction.LOCK: SessionCapability.LOCK,
+    SessionAction.LOGOUT: SessionCapability.LOGOUT,
+    SessionAction.SUSPEND: SessionCapability.SUSPEND,
+    SessionAction.HIBERNATE: SessionCapability.HIBERNATE,
+    SessionAction.REBOOT: SessionCapability.REBOOT,
+    SessionAction.SHUTDOWN: SessionCapability.SHUTDOWN,
 }
 
 _THEME_NAMES: Final[dict[int, str]] = {
@@ -472,6 +523,17 @@ class Uda:
         self._lib.uda_media_send_command.argtypes = [ctypes.c_int32]
         self._lib.uda_media_send_command.restype = ctypes.c_int32
 
+        # ---- 会话与电源（Session） ----
+        # 能力查询写一个 uint32_t 掩码；六个动作无参无出参，只回状态码。
+        self._lib.uda_session_capabilities.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        self._lib.uda_session_capabilities.restype = ctypes.c_int32
+
+        for _suffix in _SESSION_ACTIONS.values():
+            _function = getattr(self._lib, f"uda_session_{_suffix}")
+            _function.argtypes = []
+            _function.restype = ctypes.c_int32
+        del _suffix, _function
+
         # ---- 托盘（Tray） ----
         self._lib.uda_tray_create.argtypes = [
             ctypes.c_char_p,
@@ -620,6 +682,28 @@ class Uda:
             uda.media.play_pause()
         """
         return _MediaController(self)
+
+    # ------------------------------------------------------------------
+    # 会话与电源（Session）
+    # ------------------------------------------------------------------
+    @property
+    def session(self) -> "_SessionController":
+        """会话与电源生命周期入口。
+
+        提供六个动作（:attr:`_SessionController.lock`、
+        :attr:`_SessionController.logout`、:attr:`_SessionController.suspend`、
+        :attr:`_SessionController.hibernate`、:attr:`_SessionController.reboot`、
+        :attr:`_SessionController.shutdown`）与一个能力查询
+        :attr:`_SessionController.capabilities`。
+
+        **除锁屏外，其余五个动作会结束用户会话或停止机器**，必须由宿主应用先
+        取得用户显式确认后再调用::
+
+            caps = uda.session.capabilities
+            if caps["shutdown"]:
+                uda.session.shutdown()   # 仅在用户确认之后！
+        """
+        return _SessionController(self)
 
     # ------------------------------------------------------------------
     # 壁纸
@@ -1045,6 +1129,177 @@ class _MediaController:
     def stop(self) -> None:
         """停止播放。"""
         self.send(MediaCommand.STOP)
+
+
+class _SessionController:
+    """会话与电源生命周期命名空间（``uda.session``）。
+
+    六个动作方法各自对应一个 C 导出 ``uda_session_*``，互不掩饰自己触发的是
+    哪个系统动作；调用点从源码就能看出来，而不是一个泛泛的
+    ``perform(action_code)``。
+
+    **安全约定**：除 :meth:`lock` 外的五个方法会结束用户会话或停止机器，返回
+    成功时已不可撤销。请先用 :attr:`capabilities` 确认平台支持，并在调用前取得
+    用户显式确认。
+    """
+
+    __slots__ = ("_uda",)
+
+    def __init__(self, uda: "Uda") -> None:
+        self._uda = uda
+
+    # ------------------------------------------------------------------
+    # 能力查询（无副作用，可随时调用）
+    # ------------------------------------------------------------------
+    @property
+    def capabilities(self) -> dict[str, bool]:
+        """当前平台的会话动作能力矩阵。
+
+        返回一个以动作名为键的字典，例如::
+
+            {"lock": True, "logout": True, "suspend": True,
+             "hibernate": False, "reboot": True, "shutdown": True}
+
+        该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调
+        用来决定界面上画哪些按钮——也必须在画出"关机"这类按钮之前调用。
+
+        能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器依
+        然 ``hibernate: True``，真正拒绝发生在调用时。Windows 的 reboot /
+        shutdown 还需要 `SeShutdownPrivilege`，同样是运行时答案。
+        """
+        slot = _UInt32Slot()
+
+        self._uda._check(
+            self._uda._lib.uda_session_capabilities(ctypes.byref(slot._slot)),
+            "session_capabilities",
+        )
+
+        return {
+            action: bool(slot.value & capability)
+            for action, capability in _SESSION_ACTION_CAPABILITY.items()
+        }
+
+    def supports(self, action: str) -> bool:
+        """单个动作是否被当前平台支持。
+
+        Args:
+            action: :class:`SessionAction` 常量之一。
+
+        Returns:
+            ``True`` 表示后端存在该动作的代码路径。
+
+        Raises:
+            UdaError: 动作名无法识别（状态码 -1）。
+        """
+        capability = self._capability_of(action)
+        slot = _UInt32Slot()
+
+        self._uda._check(
+            self._uda._lib.uda_session_capabilities(ctypes.byref(slot._slot)),
+            "session_capabilities",
+        )
+
+        return bool(slot.value & capability)
+
+    def _capability_of(self, action: str) -> int:
+        """把动作名翻译成能力位；未知名直接拒绝而不是猜一个。"""
+        try:
+            return _SESSION_ACTION_CAPABILITY[action]
+        except KeyError:
+            known = "、".join(sorted(_SESSION_ACTION_CAPABILITY))
+            raise UdaError(
+                ERR_INVALID_ARGUMENT,
+                f"未知的会话动作 {action!r}；可用动作：{known}",
+            ) from None
+
+    def _perform(self, action: str) -> None:
+        """调用 ``uda_session_<action>`` 并把状态码翻译成异常或成功。"""
+        try:
+            suffix = _SESSION_ACTIONS[action]
+        except KeyError:
+            known = "、".join(sorted(_SESSION_ACTIONS))
+            raise UdaError(
+                ERR_INVALID_ARGUMENT,
+                f"未知的会话动作 {action!r}；可用动作：{known}",
+            ) from None
+
+        self._uda._check(
+            getattr(self._uda._lib, f"uda_session_{suffix}")(),
+            f"session_{suffix}",
+        )
+
+    # ------------------------------------------------------------------
+    # 六个动作
+    # ------------------------------------------------------------------
+    def lock(self) -> None:
+        """锁定会话；**这是唯一可以安全自动化的动作**。
+
+        Linux：session 总线上的 ``org.freedesktop.ScreenSaver.Lock()``，失败时
+        回退 ``loginctl lock-session``。Windows：``LockWorkStation()``。
+
+        该动作可逆（用户输密码解锁）且不销毁任何数据，正在运行的程序继续运行。
+        """
+        self._perform(SessionAction.LOCK)
+
+    def logout(self) -> None:
+        """结束当前用户的会话。
+
+        Linux：system 总线的
+        ``org.freedesktop.login1.Manager.TerminateSession("")``，失败时回退桌
+        面自己的会话管理器。Windows：``ExitWindowsEx(EWX_LOGOFF, 0)``。
+
+        Warning:
+            该动作会注销用户，未保存的工作可能丢失。**必须**先取得用户显式确
+            认。
+        """
+        self._perform(SessionAction.LOGOUT)
+
+    def suspend(self) -> None:
+        """挂起机器到内存。
+
+        Linux：``org.freedesktop.login1.Manager.Suspend(false)``。Windows：
+        ``SetSuspendState(false, ...)``。
+
+        Warning:
+            该动作会改变机器的电源状态。**必须**先取得用户显式确认。
+        """
+        self._perform(SessionAction.SUSPEND)
+
+    def hibernate(self) -> None:
+        """休眠机器到磁盘。
+
+        Linux：``org.freedesktop.login1.Manager.Hibernate(false)``。Windows：
+        ``SetSuspendState(true, ...)``，系统未启用休眠时以状态码 -2 拒绝。
+
+        Warning:
+            该动作会改变机器的电源状态。**必须**先取得用户显式确认。
+        """
+        self._perform(SessionAction.HIBERNATE)
+
+    def reboot(self) -> None:
+        """重启机器。
+
+        Linux：``org.freedesktop.login1.Manager.Reboot(false)``。Windows：
+        ``ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)``，需先启用
+        `SeShutdownPrivilege`；权限不足时以状态码 -2 拒绝而不会执行到一半。
+
+        Warning:
+            该动作会重启机器，未保存的工作一定丢失。**必须**先取得用户显式确
+            认。
+        """
+        self._perform(SessionAction.REBOOT)
+
+    def shutdown(self) -> None:
+        """关闭机器电源。
+
+        Linux：``org.freedesktop.login1.Manager.PowerOff(false)``。Windows：
+        ``ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)``，同样需要
+        `SeShutdownPrivilege`。
+
+        Warning:
+            该动作会关机，未保存的工作一定丢失。**必须**先取得用户显式确认。
+        """
+        self._perform(SessionAction.SHUTDOWN)
 
 
 class WakeLock:

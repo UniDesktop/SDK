@@ -12,8 +12,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# 本文件位于 <repo>/examples/python/，因此父目录的父目录即仓库根目录。
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# 本文件位于 <repo>/examples/python/，因此仓库根目录是其父目录的父目录的父目录
+# （python -> examples -> <repo>）。少一级会静默解析到 examples/，让所有相对
+# 仓库根的路径都指向不存在的位置。
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 #: 仓库自带图标目录。
 ICONS = REPO_ROOT / "icons"

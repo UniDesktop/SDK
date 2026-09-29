@@ -5,9 +5,11 @@
 //! Windows has no FreeDesktop-style daemon; the supported mechanism is the WinRT
 //! `Windows.UI.Notifications` API (see `AGENTS.md` section 3):
 //!
-//! 1. `ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02)`
-//!    produces an XML document with the standard title/body text nodes.
-//! 2. The `text` nodes are located with XPath and filled from the
+//! 1. `ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastImageAndText02)`
+//!    produces an XML document with the standard title/body text nodes and an
+//!    `<image>` node. A text-only host falls back to `ToastText02` (see
+//!    [`build_document`]).
+//! 2. The `text` and `image` nodes are located with XPath and filled from the
 //!    [`Notification`] fields.
 //! 3. `ToastNotificationManager::CreateToastNotifierWithId(app_name)` +
 //!    `ToastNotifier::Show()` displays the toast. The explicit id (rather than
@@ -41,19 +43,43 @@
 //! [`WindowsNotificationManager::availability`], which reports
 //! [`NotificationSetting`].
 //!
-//! # Limitations (Phase 1)
+//! # Limitations
 //!
-//! - **Actions.** Toast *buttons* require the `actions` content plus an
+//! - **Action buttons.** Toast buttons require the `actions` content plus an
 //!   activated handler that only a packaged app can register, so
 //!   `Notification::actions` is accepted for trait parity but not surfaced as
-//!   buttons in Phase 1.
+//!   buttons in an unpackaged host — the notification degrades to a read-only
+//!   text card. See `docs/internals/notification_specs.md` §3.2.
 //! - **Progress.** The FreeDesktop progress concept has no direct toast
 //!   equivalent; it is intentionally ignored rather than approximated.
+//! - **Toast source name.** On a host the shell has already bound to a package
+//!   identity (for example a Microsoft Store runtime), the card's source line
+//!   shows that package family name and cannot be overridden. See
+//!   `docs/internals/notification_specs.md` §3.1.
+//!
+//! # Icons
+//!
+//! `Notification::app_icon` is the *caller's* bitmap, which is separate from the
+//! icon Windows draws for the toast's identity (the small square in the card's
+//! top-left corner, taken from the AUMID/app registration). The two are
+//! independent, and an unpackaged process has no identity icon at all, so the
+//! `<image>` node has to be filled for any picture to appear.
+//!
+//! The template therefore varies with the input, because the two shapes have
+//! different schemas — see [`build_document`].
+//!
+//! The `src` attribute accepts a filesystem path, a `file://` URI, or an
+//! `http(s)://` URL. A plain Windows path is converted to a `file://` URI here
+//! because the notification platform resolves the attribute relative to the
+//! *shell's* context, not the sender's working directory, so a bare
+//! `C:\pics\a.png` is not reliably located. A value that already carries a
+//! scheme is passed through untouched, which keeps a caller that already built a
+//! URI from being double-prefixed.
 
 use std::sync::OnceLock;
 
-use windows::core::{HSTRING, PCWSTR};
-use windows::Data::Xml::Dom::{XmlDocument, XmlNodeList};
+use windows::core::{HSTRING, Interface, PCWSTR};
+use windows::Data::Xml::Dom::{XmlDocument, XmlElement, XmlNodeList};
 use windows::UI::Notifications::{
     ToastNotification, ToastNotificationManager, ToastNotifier, ToastTemplateType,
 };
@@ -64,13 +90,26 @@ use windows::Win32::UI::Shell::{
 
 use uda_core::capability::Capability;
 use uda_core::error::UdaError;
-use uda_core::notification::{Notification, NotificationManager, Urgency};
+use uda_core::notification::{self, Notification, NotificationManager, Urgency};
 
-/// XPath selecting the title text node of the `ToastText02` template.
+/// XPath selecting the title text node of the toast templates.
 const TITLE_XPATH: &str = "/toast/visual/binding/text[1]";
 
-/// XPath selecting the body text node of the `ToastText02` template.
+/// XPath selecting the body text node of the toast templates.
 const BODY_XPATH: &str = "/toast/visual/binding/text[2]";
+
+/// XPath selecting the image node of the `ToastImageAndText02` template.
+///
+/// Present in both image templates, so the same expression covers either of
+/// them. It is only queried for the image-carrying template, whose binding is
+/// guaranteed to contain the node.
+const IMAGE_XPATH: &str = "/toast/visual/binding/image";
+
+/// Text carried in `alt` when the caller supplied no name to draw alt text from.
+///
+/// The attribute is read aloud by a screen reader, so an empty value is worse
+/// than a generic word.
+const ICON_ALT_FALLBACK: &str = "notification";
 
 /// Windows notification manager.
 ///
@@ -109,14 +148,79 @@ impl WindowsNotificationManager {
         Ok(())
     }
 
+    /// Fill the `<image>` node of an image-carrying template.
+    ///
+    /// Kept separate from [`fill_template`] because only the image templates have
+    /// the node: calling this against `ToastText02` would fail on an XPath that
+    /// matches nothing, and the whole send would be rejected for a notification
+    /// the user asked to be text-only. [`build_document`] picks the template, so
+    /// the caller is the one that knows whether this may run.
+    fn fill_image(document: &XmlDocument, notification: &Notification) -> Result<(), UdaError> {
+        let source = notification::image_source(&notification.app_icon);
+        let Some(source) = source else {
+            // Nothing to draw. Leaving the template's own placeholder empty is
+            // the documented degradation: the shell then renders the card
+            // without a picture rather than with a broken-image frame.
+            return Ok(());
+        };
+
+        let image_xpath: HSTRING = IMAGE_XPATH.into();
+        let node = document
+            .SelectSingleNode(&image_xpath)
+            .map_err(|e| UdaError::Internal(format!("SelectSingleNode({IMAGE_XPATH}) failed: {e}")))?;
+
+        // `SelectSingleNode` returns an `IXmlNode`, but attributes live on an
+        // *element*: `SetAttribute` is declared on `XmlElement`. The cast is the
+        // query interface for the same COM object, so it costs no copy and
+        // cannot fail for a node the XPath already typed as an element.
+        let element = node
+            .cast::<XmlElement>()
+            .map_err(|e| UdaError::Internal(format!("the toast image node is not an element: {e}")))?;
+
+        // `SetAttribute` takes an `HSTRING`, so both names and both values are
+        // converted once here instead of at each of the four call sites.
+        let source_attribute: HSTRING = "src".into();
+        let alt_attribute: HSTRING = "alt".into();
+        let value: HSTRING = source.into();
+
+        element
+            .SetAttribute(&source_attribute, &value)
+            .map_err(|e| UdaError::Internal(format!("SetAttribute(src) failed: {e}")))?;
+
+        // `alt` is required by the schema and read aloud by a screen reader, so
+        // it carries the caller's name rather than being left empty.
+        let alt = notification::header_title(&notification.app_name).unwrap_or(ICON_ALT_FALLBACK);
+        let alt_value: HSTRING = alt.into();
+        element
+            .SetAttribute(&alt_attribute, &alt_value)
+            .map_err(|e| UdaError::Internal(format!("SetAttribute(alt) failed: {e}")))?;
+
+        Ok(())
+    }
+
     /// Build the toast XML document for a notification.
+    ///
+    /// The template is chosen from `app_icon` rather than fixed, because the two
+    /// shapes have different schemas: only `ToastImageAndText02` carries the
+    /// `<image>` node this fill needs. Selecting an image template
+    /// unconditionally would work too, but picking the text template when there
+    /// is no icon keeps the card from advertising a picture it does not have.
     fn build_document(notification: &Notification) -> Result<XmlDocument, UdaError> {
-        // `ToastText02` is the canonical two-line text toast: one title and one
-        // body line, which maps exactly onto `summary` + `body`.
-        let document = ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02)
+        // `ToastImageAndText02` is the two-line text toast with a leading
+        // image, which maps exactly onto `summary` + `body` + `app_icon`.
+        let (template, with_image) = if notification::image_source(&notification.app_icon).is_some() {
+            (ToastTemplateType::ToastImageAndText02, true)
+        } else {
+            (ToastTemplateType::ToastText02, false)
+        };
+
+        let document = ToastNotificationManager::GetTemplateContent(template)
             .map_err(|e| UdaError::Internal(format!("GetTemplateContent failed: {e}")))?;
 
         Self::fill_template(&document, notification)?;
+        if with_image {
+            Self::fill_image(&document, notification)?;
+        }
 
         Ok(document)
     }
@@ -369,10 +473,8 @@ impl NotificationManager for WindowsNotificationManager {
             );
         }
 
-        if !notification.app_icon.is_empty() {
-            log::debug!(
-                "Windows toast icon override requires the appImage content; app_icon ignored"
-            );
+        if notification::image_source(&notification.app_icon).is_none() {
+            log::debug!("no usable app_icon supplied; the toast keeps the identity's own image");
         }
 
         Ok(0)
@@ -399,6 +501,55 @@ mod tests {
     #[test]
     fn title_and_body_xpaths_are_distinct() {
         assert_ne!(TITLE_XPATH, BODY_XPATH);
+    }
+
+    #[test]
+    fn the_image_xpath_matches_the_image_node_only() {
+        // The expression must address exactly the image node of the image
+        // template, or the icon silently lands somewhere the schema forbids.
+        assert_eq!(IMAGE_XPATH, "/toast/visual/binding/image");
+        assert_ne!(IMAGE_XPATH, TITLE_XPATH);
+        assert_ne!(IMAGE_XPATH, BODY_XPATH);
+    }
+
+    // ------------------------------------------------------------------
+    // 图标来源规范化（委托给 core）
+    // ------------------------------------------------------------------
+    //
+    // The path/URI rules themselves live in [`uda_core::notification`] and are
+    // tested there, where they actually run: this crate is `#![cfg(windows)]`,
+    // so a test written here compiles to nothing on the Linux host that runs
+    // `cargo test --workspace`. What is asserted here is only what this module
+    // is responsible for - that the fill path really consults that helper, and
+    // that the template choice follows its answer.
+
+    #[test]
+    fn the_fill_path_uses_the_core_normaliser() {
+        // A Windows path must reach `SetAttribute` as a `file://` URI, which is
+        // only true if `fill_image` goes through the core helper rather than
+        // passing the caller's string through verbatim.
+        assert_eq!(
+            notification::image_source(r"C:\pics\icon.png").as_deref(),
+            Some("file:///C:/pics/icon.png")
+        );
+        assert_eq!(
+            notification::image_source("icons/icon.png").as_deref(),
+            Some("icons/icon.png")
+        );
+    }
+
+    #[test]
+    fn a_usable_icon_selects_the_image_template() {
+        // The two shapes have different schemas: only the image template has the
+        // `<image>` node, so the choice must track the helper's answer exactly.
+        let with_icon = Notification {
+            app_icon: r"C:\pics\icon.png".to_string(),
+            ..Notification::default()
+        };
+        let without_icon = Notification::default();
+
+        assert!(notification::image_source(&with_icon.app_icon).is_some());
+        assert!(notification::image_source(&without_icon.app_icon).is_none());
     }
 
     #[test]

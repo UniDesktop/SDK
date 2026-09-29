@@ -17,10 +17,10 @@
 
 ---
 
-> [!WARNING]
-> 🚧 **Active Development Branch (`develop`)**
-> 
-> You are viewing the **unstable development branch** for upcoming **v0.2.0**. Code here is actively undergoing experimental integration (System Tray, DBusMenu, Win32 Message Loops) and APIs may break without notice. For the battle-tested stable release, please switch to the [`main`](https://github.com/UniDesktop/SDK/tree/main) branch or check the [latest release (v0.1.0)](https://github.com/UniDesktop/SDK/releases).
+> [!IMPORTANT]
+> 🚀 **v0.2.0 Release Candidate Branch (`develop`)**
+>
+> **Phase 2 (Interactive Shell & System Integration) is complete** on this branch: the system tray, media playback control, and the session/power lifecycle have all been verified against real backends and are about to be tagged **v0.2.0**. For the long-lived stable line, switch to [`main`](https://github.com/UniDesktop/SDK/tree/main) or check the [v0.1.0 release](https://github.com/UniDesktop/SDK).
 
 ## Why UDA?
 
@@ -35,19 +35,21 @@ Building a cross-platform desktop application today means writing the same featu
 
 ## 🖥️ Desktop & Platform Support Matrix
 
-| Platform / DE | Theme Detection | Wallpaper | Notification | WakeLock |
-| --- | :---: | :---: | :---: | :---: |
-| **Windows 10 / 11** | ✅ | ✅ | ✅ | ✅ |
-| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ |
-| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ |
-| **XFCE** | ✅ | ✅ | ✅ | ✅ |
-| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ |
-| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ |
-| **Generic X11** | ⚠️ | ✅ | ⚠️ | ⚠️ |
+| Platform / DE | Theme | Wallpaper | Notification | WakeLock | Tray | Media | Session |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Windows 10 / 11** | ✅ | ✅ | ✅ [^1] | ✅ | ✅ | ✅ | ✅ |
+| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **XFCE** | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
+| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| **Generic X11** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
 
-> **Shipped in this release:** light/dark appearance detection with live system-follow support · wallpaper management with `Crop` / `Fill` / `Fit` / `Stretch` modes, multi-monitor targeting, and dark/light pairing · native notifications with action buttons and urgency hints · keep-awake locks (`WakeLockType::PreventDisplaySleep` / `PreventSystemIdle`).
+> **Shipped in this release:** light/dark appearance detection with live system-follow support · wallpaper management with `Crop` / `Fill` / `Fit` / `Stretch` modes, multi-monitor targeting, and dark/light pairing · native notifications with icon and urgency hints · keep-awake locks (`PreventDisplaySleep` / `PreventSystemIdle`) · **system tray** with a cross-platform menu model (text items, checkboxes, separators, submenus) · **media control** with metadata read and playback commands · **session & power lifecycle** (lock, logout, suspend, hibernate, reboot, shutdown).
 >
 > `✅` verified against the real backend · `⚠️` best-effort fallback — the exact capability is reported at runtime through `capabilities()`.
+
+[^1]: Windows notifications carry two platform restrictions. On a **Microsoft Store–installed runtime** (e.g. the Store build of Python or Node.js), the toast source is displayed as the host application's *package family name* (for example `PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0`) because Package Identity overrides the AppUserModelID; UDA cannot override that binding. In an **unpackaged script host**, interactive *action buttons* silently degrade to a read-only text card, because toast buttons require a COM activator registered by an MSIX package. See [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3.
 
 ---
 
@@ -158,25 +160,171 @@ uda/
 
 | Crate | Responsibility |
 | --- | --- |
-| [`uda-core`](crates/uda-core) | Defines the public contract: `AppearanceManager`, `WallpaperManager`, `NotificationManager`, `WakeLockManager`, plus `Capability`, `SupportLevel`, `Theme`, `FillMode`, `WallpaperOptions`, and `UdaError`. Contains no platform code. |
-| [`uda-platform-linux`](crates/uda-platform-linux) | Implements the contract over `zbus`, the XDG Desktop Portal, GNOME `gsettings`, KDE `plasmashell`, Hyprland/Sway sockets, and X11 CLI tools (`feh`, `nitrogen`). |
-| [`uda-platform-windows`](crates/uda-platform-windows) | Implements the contract over the registry, `SystemParametersInfoW`, `SetThreadExecutionState`, and WinRT toasts. Gated by `#![cfg(windows)]` so a Linux host never breaks the build. |
-| [`uda-ffi`](crates/uda-ffi) | Wraps both backends behind eight `#[no_mangle] extern "C"` functions with panic containment at the boundary, and a thread-local last-error slot. |
+| [`uda-core`](crates/uda-core) | Defines the public contract: `AppearanceManager`, `WallpaperManager`, `NotificationManager`, `WakeLockManager`, `TrayManager`, `MediaManager`, `SessionManager`, plus `Capability`, `SupportLevel`, `Theme`, `FillMode`, `WallpaperOptions`, and `UdaError`. Contains no platform code. |
+| [`uda-platform-linux`](crates/uda-platform-linux) | Implements the contract over `zbus`, the XDG Desktop Portal, GNOME `gsettings`, KDE `plasmashell`, Hyprland/Sway sockets, X11 CLI tools (`feh`, `nitrogen`), and MPRIS v2 / SNI / logind. |
+| [`uda-platform-windows`](crates/uda-platform-windows) | Implements the contract over the registry, `SystemParametersInfoW`, `SetThreadExecutionState`, WinRT toasts, `Shell_NotifyIconW`, WinRT SMTC, and the Win32 session/power APIs. Gated by `#![cfg(windows)]` so a Linux host never breaks the build. |
+| [`uda-ffi`](crates/uda-ffi) | Wraps both backends behind `#[no_mangle] extern "C"` functions with panic containment at the boundary, and a thread-local last-error slot. |
 
 ---
 
-## 🗺️ Roadmap to v0.2.0
+## 🧩 New in v0.2.0 — Tray, Media & Session
 
-The following are **planned** and not yet implemented.
+### System Tray
 
-| Feature | Target |
+Cross-platform menu model — text items, checkboxes, separators, submenus, and disabled states. On Linux the icon is exported over SNI (`org.kde.StatusNotifierItem` + DBusMenu); on Windows it uses `Shell_NotifyIconW` driven by a dedicated worker thread with its own message pump, so the host's event loop is never hijacked.
+
+**Rust**
+
+```rust
+use uda_core::tray::{TrayIcon, TrayMenu, TrayIconSource};
+use uda_platform_linux::tray::LinuxTrayManager;
+
+let menu = TrayMenu::new()
+    .text("设置", || log::info!("settings clicked"))
+    .checkbox("自动启动", true, |on| log::info!("autostart = {on}"))
+    .separator()
+    .text("退出", || std::process::exit(0));
+
+let icon = LinuxTrayManager::new()
+    .create(TrayIcon::builder()
+        .name("UDA Demo")
+        .tooltip("UDA Tray")
+        .icon(TrayIconSource::Path("icons/UniDesktop_3D_transparent_mini.png".into()))
+        .menu(menu)
+        .build())?;
+
+icon.wait();          // block until the icon is destroyed
+drop(icon);           // or let Drop unregister it from the tray
+```
+
+**Python**
+
+```python
+from uda import Uda
+
+with Uda() as uda:
+    menu = uda.create_tray_menu()
+    menu.add_text("设置", lambda: print("settings"))
+    menu.add_checkbox("自动启动", True, lambda on: print("autostart", on))
+    menu.add_separator()
+
+    icon = uda.create_tray_icon("UDA Demo", tooltip="UDA Tray")
+    icon.menu = menu
+    icon.wait()
+```
+
+**Node.js**
+
+```javascript
+const { Uda } = require('./uda');
+
+const uda = new Uda();
+const menu = uda.createTrayMenu();
+menu.addText('设置', () => console.log('settings'));
+menu.addCheckbox('自动启动', true, (on) => console.log('autostart', on));
+menu.addSeparator();
+
+const icon = uda.createTrayIcon('UDA Demo', { tooltip: 'UDA Tray' });
+icon.menu = menu;
+await icon.wait();
+icon.destroy();
+```
+
+### Media Playback Control
+
+Read what is playing and drive the player. Linux speaks MPRIS v2 over the session bus; Windows uses WinRT SMTC.
+
+**Rust**
+
+```rust
+use uda_core::media::{MediaCommand, MediaManager};
+use uda_platform_linux::media::LinuxMediaManager;
+
+let manager = LinuxMediaManager::new().await?;
+if let Some(track) = manager.active_metadata()? {
+    println!("{} — {}", track.title, track.artists.join(", "));
+}
+manager.send_command(MediaCommand::PlayPause)?;
+```
+
+**Python**
+
+```python
+with Uda() as uda:
+    track = uda.media.now_playing          # None when no player is running
+    if track:
+        print(f"{track.title} — {', '.join(track.artists)}")
+    print(uda.media.status)                # 'playing' | 'paused' | 'stopped'
+    uda.media.send("play_pause")
+```
+
+**Node.js**
+
+```javascript
+const uda = new Uda();
+const now = uda.media.nowPlaying;         // null when no player is running
+if (now) console.log(`${now.title} — ${now.artists.join(', ')}`);
+console.log(uda.media.status);
+uda.media.send('play_pause');
+```
+
+### Session & Power Lifecycle
+
+Lock, logout, suspend, hibernate, reboot and shutdown from one call. Windows acquires `SeShutdownPrivilege` through a proper token dance before `ExitWindowsEx`, and a refusal is reported as a typed error rather than a panic.
+
+**Rust**
+
+```rust
+use uda_core::session::{SessionAction, SessionManager, perform};
+use uda_platform_windows::session::WindowsSessionManager;
+
+let manager = WindowsSessionManager::new();
+
+// Ask first: locking is the only action considered safe to automate.
+for action in [SessionAction::Lock, SessionAction::Suspend] {
+    if manager.capabilities()?.contains(action.capability()) {
+        perform(&manager, action)?;
+    }
+}
+```
+
+**Python**
+
+```python
+with Uda() as uda:
+    caps = uda.session.capabilities()          # {'lock': True, 'reboot': False, ...}
+    if caps["lock"]:
+        uda.session.lock()                     # safe to automate
+    # uda.session.reboot()                    # destructive — opt in explicitly
+```
+
+**Node.js**
+
+```javascript
+const uda = new Uda();
+console.log(uda.session.capabilities);        // { lock: true, reboot: false, ... }
+if (uda.session.supports('lock')) uda.session.lock();
+// uda.session.reboot();                     // destructive — opt in explicitly
+```
+
+> **Safety contract:** only `lock` is non-destructive. Every other action is gated by a distinct capability bit, so a UI can query before it draws an entry that could shut the machine down.
+
+---
+
+## 🗺️ Roadmap
+
+**Phase 2 — Interactive Shell & System Integration (v0.2.0) is complete.** System tray, media playback control and the session/power lifecycle have all shipped and been verified against real backends.
+
+**Phase 3 (v0.3.0) — Shell Extensions & Window Topology** is the current target:
+
+| Feature | Focus |
 | --- | --- |
-| System Tray (`org.kde.StatusNotifierItem` + `Shell_NotifyIconW`) | Planned |
-| MPRIS v2 media control & metadata listener (SMTC on Windows) | Planned |
-| Global shortcut registration (Portal / X11 / Win32) | Planned |
-| Wayland input simulation via `libei` | Planned |
+| Global shortcuts | Key combinations across the Wayland Portal, X11 and Win32 |
+| Advanced clipboard | Multi-format MIME read/write with a change listener |
+| Audio endpoint routing | Default output device switching and master volume |
+| Display brightness | ACPI backlight plus DDC/CI for external monitors |
 
-Later phases cover clipboard, audio routing, display brightness, session lifecycle, virtual desktops, and screen capture.
+Later phases cover display topology and HiDPI, taskbar badges and progress bars, native file dialogs, virtual desktops, window aesthetics (Mica / Acrylic / KWin blur), input simulation, screen capture, and idle detection.
 
 ---
 

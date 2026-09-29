@@ -53,11 +53,14 @@ mod dispatch;
 mod error;
 mod media;
 mod notify;
+mod session;
 mod tray;
 mod util;
 mod wakelocks;
 
 use std::os::raw::{c_char, c_int, c_void};
+
+use uda_core::session::SessionAction;
 
 pub use error::{status_message, UdaStatus};
 
@@ -68,6 +71,15 @@ pub use media::{
     UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PAUSE, UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PREVIOUS,
     UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
     UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
+};
+
+// Re-exported from the session module: the capability bitmask is part of the C
+// ABI as well, because a caller must be able to ask "which actions exist here?"
+// *before* drawing a menu that could shut the machine down.
+pub use session::{
+    UDA_SESSION_CAP_HIBERNATE, UDA_SESSION_CAP_LOCK, UDA_SESSION_CAP_LOGOUT,
+    UDA_SESSION_CAP_MANAGEMENT, UDA_SESSION_CAP_REBOOT, UDA_SESSION_CAP_SHUTDOWN,
+    UDA_SESSION_CAP_SUSPEND,
 };
 
 /// Status code for "success".
@@ -276,6 +288,150 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
         let command = media::command_from_c(command)?;
         media::send_command(command)
     })
+}
+
+/// Report which session and power actions this platform can perform.
+///
+/// Writes a bitmask made of the [`UDA_SESSION_CAP_*`] constants to
+/// `*out_capabilities`. `0` means "no session backend exists on this target".
+///
+/// This is a *static, side-effect-free* query: it costs one D-Bus connection at
+/// most and never touches the machine's power state, so a UI may call it freely
+/// to decide which menu entries to draw.
+///
+/// A set bit means "the code path exists", not "the account is allowed". A
+/// machine with hibernation switched off still reports
+/// [`UDA_SESSION_CAP_HIBERNATE`]; the attempt then fails with
+/// [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED), which is what
+/// tells the caller the difference.
+///
+/// # Safety
+///
+/// `out_capabilities` must point at a writable `uint32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) -> c_int {
+    if out_capabilities.is_null() {
+        util::set_last_message("`out_capabilities` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let capabilities = session::capabilities();
+
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `uint32_t` at this address.
+        unsafe { *out_capabilities = capabilities.bits() };
+        Ok(())
+    })
+}
+
+/// Lock the session, leaving every running program alone.
+///
+/// Linux: `org.freedesktop.ScreenSaver.Lock()` on the session bus, falling back
+/// to `loginctl lock-session`. Windows: `user32!LockWorkStation`.
+///
+/// This is the **only** action safe to automate: it is reversible (the user
+/// unlocks with their password) and destroys nothing. The other five exports
+/// must be gated behind an explicit user confirmation.
+///
+/// Returns [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) when
+/// the platform advertises no lock capability at all.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_lock() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Lock))
+}
+
+/// End the calling user's session.
+///
+/// Linux: `org.freedesktop.login1.Manager.TerminateSession("")` on the system
+/// bus, falling back to the desktop's own session manager. Windows:
+/// `ExitWindowsEx(EWX_LOGOFF, 0)`.
+///
+/// **This action logs the user out.** Unsaved work is lost unless the desktop
+/// refuses to comply. Never call it without an explicit confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_logout() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Logout))
+}
+
+/// Suspend the machine to RAM.
+///
+/// Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
+/// `SetSuspendState(false, ...)`.
+///
+/// **This action changes the machine's power state.** Never call it without an
+/// explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_suspend() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Suspend))
+}
+
+/// Hibernate the machine to disk.
+///
+/// Linux: `org.freedesktop.login1.Manager.Hibernate(false)`. Windows:
+/// `SetSuspendState(true, ...)`, which the platform rejects with
+/// `ERROR_FILE_NOT_FOUND` when hibernation is disabled - reported as
+/// [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED).
+///
+/// **This action changes the machine's power state.** Never call it without an
+/// explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_hibernate() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Hibernate))
+}
+
+/// Restart the machine.
+///
+/// Linux: `org.freedesktop.login1.Manager.Reboot(false)`. Windows:
+/// `ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)` after enabling
+/// `SeShutdownPrivilege`, which needs an elevated process or a local
+/// administrator account; without it the call fails with
+/// [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) rather than
+/// half-rebooting.
+///
+/// **This action restarts the machine.** Unsaved work is lost. Never call it
+/// without an explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_reboot() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Reboot))
+}
+
+/// Power the machine off.
+///
+/// Linux: `org.freedesktop.login1.Manager.PowerOff(false)`. Windows:
+/// `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)` after enabling
+/// `SeShutdownPrivilege`, with the same elevation requirement as
+/// [`uda_session_reboot`].
+///
+/// **This action shuts the machine down.** Unsaved work is lost. Never call it
+/// without an explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_shutdown() -> c_int {
+    util::catch_boundary(|| session::perform(SessionAction::Shutdown))
 }
 
 /// Read the current wallpaper path.

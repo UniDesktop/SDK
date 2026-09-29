@@ -16,10 +16,10 @@
 
 ---
 
-> [!WARNING]
-> **🚧 正在积极开发的前沿分支 (`develop`)**
-> 
-> 您当前浏览的是正在筹备 **v0.2.0** 的**前沿开发分支**。此分支代码正处于高频实验性开发期（系统托盘、DBusMenu、Win32 消息循环），API 可能会随时发生不兼容变动。如需使用经过全面测试的生产稳定版，请切换至 [`main`](https://github.com/UniDesktop/SDK/tree/main) 稳定分支或查看 [v0.1.0 正式发布版](https://github.com/UniDesktop/SDK/releases)。
+> [!IMPORTANT]
+> **🚀 v0.2.0 发版筹备分支 (`develop`)**
+>
+> 本分支已收官 **Phase 2（交互式 Shell 与系统集成）**：系统托盘、媒体播控与会话电源生命周期均已在真实后端上完成验证。随即将以 **v0.2.0** 标签合并发布。如需使用经过长期考验的生产稳定版，请切换至 [`main`](https://github.com/UniDesktop/SDK/tree/main) 分支或查看 [v0.1.0 正式发布版](https://github.com/UniDesktop/SDK/releases)。
 
 ## 为什么需要 UDA？
 
@@ -34,19 +34,21 @@
 
 ## 🖥️ 桌面环境与平台支持矩阵
 
-| 平台 / 桌面环境 | 主题检测 | 壁纸 | 通知 | 防休眠锁 |
-| --- | :---: | :---: | :---: | :---: |
-| **Windows 10 / 11** | ✅ | ✅ | ✅ | ✅ |
-| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ |
-| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ |
-| **XFCE** | ✅ | ✅ | ✅ | ✅ |
-| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ |
-| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ |
-| **通用 X11** | ⚠️ | ✅ | ⚠️ | ⚠️ |
+| 平台 / 桌面环境 | 主题 | 壁纸 | 通知 | 防休眠锁 | 系统托盘 | 媒体播控 | 会话电源 |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Windows 10 / 11** | ✅ | ✅ | ✅ [^1] | ✅ | ✅ | ✅ | ✅ |
+| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **XFCE** | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
+| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| **通用 X11** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
 
-> **本版本已交付：** 深浅色外观检测并支持跟随系统 · 壁纸管理（`Crop` / `Fill` / `Fit` / `Stretch` 四种模式、多显示器指定、深浅色配对）· 原生通知（动作按钮与紧急度提示）· 防休眠常亮锁（`WakeLockType::PreventDisplaySleep` / `PreventSystemIdle`）。
+> **本版本已交付：** 深浅色外观检测并支持跟随系统 · 壁纸管理（`Crop` / `Fill` / `Fit` / `Stretch` 四种模式、多显示器指定、深浅色配对）· 原生通知（含图标与紧急度提示）· 防休眠常亮锁（`PreventDisplaySleep` / `PreventSystemIdle`）· **系统托盘**（文本项、复选框、分隔线、子菜单的跨平台菜单模型）· **媒体播控**（元数据读取与播放控制）· **会话与电源生命周期**（锁屏、注销、睡眠、休眠、重启、关机）。
 >
 > `✅` 已验证对接真实后端 · `⚠️` 尽力而为的回退方案——具体能力通过运行时的 `capabilities()` 上报。
+
+[^1]: Windows 通知存在两项平台限制。在 **Microsoft Store 安装的运行时**（如商店版 Python、Node.js）中，toast 来源会显示为宿主应用的**包族名**（例如 `PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0`），因为 Package Identity 会覆盖 AppUserModelID，UDA 无法改写该绑定。在**未打包的脚本环境**中，交互式*动作按钮*会静默降级为只读文本卡片，因为 toast 按钮需要由 MSIX 包注册的 COM 激活器。详见 [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3。
 
 ---
 
@@ -160,25 +162,171 @@ uda/
 
 | Crate | 职责 |
 | --- | --- |
-| [`uda-core`](crates/uda-core) | 定义公共契约：`AppearanceManager`、`WallpaperManager`、`NotificationManager`、`WakeLockManager`，以及 `Capability`、`SupportLevel`、`Theme`、`FillMode`、`WallpaperOptions`、`UdaError`。不含任何平台代码。 |
-| [`uda-platform-linux`](crates/uda-platform-linux) | 基于 `zbus`、XDG Desktop Portal、GNOME `gsettings`、KDE `plasmashell`、Hyprland/Sway socket 与 X11 CLI 工具（`feh`、`nitrogen`）实现上述契约。 |
-| [`uda-platform-windows`](crates/uda-platform-windows) | 基于注册表、`SystemParametersInfoW`、`SetThreadExecutionState` 与 WinRT toast 实现上述契约。以 `#![cfg(windows)]` 门控，确保 Linux 宿主编译不受影响。 |
-| [`uda-ffi`](crates/uda-ffi) | 将两套后端封装为 8 个 `#[no_mangle] extern "C"` 函数，边界处遏制 panic，并提供线程本地的 last-error 槽位。 |
+| [`uda-core`](crates/uda-core) | 定义公共契约：`AppearanceManager`、`WallpaperManager`、`NotificationManager`、`WakeLockManager`、`TrayManager`、`MediaManager`、`SessionManager`，以及 `Capability`、`SupportLevel`、`Theme`、`FillMode`、`WallpaperOptions`、`UdaError`。不含任何平台代码。 |
+| [`uda-platform-linux`](crates/uda-platform-linux) | 基于 `zbus`、XDG Desktop Portal、GNOME `gsettings`、KDE `plasmashell`、Hyprland/Sway socket、X11 CLI 工具（`feh`、`nitrogen`）、MPRIS v2、SNI 与 logind 实现上述契约。 |
+| [`uda-platform-windows`](crates/uda-platform-windows) | 基于注册表、`SystemParametersInfoW`、`SetThreadExecutionState`、WinRT toast、`Shell_NotifyIconW`、WinRT SMTC 与 Win32 会话/电源 API 实现上述契约。以 `#![cfg(windows)]` 门控，确保 Linux 宿主编译不受影响。 |
+| [`uda-ffi`](crates/uda-ffi) | 将两套后端封装为若干 `#[no_mangle] extern "C"` 函数，边界处遏制 panic，并提供线程本地的 last-error 槽位。 |
 
 ---
 
-## 🗺️ v0.2.0 路线图
+## 🧩 v0.2.0 新增 —— 托盘、媒体与会话
 
-以下功能**尚在规划中，尚未实现**。
+### 系统托盘
 
-| 功能 | 状态 |
+跨平台菜单数据模型：文本项、复选框、分隔线、子菜单与禁用态。Linux 侧通过 SNI（`org.kde.StatusNotifierItem` + DBusMenu）导出托盘图标；Windows 侧使用 `Shell_NotifyIconW`，由独立工作线程与专用消息泵驱动，宿主的事件循环永不被劫持。
+
+**Rust**
+
+```rust
+use uda_core::tray::{TrayIcon, TrayMenu, TrayIconSource};
+use uda_platform_linux::tray::LinuxTrayManager;
+
+let menu = TrayMenu::new()
+    .text("设置", || log::info!("点击了设置"))
+    .checkbox("开机自启", true, |on| log::info!("自启 = {on}"))
+    .separator()
+    .text("退出", || std::process::exit(0));
+
+let icon = LinuxTrayManager::new()
+    .create(TrayIcon::builder()
+        .name("UDA Demo")
+        .tooltip("UDA Tray")
+        .icon(TrayIconSource::Path("icons/UniDesktop_3D_transparent_mini.png".into()))
+        .menu(menu)
+        .build())?;
+
+icon.wait();          // 阻塞至图标被销毁
+drop(icon);           // 或交给 Drop 自动从托盘注销
+```
+
+**Python**
+
+```python
+from uda import Uda
+
+with Uda() as uda:
+    menu = uda.create_tray_menu()
+    menu.add_text("设置", lambda: print("设置"))
+    menu.add_checkbox("开机自启", True, lambda on: print("自启", on))
+    menu.add_separator()
+
+    icon = uda.create_tray_icon("UDA Demo", tooltip="UDA Tray")
+    icon.menu = menu
+    icon.wait()
+```
+
+**Node.js**
+
+```javascript
+const { Uda } = require('./uda');
+
+const uda = new Uda();
+const menu = uda.createTrayMenu();
+menu.addText('设置', () => console.log('设置'));
+menu.addCheckbox('开机自启', true, (on) => console.log('自启', on));
+menu.addSeparator();
+
+const icon = uda.createTrayIcon('UDA Demo', { tooltip: 'UDA Tray' });
+icon.menu = menu;
+await icon.wait();
+icon.destroy();
+```
+
+### 媒体播控
+
+读取当前播放信息并控制播放器。Linux 侧走会话总线上的 MPRIS v2，Windows 侧使用 WinRT SMTC。
+
+**Rust**
+
+```rust
+use uda_core::media::{MediaCommand, MediaManager};
+use uda_platform_linux::media::LinuxMediaManager;
+
+let manager = LinuxMediaManager::new().await?;
+if let Some(track) = manager.active_metadata()? {
+    println!("{} — {}", track.title, track.artists.join(", "));
+}
+manager.send_command(MediaCommand::PlayPause)?;
+```
+
+**Python**
+
+```python
+with Uda() as uda:
+    track = uda.media.now_playing          # 无播放器时为 None
+    if track:
+        print(f"{track.title} — {', '.join(track.artists)}")
+    print(uda.media.status)                # 'playing' | 'paused' | 'stopped'
+    uda.media.send("play_pause")
+```
+
+**Node.js**
+
+```javascript
+const uda = new Uda();
+const now = uda.media.nowPlaying;         // 无播放器时为 null
+if (now) console.log(`${now.title} — ${now.artists.join(', ')}`);
+console.log(uda.media.status);
+uda.media.send('play_pause');
+```
+
+### 会话与电源生命周期
+
+一次调用完成锁屏、注销、睡眠、休眠、重启与关机。Windows 侧在 `ExitWindowsEx` 之前会通过标准的 Token 提权流程获取 `SeShutdownPrivilege`，提权被拒时上报类型化错误而非 panic。
+
+**Rust**
+
+```rust
+use uda_core::session::{SessionAction, SessionManager, perform};
+use uda_platform_windows::session::WindowsSessionManager;
+
+let manager = WindowsSessionManager::new();
+
+// 先查询：锁屏是唯一被认为可安全自动化的动作。
+for action in [SessionAction::Lock, SessionAction::Suspend] {
+    if manager.capabilities()?.contains(action.capability()) {
+        perform(&manager, action)?;
+    }
+}
+```
+
+**Python**
+
+```python
+with Uda() as uda:
+    caps = uda.session.capabilities()          # {'lock': True, 'reboot': False, ...}
+    if caps["lock"]:
+        uda.session.lock()                     # 可安全自动化
+    # uda.session.reboot()                    # 破坏性动作——需显式启用
+```
+
+**Node.js**
+
+```javascript
+const uda = new Uda();
+console.log(uda.session.capabilities);        // { lock: true, reboot: false, ... }
+if (uda.session.supports('lock')) uda.session.lock();
+// uda.session.reboot();                     // 破坏性动作——需显式启用
+```
+
+> **安全约定：** 只有 `lock` 是非破坏性的。其余动作各自对应独立的能力位，UI 可以先查询再决定是否展示可能导致关机的菜单项。
+
+---
+
+## 🗺️ 路线图
+
+**Phase 2 —— 交互式 Shell 与系统集成（v0.2.0）已收官。** 系统托盘、媒体播控与会话电源生命周期均已交付，并已在真实后端上完成验证。
+
+**Phase 3（v0.3.0）—— Shell 扩展与窗口拓扑** 为当前目标：
+
+| 功能 | 重点 |
 | --- | --- |
-| 系统托盘（Linux `org.kde.StatusNotifierItem` + Windows `Shell_NotifyIconW`） | 规划中 |
-| MPRIS v2 媒体控制与元数据监听（Windows 侧为 SMTC） | 规划中 |
-| 全局快捷键注册（Portal / X11 / Win32） | 规划中 |
-| 基于 `libei` 的 Wayland 输入模拟 | 规划中 |
+| 全局快捷键 | 覆盖 Wayland Portal、X11 与 Win32 的组合键监听 |
+| 高级剪贴板 | 多格式 MIME 读写与变更监听 |
+| 音频端点路由 | 默认输出设备切换与主音量控制 |
+| 显示器亮度 | ACPI 背光与外接显示器 DDC/CI |
 
-后续阶段还将覆盖剪贴板、音频路由、屏幕亮度、会话生命周期、虚拟桌面与屏幕捕获。
+后续阶段还将覆盖显示器拓扑与 HiDPI、任务栏角标与进度条、原生文件对话框、虚拟桌面、窗口美化（Mica / Acrylic / KWin 模糊）、输入模拟、屏幕捕获与用户空闲检测。
 
 ---
 

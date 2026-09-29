@@ -20,6 +20,18 @@ version = "0.58"
 features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
+    # The session backend needs:
+    # * `Win32_Security` for `OpenProcessToken`, `AdjustTokenPrivileges`,
+    #   `LookupPrivilegeValueW` and `SE_SHUTDOWN_NAME` (the shutdown privilege).
+    # * `Win32_System_Shutdown` for `LockWorkStation` and `ExitWindowsEx`.
+    # * `Win32_System_Power` for `SetSuspendState` (sleep and hibernate).
+    # `Win32_Security` was already present for the registry-based appearance
+    # backend; it is listed here because the privilege API comes with it.
+    "Win32_Security",
+    "Win32_System_Shutdown",
+    "Win32_System_Power",
+    # `GetCurrentProcess()` (needed to open the process token) lives here.
+    "Win32_System_Threading",
     # `RegCreateKeyExW` and the `HKEY` type live behind this feature in the
     # `windows` crate; `RegOpenKeyExW`/`RegSetValueExW` do not, but keeping the
     # whole registry surface behind one feature avoids a split import list.

@@ -3,6 +3,7 @@ pub mod capability;
 pub mod error;
 pub mod media;
 pub mod notification;
+pub mod session;
 pub mod tray;
 pub mod wakelock;
 pub mod wallpaper;

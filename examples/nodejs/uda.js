@@ -57,6 +57,30 @@ const MEDIA_COMMAND_CODES = {
 /** C 播放状态码 -> SDK 字符串，与 `include/uda.h` 的 UDA_MEDIA_* 一致。 */
 const MEDIA_STATUS_NAMES = { 0: 'playing', 1: 'paused', 2: 'stopped', 3: 'unknown' };
 
+/** 会话动作名 -> C 函数后缀，对应 `uda_session_*` 导出。 */
+const SESSION_ACTIONS = ['lock', 'logout', 'suspend', 'hibernate', 'reboot', 'shutdown'];
+
+/** 会话动作名 -> 能力位，与 `include/uda.h` 的 UDA_SESSION_CAP_* 一致。 */
+const SESSION_ACTION_CAPABILITY = {
+  lock: 0x00020000,
+  logout: 0x00040000,
+  suspend: 0x00080000,
+  hibernate: 0x00100000,
+  reboot: 0x00200000,
+  shutdown: 0x00400000,
+};
+
+/** 全部会话能力位，便于掩码求差集时筛掉未文档化的位。 */
+const SESSION_CAPABILITY_ALL =
+  (0x00010000 |
+    0x00020000 |
+    0x00040000 |
+    0x00080000 |
+    0x00100000 |
+    0x00200000 |
+    0x00400000) >>>
+  0;
+
 /** 提交给 shell 的托盘图标最长边像素数（见 docs/internals/tray_specs.md §2.6）。 */
 const TRAY_ICON_MAX_EXTENT = 32;
 
@@ -220,6 +244,15 @@ function loadUda() {
       ])(titleSlot, artistSlot, albumSlot, durationSlot, positionSlot),
     mediaGetStatus: (slot) => library.func('uda_media_get_status', 'int32', ['void *'])(slot),
     mediaSendCommand: library.func('uda_media_send_command', 'int32', ['int32']),
+    // 会话与电源：能力查询写一个 uint32_t 掩码；六个动作无参，只回状态码。
+    sessionCapabilities: (slot) =>
+      library.func('uda_session_capabilities', 'int32', ['void *'])(slot),
+    sessionLock: library.func('uda_session_lock', 'int32', []),
+    sessionLogout: library.func('uda_session_logout', 'int32', []),
+    sessionSuspend: library.func('uda_session_suspend', 'int32', []),
+    sessionHibernate: library.func('uda_session_hibernate', 'int32', []),
+    sessionReboot: library.func('uda_session_reboot', 'int32', []),
+    sessionShutdown: library.func('uda_session_shutdown', 'int32', []),
     trayCreate: (name, tooltip, slot) =>
       library.func('uda_tray_create', 'int32', ['const char *', 'const char *', 'void *'])(
         name,
@@ -663,6 +696,24 @@ class Uda {
   }
 
   /**
+   * 会话与电源生命周期入口。
+   *
+   * 提供六个动作（`lock`、`logout`、`suspend`、`hibernate`、`reboot`、
+   * `shutdown`）与一个能力查询 `capabilities`。
+   *
+   * **除锁屏外，其余五个动作会结束用户会话或停止机器**，返回成功时已不可撤
+   * 销。请先用 `capabilities` 确认平台支持，并在调用前取得用户显式确认。
+   *
+   * @returns {SessionController}
+   */
+  get session() {
+    if (!this._session) {
+      this._session = new SessionController(this);
+    }
+    return this._session;
+  }
+
+  /**
    * 当前壁纸路径。
    *
    * @returns {string | null} 未设置或平台不支持时为 `null`。
@@ -992,6 +1043,179 @@ class MediaController {
   /** 停止播放。 */
   stop() {
     this.send('stop');
+  }
+}
+
+/**
+ * 会话与电源生命周期命名空间（`uda.session`）。
+ *
+ * 六个动作方法各自对应一个 C 导出 `uda_session_*`，互不掩饰自己触发的是哪个
+ * 系统动作；调用点从源码就能看出来，而不是一个泛泛的 `perform(actionCode)`。
+ *
+ * **安全约定**：除 `lock` 外的五个方法会结束用户会话或停止机器，返回成功时已
+ * 不可撤销。请先用 `capabilities` 确认平台支持，并在调用前取得用户显式确认。
+ *
+ * @example
+ * const caps = uda.session.capabilities;
+ * if (caps.shutdown) {
+ *   // 仅在用户确认之后！
+ *   uda.session.shutdown();
+ * }
+ */
+class SessionController {
+  /** @param {Uda} uda 拥有该控制器的 UDA 实例。 */
+  constructor(uda) {
+    this._uda = uda;
+  }
+
+  /**
+   * 当前平台的会话动作能力矩阵。
+   *
+   * 返回以动作名为键的布尔字典，例如
+   * `{ lock: true, logout: true, suspend: true, hibernate: false,
+   *    reboot: true, shutdown: true }`。
+   *
+   * 该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调用来
+   * 决定界面上画哪些按钮——也必须在画出“关机”这类按钮之前调用。
+   *
+   * 能力位表达“代码路径存在”，**不是**“当前账户被允许”：关掉休眠的机器依然
+   * `hibernate: true`，真正拒绝发生在调用时。Windows 的 `reboot` / `shutdown`
+   * 还需要 `SeShutdownPrivilege`，同样是运行时答案。
+   *
+   * @returns {{lock: boolean, logout: boolean, suspend: boolean,
+   *            hibernate: boolean, reboot: boolean, shutdown: boolean}}
+   */
+  get capabilities() {
+    const caps = {};
+    for (const action of SESSION_ACTIONS) {
+      caps[action] = this.supports(action);
+    }
+    return caps;
+  }
+
+  /**
+   * 单个动作是否被当前平台支持。
+   *
+   * @param {string} action 动作名：`lock` / `logout` / `suspend` /
+   *   `hibernate` / `reboot` / `shutdown`。
+   * @returns {boolean} `true` 表示后端存在该动作的代码路径。
+   * @throws {Error} 动作名无法识别时抛出（状态码 -1）。
+   */
+  supports(action) {
+    const capability = this._capabilityOf(action);
+    const slot = this._uda._lib.outSlot('uint32');
+    this._uda._check(this._uda._lib.sessionCapabilities(slot), 'session_capabilities');
+    const mask = Number(this._uda._lib.readSlot('uint32', slot));
+    return (mask & capability) !== 0;
+  }
+
+  /**
+   * 把动作名翻译成能力位；未知名直接拒绝而不是猜一个。
+   *
+   * @param {string} action 动作名。
+   * @returns {number} 能力位掩码。
+   * @private
+   */
+  _capabilityOf(action) {
+    const capability = SESSION_ACTION_CAPABILITY[action];
+    if (capability === undefined) {
+      const known = Object.keys(SESSION_ACTION_CAPABILITY).join('、');
+      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+    }
+    return capability;
+  }
+
+  /**
+   * 调用 `uda_session_<action>` 并把状态码翻译成异常或成功。
+   *
+   * @param {string} action 动作名。
+   * @private
+   */
+  _perform(action) {
+    if (!SESSION_ACTIONS.includes(action)) {
+      const known = SESSION_ACTIONS.join('、');
+      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+    }
+    const entry = this._uda._lib[`session${action[0].toUpperCase()}${action.slice(1)}`];
+    this._uda._check(entry(), `session_${action}`);
+  }
+
+  /**
+   * 锁定会话；**这是唯一可以安全自动化的动作**。
+   *
+   * Linux：session 总线上的 `org.freedesktop.ScreenSaver.Lock()`，失败时回退
+   * `loginctl lock-session`。Windows：`LockWorkStation()`。
+   *
+   * 该动作可逆（用户输密码解锁）且不销毁任何数据，正在运行的程序继续运行。
+   */
+  lock() {
+    this._perform('lock');
+  }
+
+  /**
+   * 结束当前用户的会话。
+   *
+   * Linux：system 总线的
+   * `org.freedesktop.login1.Manager.TerminateSession("")`，失败时回退桌面自己
+   * 的会话管理器。Windows：`ExitWindowsEx(EWX_LOGOFF, 0)`。
+   *
+   * **警告**：该动作会注销用户，未保存的工作可能丢失。**必须**先取得用户显式
+   * 确认。
+   */
+  logout() {
+    this._perform('logout');
+  }
+
+  /**
+   * 挂起机器到内存。
+   *
+   * Linux：`org.freedesktop.login1.Manager.Suspend(false)`。Windows：
+   * `SetSuspendState(false, ...)`。
+   *
+   * **警告**：该动作会改变机器的电源状态。**必须**先取得用户显式确认。
+   */
+  suspend() {
+    this._perform('suspend');
+  }
+
+  /**
+   * 休眠机器到磁盘。
+   *
+   * Linux：`org.freedesktop.login1.Manager.Hibernate(false)`。Windows：
+   * `SetSuspendState(true, ...)`，系统未启用休眠时以状态码 -2 拒绝。
+   *
+   * **警告**：该动作会改变机器的电源状态。**必须**先取得用户显式确认。
+   */
+  hibernate() {
+    this._perform('hibernate');
+  }
+
+  /**
+   * 重启机器。
+   *
+   * Linux：`org.freedesktop.login1.Manager.Reboot(false)`。Windows：
+   * `ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)`，需先启用
+   * `SeShutdownPrivilege`；权限不足时以状态码 -2 拒绝而不会执行到一半。
+   *
+   * **警告**：该动作会重启机器，未保存的工作一定丢失。**必须**先取得用户显式
+   * 确认。
+   */
+  reboot() {
+    this._perform('reboot');
+  }
+
+  /**
+   * 关闭机器电源。
+   *
+   * Linux：`org.freedesktop.login1.Manager.PowerOff(false)`。Windows：
+   * `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)`，同样需要
+   * `SeShutdownPrivilege`。
+   *
+   * **警告**：该动作会关机，未保存的工作一定丢失。**必须**先取得用户显式确
+   * 认。
+   */
+  shutdown() {
+    this._perform('shutdown');
   }
 }
 
@@ -1339,4 +1563,6 @@ module.exports = {
   MEDIA_COMMANDS: Object.freeze(Object.keys(MEDIA_COMMAND_CODES)),
   MEDIA_STATUS: Object.freeze(MEDIA_STATUS_NAMES),
   TRAY_ICON_MAX_EXTENT,
+  SessionController,
+  SESSION_ACTIONS: Object.freeze(SESSION_ACTIONS),
 };

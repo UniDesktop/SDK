@@ -30,6 +30,20 @@ impl CapabilityMatrix {
     pub const TRAY_DYNAMIC_MENU: u32 = 1 << 14;
     /// A media playback backend exists (MPRIS v2 on Linux, SMTC on Windows).
     pub const MEDIA_CONTROL: u32 = 1 << 15;
+    /// A session backend exists: at least one of the actions below can be issued.
+    pub const SESSION_MANAGEMENT: u32 = 1 << 16;
+    /// The session can be locked (the only safe-to-automate action).
+    pub const LOCK: u32 = 1 << 17;
+    /// The calling user's session can be logged out.
+    pub const LOGOUT: u32 = 1 << 18;
+    /// The machine can be suspended to RAM.
+    pub const SUSPEND: u32 = 1 << 19;
+    /// The machine can be hibernated to disk.
+    pub const HIBERNATE: u32 = 1 << 20;
+    /// The machine can be rebooted (needs privilege on Windows).
+    pub const REBOOT: u32 = 1 << 21;
+    /// The machine can be powered off (needs privilege on Windows).
+    pub const SHUTDOWN: u32 = 1 << 22;
 }
 
 bitflags! {
@@ -51,6 +65,13 @@ bitflags! {
         const TRAY_CHECKBOX = CapabilityMatrix::TRAY_CHECKBOX;
         const TRAY_DYNAMIC_MENU = CapabilityMatrix::TRAY_DYNAMIC_MENU;
         const MEDIA_CONTROL = CapabilityMatrix::MEDIA_CONTROL;
+        const SESSION_MANAGEMENT = CapabilityMatrix::SESSION_MANAGEMENT;
+        const LOCK = CapabilityMatrix::LOCK;
+        const LOGOUT = CapabilityMatrix::LOGOUT;
+        const SUSPEND = CapabilityMatrix::SUSPEND;
+        const HIBERNATE = CapabilityMatrix::HIBERNATE;
+        const REBOOT = CapabilityMatrix::REBOOT;
+        const SHUTDOWN = CapabilityMatrix::SHUTDOWN;
     }
 }
 
