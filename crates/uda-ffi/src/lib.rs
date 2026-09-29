@@ -689,23 +689,23 @@ pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
 // System tray
 // ---------------------------------------------------------------------------
 
-/// Ownership of the tray surface.
-///
-/// The C caller cannot hold an `Arc`, so every tray icon and every context menu
-/// lives in a process-wide table keyed by an opaque `uint64_t`. Two independent
-/// handle spaces are *not* used - one table with a per-entry kind, so a mistake
-/// is diagnosed ("handle 3 is a menu, not a tray icon") instead of accidentally
-/// resolving to the wrong record.
-///
-/// The invariants the exports below uphold:
-///
-/// * Handles start at `1`; `0` means "no handle" and every entry point rejects it
-///   without touching a pointer.
-/// * A handle is single-use: destroying it removes the entry, and a second
-///   destroy of the same value is `UDA_ERR_INVALID_ARGUMENT` rather than a
-///   silent no-op, so a host cannot "double-release" a shell resource.
-/// * A menu may be attached to an icon and then destroyed; the icon keeps its
-///   own `Arc`, so the tray does not lose its rows.
+// Ownership of the tray surface.
+//
+// The C caller cannot hold an `Arc`, so every tray icon and every context menu
+// lives in a process-wide table keyed by an opaque `uint64_t`. Two independent
+// handle spaces are *not* used - one table with a per-entry kind, so a mistake
+// is diagnosed ("handle 3 is a menu, not a tray icon") instead of accidentally
+// resolving to the wrong record.
+//
+// The invariants the exports below uphold:
+//
+// - Handles start at `1`; `0` means "no handle" and every entry point rejects
+//   it without touching a pointer.
+// - A handle is single-use: destroying it removes the entry, and a second
+//   destroy of the same value is `UDA_ERR_INVALID_ARGUMENT` rather than a
+//   silent no-op, so a host cannot "double-release" a shell resource.
+// - A menu may be attached to an icon and then destroyed; the icon keeps its
+//   own `Arc`, so the tray does not lose its rows.
 
 /// Create a tray icon.
 ///

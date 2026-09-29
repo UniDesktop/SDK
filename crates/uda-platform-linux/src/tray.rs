@@ -332,7 +332,10 @@ impl MenuRow {
     }
 
     /// Find a row by dbusmenu id, depth-first.
-    fn find<'a>(rows: &'a [MenuRow], id: i32) -> Option<&'a MenuRow> {
+    ///
+    /// The returned borrow is tied to `rows` by elision, which is all the
+    /// signature needs to say; naming the lifetime would add nothing.
+    fn find(rows: &[MenuRow], id: i32) -> Option<&MenuRow> {
         for row in rows {
             if row.id == id {
                 return Some(row);
@@ -684,8 +687,8 @@ impl StatusNotifierItemInterface {
             let mut shared = lock_or_recover(&self.shared, "status notifier item");
             let now = Instant::now();
             let double_click = match shared.last_activate {
-                Some(last) if now.duration_since(last) <= DOUBLE_CLICK_WINDOW => true,
-                _ => false,
+                Some(last) => now.duration_since(last) <= DOUBLE_CLICK_WINDOW,
+                None => false,
             };
             // The window always restarts, so a triple click reads as
             // click-then-double rather than one long double.
@@ -713,6 +716,13 @@ impl StatusNotifierItemInterface {
         }
     }
 }
+
+/// The four fields of the SNI `ToolTip` property, in specification order.
+///
+/// `(icon name, icon pixmap, title, description)`. Named because the raw tuple is
+/// long enough to obscure the property it types, and because the field order is
+/// fixed by the protocol rather than by anything in this crate.
+type ToolTipShape = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 
 #[interface(name = "org.kde.StatusNotifierItem")]
 impl StatusNotifierItemInterface {
@@ -839,7 +849,7 @@ impl StatusNotifierItemInterface {
     /// `IconName` and `IconPixmap` are mutually exclusive in SNI, so exactly one
     /// of the two icon slots is populated here.
     #[zbus(property)]
-    fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+    fn tool_tip(&self) -> ToolTipShape {
         let snapshot = self.snapshot();
         match snapshot.icon {
             IconPayload::Name(name) => (name, Vec::new(), snapshot.tooltip, String::new()),
@@ -1121,10 +1131,10 @@ impl Worker {
 
         loop {
             // A disconnected channel means the sender is gone, which is the
-            // documented signal that nothing owns this icon any more.
-            match self.commands.try_recv() {
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                _ => {}
+            // documented signal that nothing owns this icon any more. An empty
+            // channel is the normal case and simply falls through.
+            if let Err(std::sync::mpsc::TryRecvError::Disconnected) = self.commands.try_recv() {
+                break;
             }
             if self.host_released() {
                 break;
@@ -1951,8 +1961,12 @@ mod tests {
 
     #[test]
     fn the_item_snapshot_reflects_visibility() {
-        let mut state = TrayShared::default();
-        state.tooltip = "tip".to_string();
+        // Only the tooltip is preset; everything else stays at its default, so
+        // the fields are set in the initialiser rather than reassigned after.
+        let mut state = TrayShared {
+            tooltip: "tip".to_string(),
+            ..TrayShared::default()
+        };
         let snapshot = state.item_snapshot();
         assert_eq!(snapshot.tooltip, "tip");
         assert!(snapshot.visible);

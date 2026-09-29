@@ -312,10 +312,12 @@ mod tests {
             SessionAction::Shutdown,
         ] {
             if capabilities.contains(action.capability()) {
-                // Every advertised action really has a code path on this target.
+                // An advertised action always sits behind a session backend: a
+                // bit without the management bit would mean a caller can be
+                // offered a button the platform has no code path for.
                 assert!(
-                    cfg!(any(target_os = "linux", target_os = "windows")),
-                    "{action:?} advertised on a target with no backend"
+                    capabilities.contains(Capability::SESSION_MANAGEMENT),
+                    "{action:?} advertised with no session backend behind it"
                 );
             }
         }

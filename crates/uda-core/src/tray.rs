@@ -40,8 +40,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// The wrapper exists only to supply `Debug`, which a `dyn FnMut` does not
 /// implement; without it `MenuItem` could not derive `Debug` and hosts would
 /// lose the ability to log a menu tree.
+/// The boxed, shared, interior-mutable form a row action takes.
+///
+/// Named because the raw type is long enough to obscure every signature that
+/// mentions it, and because the pieces each carry a constraint worth stating
+/// once: `Arc` so a row can be cloned cheaply and every holder sees the same
+/// callback, `Mutex` because `FnMut` needs `&mut`, and `Send` because the tray
+/// worker thread - not the host - is what invokes it.
+type SharedTrayCallback = Arc<Mutex<dyn FnMut(&TrayEvent) + Send + 'static>>;
+
 #[derive(Clone)]
-pub struct TrayAction(Arc<Mutex<dyn FnMut(&TrayEvent) + Send + 'static>>);
+pub struct TrayAction(SharedTrayCallback);
 
 impl TrayAction {
     /// Wrap a callback.
@@ -628,9 +637,10 @@ impl TrayMenu {
     /// cannot express that lifetime.
     #[must_use]
     pub fn handle(self: &Arc<Self>, id: MenuItemId) -> Option<TrayMenuHandle> {
-        if self.find(id).is_none() {
-            return None;
-        }
+        // The existence check *is* the early return: `find` already answers
+        // whether the id is live, so its `Option` is propagated rather than
+        // reopened by hand.
+        self.find(id)?;
         Some(TrayMenuHandle::new(Arc::clone(self), id))
     }
 
@@ -1595,7 +1605,7 @@ mod tests {
                     FIRED.fetch_add(1, Ordering::SeqCst);
                 })
             })
-            .and_then(|builder| Ok(builder.build()));
+            .map(|builder| builder.build());
         let menu = match built {
             Ok(menu) => menu,
             Err(error) => panic!("builder failed: {error}"),

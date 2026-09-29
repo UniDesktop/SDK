@@ -388,11 +388,13 @@ fn dict_get<'d>(
 /// dictionary keys arrive as variants and the lookup must not fail the whole
 /// parse when one key is absent.
 pub(crate) fn metadata_from_dict(dictionary: &zbus::zvariant::Dict<'_, '_>) -> MediaMetadata {
+    // `dict_get` hands back an owned `Value`; the field readers deref-friendly
+    // signatures accept it directly, so no explicit borrow is needed.
     let title = dict_get(dictionary, "xesam:title")
-        .map(|value| title_from_value(&value))
+        .map(title_from_value)
         .unwrap_or_default();
     let artist = dict_get(dictionary, "xesam:artist")
-        .map(|value| join_artists(&artists_from_value(&value)))
+        .map(|value| join_artists(&artists_from_value(value)))
         .unwrap_or_default();
     let album = dict_get(dictionary, "xesam:album")
         .and_then(|value| value.downcast_ref::<String>().ok())
