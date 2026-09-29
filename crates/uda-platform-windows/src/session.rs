@@ -47,11 +47,11 @@ use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_SHUTDOWN_NAME,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
-use windows::Win32::System::Shutdown::{
-    ExitWindowsEx, LockWorkStation, EXIT_WINDOWS_FLAGS, EWX_FORCEIFHUNG, EWX_LOGOFF,
-    EWX_POWEROFF, EWX_REBOOT,
-};
 use windows::Win32::System::Power::SetSuspendState;
+use windows::Win32::System::Shutdown::{
+    ExitWindowsEx, LockWorkStation, EWX_FORCEIFHUNG, EWX_LOGOFF, EWX_POWEROFF, EWX_REBOOT,
+    EXIT_WINDOWS_FLAGS,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use uda_core::capability::Capability;
@@ -96,9 +96,8 @@ impl WindowsSessionManager {
     fn logout(&self) -> Result<(), UdaError> {
         // The flags come from the same table the tests read, so a change to the
         // mapping cannot pass the tests while shipping something else.
-        let flags = exit_flags_for(SessionAction::Logout).ok_or_else(|| {
-            UdaError::Internal("logout lost its ExitWindowsEx flags".to_string())
-        })?;
+        let flags = exit_flags_for(SessionAction::Logout)
+            .ok_or_else(|| UdaError::Internal("logout lost its ExitWindowsEx flags".to_string()))?;
 
         // `EWX_LOGOFF` needs no privilege: a user may always end their own
         // session. `EWX_FORCEIFHUNG` is deliberately *not* used here, because
@@ -446,7 +445,10 @@ mod tests {
     fn logout_uses_the_logoff_flag_and_nothing_else() {
         assert_eq!(exit_flags_for(SessionAction::Logout), Some(EWX_LOGOFF));
         // `EWX_LOGOFF` needs no privilege, so no force flag is added either.
-        assert_ne!(exit_flags_for(SessionAction::Logout), Some(EWX_LOGOFF | EWX_FORCEIFHUNG));
+        assert_ne!(
+            exit_flags_for(SessionAction::Logout),
+            Some(EWX_LOGOFF | EWX_FORCEIFHUNG)
+        );
     }
 
     #[test]

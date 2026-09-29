@@ -175,7 +175,10 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<&'static str> {
-            self.calls.lock().expect("the mock lock is never poisoned").clone()
+            self.calls
+                .lock()
+                .expect("the mock lock is never poisoned")
+                .clone()
         }
     }
 
@@ -329,7 +332,9 @@ mod tests {
 
         impl SessionManager for FailingManager {
             fn lock(&self) -> Result<(), UdaError> {
-                Err(UdaError::CommandFailed("the screen saver refused".to_string()))
+                Err(UdaError::CommandFailed(
+                    "the screen saver refused".to_string(),
+                ))
             }
 
             fn logout(&self) -> Result<(), UdaError> {

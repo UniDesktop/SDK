@@ -160,7 +160,10 @@ mod tests {
 
     #[test]
     fn a_valid_command_code_is_accepted() {
-        assert_eq!(command_from_c(UDA_MEDIA_CMD_NEXT).ok(), Some(MediaCommand::Next));
+        assert_eq!(
+            command_from_c(UDA_MEDIA_CMD_NEXT).ok(),
+            Some(MediaCommand::Next)
+        );
     }
 
     #[test]
@@ -186,7 +189,10 @@ mod tests {
         // rather than an error, and on a real desktop it returns whatever is
         // playing. Either branch must be usable without unwrapping.
         let result = active_metadata();
-        assert!(result.is_ok(), "a missing player is not an error: {result:?}");
+        assert!(
+            result.is_ok(),
+            "a missing player is not an error: {result:?}"
+        );
     }
 
     #[test]

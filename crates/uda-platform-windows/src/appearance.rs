@@ -343,7 +343,10 @@ mod tests {
         // `get_accent_color`; the per-call `NotSupported` still covers a host
         // whose registry lacks the value.
         assert!(caps.contains(Capability::READ_ACCENT_COLOR));
-        assert_eq!(caps, Capability::DETECT_THEME | Capability::READ_ACCENT_COLOR);
+        assert_eq!(
+            caps,
+            Capability::DETECT_THEME | Capability::READ_ACCENT_COLOR
+        );
     }
 
     #[test]
@@ -378,7 +381,15 @@ mod tests {
         // A fully opaque mid-blue, the shape Windows actually writes for the
         // default accent: alpha `0xFF`, blue `0x00`, green `0x78`, red `0xD7`.
         let color = WindowsAppearanceManager::accent_from_dword(0xFF00_78D7);
-        assert_eq!(color, RgbaColor { r: 0xD7, g: 0x78, b: 0x00, a: 0xFF });
+        assert_eq!(
+            color,
+            RgbaColor {
+                r: 0xD7,
+                g: 0x78,
+                b: 0x00,
+                a: 0xFF
+            }
+        );
     }
 
     #[test]

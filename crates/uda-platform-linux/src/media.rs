@@ -198,18 +198,18 @@ async fn properties_proxy<'a>(
 
 /// List the unique connection names on the session bus.
 async fn list_names(connection: &Connection) -> Result<Vec<String>, UdaError> {
-    let proxy = match tokio::time::timeout(DBUS_TIMEOUT, zbus::fdo::DBusProxy::new(connection)).await
-    {
-        Ok(Ok(proxy)) => proxy,
-        Ok(Err(e)) => {
-            return Err(UdaError::DetectionFailed(format!("dbus proxy: {e}")));
-        }
-        Err(_) => {
-            return Err(UdaError::DetectionFailed(
-                "building the bus-daemon proxy timed out".to_string(),
-            ));
-        }
-    };
+    let proxy =
+        match tokio::time::timeout(DBUS_TIMEOUT, zbus::fdo::DBusProxy::new(connection)).await {
+            Ok(Ok(proxy)) => proxy,
+            Ok(Err(e)) => {
+                return Err(UdaError::DetectionFailed(format!("dbus proxy: {e}")));
+            }
+            Err(_) => {
+                return Err(UdaError::DetectionFailed(
+                    "building the bus-daemon proxy timed out".to_string(),
+                ));
+            }
+        };
 
     // `list_names` reports `OwnedBusName`s; `.to_string()` yields the bus name a
     // well-known MPRIS service is registered under.
@@ -219,9 +219,7 @@ async fn list_names(connection: &Connection) -> Result<Vec<String>, UdaError> {
             .map(|name| name.to_string())
             .collect::<Vec<_>>()),
         Ok(Err(e)) => Err(UdaError::DetectionFailed(format!("ListNames: {e}"))),
-        Err(_) => Err(UdaError::DetectionFailed(
-            "ListNames timed out".to_string(),
-        )),
+        Err(_) => Err(UdaError::DetectionFailed("ListNames timed out".to_string())),
     }
 }
 
@@ -389,9 +387,7 @@ fn dict_get<'d>(
 /// [`dict_get`] is a helper rather than [`zbus::zvariant::Dict::get`] because the
 /// dictionary keys arrive as variants and the lookup must not fail the whole
 /// parse when one key is absent.
-pub(crate) fn metadata_from_dict(
-    dictionary: &zbus::zvariant::Dict<'_, '_>,
-) -> MediaMetadata {
+pub(crate) fn metadata_from_dict(dictionary: &zbus::zvariant::Dict<'_, '_>) -> MediaMetadata {
     let title = dict_get(dictionary, "xesam:title")
         .map(|value| title_from_value(&value))
         .unwrap_or_default();
@@ -497,30 +493,23 @@ async fn read_position(properties: &PropertiesProxy<'_>) -> Option<u64> {
 /// MPRIS transport methods take no arguments and return nothing, so the reply is
 /// not inspected: an MPRIS player acknowledges by returning at all. The call is
 /// bounded by [`DBUS_TIMEOUT`] because a hung player must not pin the caller.
-async fn call_method(
-    connection: &Connection,
-    name: &str,
-    method: &str,
-) -> Result<(), UdaError> {
+async fn call_method(connection: &Connection, name: &str, method: &str) -> Result<(), UdaError> {
     // The builder chain returns `zbus::Error`; mapping it to `UdaError` inside
     // the async block keeps the outer `match` arms symmetric.
-    let proxy: Proxy<'_> = match tokio::time::timeout(
-        DBUS_TIMEOUT,
-        async {
-            let builder = ProxyBuilder::<Proxy<'_>>::new(connection)
-                .destination(name)
-                .map_err(|e| UdaError::Internal(format!("bad player name {name}: {e}")))?
-                .path(MPRIS_PATH)
-                .map_err(|e| UdaError::Internal(format!("bad object path: {e}")))?
-                .interface(PLAYER_INTERFACE)
-                .map_err(|e| UdaError::Internal(format!("bad interface: {e}")))?;
+    let proxy: Proxy<'_> = match tokio::time::timeout(DBUS_TIMEOUT, async {
+        let builder = ProxyBuilder::<Proxy<'_>>::new(connection)
+            .destination(name)
+            .map_err(|e| UdaError::Internal(format!("bad player name {name}: {e}")))?
+            .path(MPRIS_PATH)
+            .map_err(|e| UdaError::Internal(format!("bad object path: {e}")))?
+            .interface(PLAYER_INTERFACE)
+            .map_err(|e| UdaError::Internal(format!("bad interface: {e}")))?;
 
-            builder
-                .build()
-                .await
-                .map_err(|e| UdaError::CommandFailed(format!("transport proxy for {name}: {e}")))
-        },
-    )
+        builder
+            .build()
+            .await
+            .map_err(|e| UdaError::CommandFailed(format!("transport proxy for {name}: {e}")))
+    })
     .await
     {
         Ok(Ok(proxy)) => proxy,
@@ -584,7 +573,9 @@ impl MediaManager for LinuxMediaManager {
 
             // A player that published a status a moment ago and cannot be read
             // now has exited; that is `Unknown`, not an error.
-            Ok(read_status(&properties).await.unwrap_or(PlaybackStatus::Unknown))
+            Ok(read_status(&properties)
+                .await
+                .unwrap_or(PlaybackStatus::Unknown))
         })
     }
 
@@ -637,7 +628,10 @@ mod tests {
 
         for (key, value) in entries {
             dictionary
-                .append(zbus::zvariant::Value::from(key), zbus::zvariant::Value::new(value))
+                .append(
+                    zbus::zvariant::Value::from(key),
+                    zbus::zvariant::Value::new(value),
+                )
                 .expect("a test entry appends");
         }
         dictionary
@@ -749,7 +743,10 @@ mod tests {
     fn a_full_metadata_dictionary_is_parsed() {
         let metadata = metadata_from_dict(&dictionary(vec![
             ("xesam:title", "Song".into()),
-            ("xesam:artist", vec!["A".to_string(), "B".to_string()].into()),
+            (
+                "xesam:artist",
+                vec!["A".to_string(), "B".to_string()].into(),
+            ),
             ("xesam:album", "Album".into()),
             ("mpris:length", 240_000_000i64.into()),
         ]));
@@ -775,10 +772,7 @@ mod tests {
     fn a_dictionary_with_only_a_duration_is_still_information() {
         // Radio streams publish a length and nothing else; that must not be
         // mistaken for "no metadata".
-        let metadata = metadata_from_dict(&dictionary(vec![(
-            "mpris:length",
-            1i64.into(),
-        )]));
+        let metadata = metadata_from_dict(&dictionary(vec![("mpris:length", 1i64.into())]));
         assert!(!metadata.is_empty());
         assert_eq!(metadata.duration_ms, Some(0));
     }
@@ -787,7 +781,10 @@ mod tests {
     fn commands_map_to_the_mpris_method_names() {
         assert_eq!(method_for_command(MediaCommand::Play), "Play");
         assert_eq!(method_for_command(MediaCommand::Pause), "Pause");
-        assert_eq!(method_for_command(MediaCommand::TogglePlayPause), "PlayPause");
+        assert_eq!(
+            method_for_command(MediaCommand::TogglePlayPause),
+            "PlayPause"
+        );
         assert_eq!(method_for_command(MediaCommand::Next), "Next");
         assert_eq!(method_for_command(MediaCommand::Previous), "Previous");
         assert_eq!(method_for_command(MediaCommand::Stop), "Stop");

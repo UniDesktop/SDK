@@ -843,12 +843,7 @@ impl StatusNotifierItemInterface {
         let snapshot = self.snapshot();
         match snapshot.icon {
             IconPayload::Name(name) => (name, Vec::new(), snapshot.tooltip, String::new()),
-            IconPayload::Pixmap(pixmap) => (
-                String::new(),
-                pixmap,
-                snapshot.tooltip,
-                String::new(),
-            ),
+            IconPayload::Pixmap(pixmap) => (String::new(), pixmap, snapshot.tooltip, String::new()),
             IconPayload::None => (String::new(), Vec::new(), snapshot.tooltip, String::new()),
         }
     }
@@ -912,7 +907,6 @@ impl DBusMenuInterface {
         let revision = lock_or_recover(&self.revision, "dbus menu revision");
         *revision
     }
-
 }
 
 #[interface(name = "com.canonical.dbusmenu")]
@@ -953,11 +947,7 @@ impl DBusMenuInterface {
     }
 
     /// Single property read.
-    async fn get_property(
-        &self,
-        id: i32,
-        name: String,
-    ) -> zbus::fdo::Result<zvariant::OwnedValue> {
+    async fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<zvariant::OwnedValue> {
         let snapshot = match self.menu_snapshot() {
             Some(snapshot) => snapshot,
             None => {
@@ -985,13 +975,7 @@ impl DBusMenuInterface {
     /// id-to-row map and looks the row up here. The callback is invoked **after**
     /// the state lock is dropped: holding a D-Bus dispatch guard across host
     /// code would stall every other request.
-    async fn event(
-        &self,
-        id: i32,
-        event_id: String,
-        _data: zvariant::Value<'_>,
-        _timestamp: u32,
-    ) {
+    async fn event(&self, id: i32, event_id: String, _data: zvariant::Value<'_>, _timestamp: u32) {
         if event_id != "clicked" {
             // `hovered` carries no host-visible meaning in UDA's model.
             log::debug!("tray menu event '{event_id}' ignored");
@@ -1130,9 +1114,7 @@ impl Worker {
         // item stays exported so a watcher that starts later can still find it
         // through `RegisterStatusNotifierItem` or `NameOwnerChanged`.
         if let Err(error) = register_with_watcher(&connection, &self.bus_name).await {
-            log::warn!(
-                "tray registered without a watcher ({error}); the shell may not show it"
-            );
+            log::warn!("tray registered without a watcher ({error}); the shell may not show it");
         }
 
         log::info!("tray item '{}' is live", self.bus_name);
@@ -1263,20 +1245,15 @@ impl Worker {
 /// `tray_specs.md` §1.6). Returns an error when neither is reachable.
 async fn register_with_watcher(connection: &Connection, service: &str) -> Result<(), UdaError> {
     for interface_name in [WATCHER_INTERFACE, WATCHER_FALLBACK_INTERFACE] {
-        let proxy = match zbus::Proxy::new(
-            connection,
-            WATCHER_SERVICE,
-            WATCHER_PATH,
-            interface_name,
-        )
-        .await
-        {
-            Ok(proxy) => proxy,
-            Err(error) => {
-                log::debug!("tray watcher {interface_name} unreachable: {error}");
-                continue;
-            }
-        };
+        let proxy =
+            match zbus::Proxy::new(connection, WATCHER_SERVICE, WATCHER_PATH, interface_name).await
+            {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    log::debug!("tray watcher {interface_name} unreachable: {error}");
+                    continue;
+                }
+            };
         match proxy
             .call::<_, _, ()>("RegisterStatusNotifierItem", &service)
             .await
@@ -1645,7 +1622,9 @@ mod tests {
 
         let child = Arc::new(uda_core::tray::TrayMenu::new());
         assert!(child.push(MenuItem::text("inner")).is_ok());
-        assert!(menu.push(MenuItem::submenu("more", Arc::clone(&child))).is_ok());
+        assert!(menu
+            .push(MenuItem::submenu("more", Arc::clone(&child)))
+            .is_ok());
         menu
     }
 
@@ -1683,11 +1662,15 @@ mod tests {
         assert!(checkbox.checked);
         let props = row_properties(checkbox);
         assert_eq!(
-            props.get("toggle-type").and_then(|v| <&str>::try_from(v).ok()),
+            props
+                .get("toggle-type")
+                .and_then(|v| <&str>::try_from(v).ok()),
             Some("checkmark")
         );
         assert_eq!(
-            props.get("toggle-state").and_then(|v| <i32>::try_from(v).ok()),
+            props
+                .get("toggle-state")
+                .and_then(|v| <i32>::try_from(v).ok()),
             Some(1)
         );
 
@@ -1841,13 +1824,22 @@ mod tests {
     fn support_level_is_honest() {
         let manager = LinuxTrayManager::new();
         assert_eq!(manager.support_level(TrayFeature::Icon), SupportLevel::Full);
-        assert_eq!(manager.support_level(TrayFeature::Tooltip), SupportLevel::Full);
-        assert_eq!(manager.support_level(TrayFeature::Click), SupportLevel::Full);
+        assert_eq!(
+            manager.support_level(TrayFeature::Tooltip),
+            SupportLevel::Full
+        );
+        assert_eq!(
+            manager.support_level(TrayFeature::Click),
+            SupportLevel::Full
+        );
         assert_eq!(
             manager.support_level(TrayFeature::DoubleClick),
             SupportLevel::None
         );
-        assert_eq!(manager.capabilities(), LinuxTrayManager::advertised_capabilities());
+        assert_eq!(
+            manager.capabilities(),
+            LinuxTrayManager::advertised_capabilities()
+        );
     }
 
     #[test]
@@ -2042,6 +2034,9 @@ mod tests {
         // Constructing a manager must be free of side effects so a capability
         // probe never opens a D-Bus connection.
         let manager = LinuxTrayManager::new();
-        assert_eq!(manager.capabilities(), LinuxTrayManager::advertised_capabilities());
+        assert_eq!(
+            manager.capabilities(),
+            LinuxTrayManager::advertised_capabilities()
+        );
     }
 }

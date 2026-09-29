@@ -117,7 +117,12 @@ jobs:
           # a script forgets to install the UTF-8 guard itself.
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        run: python3 examples/python/demo.py
+        # `01_appearance` is the read-only smoke test: it touches no wallpaper,
+        # sends no notification and takes no power action, so it is safe on an
+        # unattended runner. The bundled demos were split into `01`…`07` when
+        # the examples were modularised; the old single `demo.py` no longer
+        # exists.
+        run: python3 examples/python/01_appearance.py
 
       - name: Upload FFI artifacts
         uses: actions/upload-artifact@v4
@@ -181,7 +186,9 @@ jobs:
           # See the note above: keep Python in UTF-8 mode under the cp1252 console.
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        run: python examples/python/demo.py
+        # Same read-only smoke test as the Linux job. The demos were split into
+        # `01`…`07` when the examples were modularised; `demo.py` is gone.
+        run: python examples/python/01_appearance.py
 
       - name: Run Python example in English fallback mode
         shell: bash
@@ -193,7 +200,7 @@ jobs:
           # instead of emitting mojibake or crashing. Guards the language
           # fallback path that shields us if the encoding guard ever regresses.
           UDA_LANG: en
-        run: python examples/python/demo.py
+        run: python examples/python/01_appearance.py
 
       - name: Upload FFI artifacts
         uses: actions/upload-artifact@v4

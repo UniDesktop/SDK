@@ -367,9 +367,9 @@ impl MenuItem {
     #[must_use]
     pub const fn state(&self) -> MenuItemState {
         match self {
-            Self::Text { state, .. } | Self::Checkbox { state, .. } | Self::Submenu { state, .. } => {
-                *state
-            }
+            Self::Text { state, .. }
+            | Self::Checkbox { state, .. }
+            | Self::Submenu { state, .. } => *state,
             // A separator is never interactive; reporting a disabled state keeps
             // `is_disabled()` true without a special case at every call site.
             Self::Separator => MenuItemState {
@@ -727,11 +727,7 @@ impl TrayMenuBuilder {
     }
 
     /// Append a text row with a callback.
-    pub fn text_with_action<F>(
-        self,
-        label: impl Into<String>,
-        action: F,
-    ) -> Result<Self, UdaError>
+    pub fn text_with_action<F>(self, label: impl Into<String>, action: F) -> Result<Self, UdaError>
     where
         F: FnMut(&TrayEvent) + Send + 'static,
     {
@@ -914,9 +910,7 @@ impl TrayIconSource {
                 if *stride < row_bytes {
                     return Err(IconError::StrideTooSmall);
                 }
-                let needed = stride
-                    .checked_mul(*height)
-                    .ok_or(IconError::DataTooShort)? as usize;
+                let needed = stride.checked_mul(*height).ok_or(IconError::DataTooShort)? as usize;
                 if data.len() < needed {
                     return Err(IconError::DataTooShort);
                 }
@@ -1474,8 +1468,15 @@ mod tests {
         // Inserting above must not shift the ids of existing rows.
         assert!(menu.insert(0, MenuItem::text("inserted")).is_ok());
         assert_eq!(menu.len(), 3);
-        assert_eq!(menu.find(first).and_then(|item| item.label().map(str::to_string)), Some("first".to_string()));
-        assert_eq!(menu.find(second).expect("row survives").label(), Some("second"));
+        assert_eq!(
+            menu.find(first)
+                .and_then(|item| item.label().map(str::to_string)),
+            Some("first".to_string())
+        );
+        assert_eq!(
+            menu.find(second).expect("row survives").label(),
+            Some("second")
+        );
 
         assert!(menu.remove(first));
         assert!(!menu.remove(first));
@@ -1543,7 +1544,11 @@ mod tests {
         assert!(menu.set_enabled(id, true));
         assert!(!menu.find(id).expect("row survives").is_disabled());
         assert!(menu.set_label(id, "renamed"));
-        assert_eq!(menu.find(id).and_then(|item| item.label().map(str::to_string)), Some("renamed".to_string()));
+        assert_eq!(
+            menu.find(id)
+                .and_then(|item| item.label().map(str::to_string)),
+            Some("renamed".to_string())
+        );
         // Unknown ids are reported as no-ops rather than panicking.
         let unknown = MenuItemId(999_999);
         assert!(!menu.set_label(unknown, "ghost"));
@@ -1616,7 +1621,10 @@ mod tests {
             .map(|(id, _)| id)
             .expect("row exists");
         match menu.find(quit) {
-            Some(MenuItem::Text { action: Some(action), .. }) => action.invoke(&TrayEvent::Click),
+            Some(MenuItem::Text {
+                action: Some(action),
+                ..
+            }) => action.invoke(&TrayEvent::Click),
             other => panic!("expected a text row carrying an action, got {other:?}"),
         }
         assert_eq!(FIRED.load(Ordering::SeqCst), 1);
@@ -1766,19 +1774,28 @@ mod tests {
         // Nothing published yet: the honest answer is "no tray".
         assert_eq!(icon.capabilities(), Capability::empty());
         assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::None);
-        assert_eq!(icon.support_level(TrayFeature::DoubleClick), SupportLevel::None);
+        assert_eq!(
+            icon.support_level(TrayFeature::DoubleClick),
+            SupportLevel::None
+        );
 
         inner.set_capabilities(Capability::SYSTEM_TRAY);
         assert_eq!(icon.capabilities(), Capability::SYSTEM_TRAY);
         assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
         // Unclaimed features are `None`, never an optimistic `Partial`.
-        assert_eq!(icon.support_level(TrayFeature::DoubleClick), SupportLevel::None);
+        assert_eq!(
+            icon.support_level(TrayFeature::DoubleClick),
+            SupportLevel::None
+        );
     }
 
     #[test]
     fn feature_display_names_are_stable() {
         assert_eq!(TrayFeature::Icon.to_string(), "tray icon");
-        assert_eq!(TrayFeature::DoubleClick.to_string(), "tray double-click event");
+        assert_eq!(
+            TrayFeature::DoubleClick.to_string(),
+            "tray double-click event"
+        );
         assert_eq!(MenuItemId(7).to_string(), "tray-item-7");
     }
 
@@ -1815,5 +1832,4 @@ mod tests {
         assert_send::<TrayAction>();
         assert_send::<TrayEventHandler>();
     }
-
 }

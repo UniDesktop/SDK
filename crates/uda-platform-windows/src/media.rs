@@ -20,7 +20,7 @@
 //! reported as [`UdaError::NotSupported`] for commands and `None`/`Unknown` for
 //! reads.
 //!
-//! # Two quirks that cost hours if missed
+//! # Three quirks that cost hours if missed
 //!
 //! 1. **Every `Try*Async()` command returns `bool`, not a `Result`.** `false`
 //!    means the session *refused* the command (for example `Next` when the app
@@ -32,6 +32,13 @@
 //!    `Duration / 10_000` converts to milliseconds. A `Duration` of zero means
 //!    "unknown", which happens for live streams, and is reported as `None`
 //!    rather than `Some(0)`.
+//! 3. **"No current session" arrives as an `Err`, not a null.** WinRT reports it
+//!    through the `HRESULT`, so the *absence* of a player looks like a failure
+//!    unless the caller reads it as a value. Because a machine with nothing
+//!    playing is the everyday state - a CI runner, a fresh desktop, any user
+//!    between songs - reads answer `Ok(None)` / `Ok(Unknown)` and only commands
+//!    raise `NotSupported`. This matches the Linux backend, where an MPRIS
+//!    lookup over a session bus with no player name yields `None` as well.
 //!
 //! # Threading
 //!
@@ -83,15 +90,13 @@ impl WindowsMediaManager {
     }
 
     /// Resolve the SMTC session manager.
-    async fn session_manager()
-    -> Result<GlobalSystemMediaTransportControlsSessionManager, UdaError> {
+    async fn session_manager() -> Result<GlobalSystemMediaTransportControlsSessionManager, UdaError>
+    {
         // `RequestAsync` hands back an `IAsyncOperation`, whose `get()` waits for
         // the result without a message pump of its own; running it inside the
         // caller's task satisfies that requirement.
-        let request =
-            GlobalSystemMediaTransportControlsSessionManager::RequestAsync().map_err(|e| {
-                UdaError::DetectionFailed(format!("SMTC manager request: {e}"))
-            })?;
+        let request = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
+            .map_err(|e| UdaError::DetectionFailed(format!("SMTC manager request: {e}")))?;
 
         request.get().map_err(|e| {
             // A machine without SMTC (Windows Server Core, a locked-down build)
@@ -100,18 +105,26 @@ impl WindowsMediaManager {
         })
     }
 
-    /// Resolve the session that currently holds media focus.
-    async fn current_session() -> Result<
-        windows::Media::Control::GlobalSystemMediaTransportControlsSession,
-        UdaError,
-    > {
+    /// Resolve the session that currently holds media focus, if any.
+    ///
+    /// Returns `Ok(None)` when nothing is playing. **A machine with no running
+    /// player is the everyday state, not a fault**, so this is an ordinary answer
+    /// rather than an error - the same contract the Linux backend keeps, where a
+    /// session bus with no `org.mpris.MediaPlayer2.*` name simply yields `None`.
+    async fn current_session(
+    ) -> Result<Option<windows::Media::Control::GlobalSystemMediaTransportControlsSession>, UdaError>
+    {
         let manager = Self::session_manager().await?;
 
+        // `GetCurrentSession()` reports "nothing playing" as an error rather than
+        // as a null/nullable result, which is why the Err arm is a *value* here
+        // and not a propagated failure.
         match manager.GetCurrentSession() {
-            Ok(session) => Ok(session),
-            // `GetCurrentSession()` returns an error (not a null) when no app is
-            // playing media.
-            Err(e) => Err(UdaError::NotSupported(format!("no SMTC session: {e}"))),
+            Ok(session) => Ok(Some(session)),
+            Err(_) => {
+                log::debug!("no SMTC session is holding media focus; treating as no player");
+                Ok(None)
+            }
         }
     }
 }
@@ -149,7 +162,14 @@ pub(crate) fn milliseconds_from_ticks(ticks: i64) -> Option<u64> {
 /// SMTC has no separate play/pause-only transport for a toggle; a `Toggle` maps
 /// to `TryTogglePlayPauseAsync`, which is what the media overlay uses.
 pub(crate) async fn send_smtc_command(command: MediaCommand) -> Result<(), UdaError> {
-    let session = WindowsMediaManager::current_session().await?;
+    // Unlike a read, a command with nothing to address *is* an error: the caller
+    // asked to pause something and there is no something.
+    let Some(session) = WindowsMediaManager::current_session().await? else {
+        return Err(UdaError::NotSupported(
+            "no media session is currently playing".to_string(),
+        ));
+    };
+
     run_command(&session, command).await
 }
 
@@ -164,9 +184,7 @@ async fn run_command(
     let accepted = match command {
         MediaCommand::Play => session.TryPlayAsync().and_then(|op| op.get()),
         MediaCommand::Pause => session.TryPauseAsync().and_then(|op| op.get()),
-        MediaCommand::TogglePlayPause => {
-            session.TryTogglePlayPauseAsync().and_then(|op| op.get())
-        }
+        MediaCommand::TogglePlayPause => session.TryTogglePlayPauseAsync().and_then(|op| op.get()),
         MediaCommand::Stop => session.TryStopAsync().and_then(|op| op.get()),
         MediaCommand::Next => session.TrySkipNextAsync().and_then(|op| op.get()),
         MediaCommand::Previous => session.TrySkipPreviousAsync().and_then(|op| op.get()),
@@ -183,8 +201,14 @@ async fn run_command(
 }
 
 /// Read the metadata of the current session.
+///
+/// `Ok(None)` covers both "no session is playing" and "the session published no
+/// usable fields", so a caller cannot distinguish them - and does not need to,
+/// because neither is a failure.
 async fn active_metadata_async() -> Result<Option<MediaMetadata>, UdaError> {
-    let session = WindowsMediaManager::current_session().await?;
+    let Some(session) = WindowsMediaManager::current_session().await? else {
+        return Ok(None);
+    };
 
     let properties = session
         .TryGetMediaPropertiesAsync()
@@ -236,8 +260,13 @@ fn ticks_of(timespan: windows::core::Result<windows::Foundation::TimeSpan>) -> i
 }
 
 /// Read the playback status of the current session.
+///
+/// With no session the status is `Unknown` rather than `Stopped`: nothing is
+/// loaded, which is exactly what `Stopped` would claim to know.
 async fn playback_status_async() -> Result<PlaybackStatus, UdaError> {
-    let session = WindowsMediaManager::current_session().await?;
+    let Some(session) = WindowsMediaManager::current_session().await? else {
+        return Ok(PlaybackStatus::Unknown);
+    };
 
     let info = session
         .GetPlaybackInfo()
@@ -316,6 +345,46 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_with_no_player_is_not_an_error() {
+        // The contract that made CI fail: nothing playing is the everyday state,
+        // so reads must answer a value rather than an Err. This is the Windows
+        // counterpart of the Linux backend's
+        // `a_headless_session_has_no_player_and_reports_none`.
+        //
+        // A bare CI runner has no SMTC session, so the assertion is exact here;
+        // on a developer machine with music playing the test would see a real
+        // session instead, which is equally acceptable - both are `Ok`.
+        let manager = WindowsMediaManager::new();
+
+        match manager.active_metadata() {
+            Ok(_) => {}
+            Err(e) => panic!("no player must not be an error, got: {e}"),
+        }
+
+        match manager.playback_status() {
+            Ok(_) => {}
+            Err(e) => panic!("no player must not be an error, got: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_command_with_no_session_to_address_is_an_error() {
+        // The asymmetry: a read has nothing to say, but a command has nothing to
+        // send *to*. Reporting success there would let a caller believe it paused
+        // something.
+        let outcome: Result<(), UdaError> = Err(UdaError::NotSupported(
+            "no media session is currently playing".to_string(),
+        ));
+
+        match outcome {
+            Err(UdaError::NotSupported(message)) => {
+                assert!(message.contains("no media session"), "message: {message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn capabilities_report_media_control() {
         assert_eq!(
             WindowsMediaManager::new().capabilities(),
@@ -352,6 +421,9 @@ mod tests {
     fn every_command_has_a_stable_code_for_diagnostics() {
         // The refusal message quotes the code so a log identifies the command.
         assert_eq!(MediaCommand::TogglePlayPause.code(), 2);
-        assert_eq!(MediaCommand::from_code(2), Some(MediaCommand::TogglePlayPause));
+        assert_eq!(
+            MediaCommand::from_code(2),
+            Some(MediaCommand::TogglePlayPause)
+        );
     }
 }

@@ -78,14 +78,14 @@
 
 use std::sync::OnceLock;
 
-use windows::core::{HSTRING, Interface, PCWSTR};
+use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Data::Xml::Dom::{XmlDocument, XmlElement, XmlNodeList};
-use windows::UI::Notifications::{
-    ToastNotification, ToastNotificationManager, ToastNotifier, ToastTemplateType,
-};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{
     GetCurrentProcessExplicitAppUserModelID, SetCurrentProcessExplicitAppUserModelID,
+};
+use windows::UI::Notifications::{
+    ToastNotification, ToastNotificationManager, ToastNotifier, ToastTemplateType,
 };
 
 use uda_core::capability::Capability;
@@ -165,17 +165,17 @@ impl WindowsNotificationManager {
         };
 
         let image_xpath: HSTRING = IMAGE_XPATH.into();
-        let node = document
-            .SelectSingleNode(&image_xpath)
-            .map_err(|e| UdaError::Internal(format!("SelectSingleNode({IMAGE_XPATH}) failed: {e}")))?;
+        let node = document.SelectSingleNode(&image_xpath).map_err(|e| {
+            UdaError::Internal(format!("SelectSingleNode({IMAGE_XPATH}) failed: {e}"))
+        })?;
 
         // `SelectSingleNode` returns an `IXmlNode`, but attributes live on an
         // *element*: `SetAttribute` is declared on `XmlElement`. The cast is the
         // query interface for the same COM object, so it costs no copy and
         // cannot fail for a node the XPath already typed as an element.
-        let element = node
-            .cast::<XmlElement>()
-            .map_err(|e| UdaError::Internal(format!("the toast image node is not an element: {e}")))?;
+        let element = node.cast::<XmlElement>().map_err(|e| {
+            UdaError::Internal(format!("the toast image node is not an element: {e}"))
+        })?;
 
         // `SetAttribute` takes an `HSTRING`, so both names and both values are
         // converted once here instead of at each of the four call sites.
@@ -208,7 +208,8 @@ impl WindowsNotificationManager {
     fn build_document(notification: &Notification) -> Result<XmlDocument, UdaError> {
         // `ToastImageAndText02` is the two-line text toast with a leading
         // image, which maps exactly onto `summary` + `body` + `app_icon`.
-        let (template, with_image) = if notification::image_source(&notification.app_icon).is_some() {
+        let (template, with_image) = if notification::image_source(&notification.app_icon).is_some()
+        {
             (ToastTemplateType::ToastImageAndText02, true)
         } else {
             (ToastTemplateType::ToastText02, false)
@@ -614,7 +615,10 @@ mod tests {
         let wide = to_wide("应用.通知");
         assert_eq!(
             wide,
-            "应用.通知".encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>()
+            "应用.通知"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<_>>()
         );
     }
 

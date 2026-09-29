@@ -209,9 +209,14 @@ pub unsafe extern "C" fn uda_media_get_metadata(
     out_duration_ms: *mut u64,
     out_position_ms: *mut u64,
 ) -> c_int {
-    if out_title.is_null() || out_artist.is_null() || out_album.is_null() || out_duration_ms.is_null()
+    if out_title.is_null()
+        || out_artist.is_null()
+        || out_album.is_null()
+        || out_duration_ms.is_null()
     {
-        util::set_last_message("`out_title`, `out_artist`, `out_album` and `out_duration_ms` must not be null");
+        util::set_last_message(
+            "`out_title`, `out_artist`, `out_album` and `out_duration_ms` must not be null",
+        );
         return UDA_ERR_INVALID_ARGUMENT;
     }
 
@@ -820,9 +825,7 @@ pub unsafe extern "C" fn uda_tray_set_icon_rgba(
         return UDA_ERR_INVALID_ARGUMENT;
     }
 
-    util::catch_boundary(|| {
-        tray::set_icon_rgba(handle, width, height, stride, data, len)
-    })
+    util::catch_boundary(|| tray::set_icon_rgba(handle, width, height, stride, data, len))
 }
 
 /// Show or hide the icon without unregistering it.
@@ -950,7 +953,8 @@ pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
     util::catch_boundary(|| {
         // SAFETY: `label` was validated non-null above.
         let label = unsafe { util::owned_string_from(label, "label") }?;
-        let item_id = tray::menu_add_checkbox(menu_handle, &label, checked != 0, callback, user_data)?;
+        let item_id =
+            tray::menu_add_checkbox(menu_handle, &label, checked != 0, callback, user_data)?;
         // SAFETY: `out_item_id` was validated non-null and is writable.
         unsafe { *out_item_id = item_id };
         Ok(())

@@ -133,7 +133,10 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<&'static str> {
-            self.calls.lock().expect("the mock lock is never poisoned").clone()
+            self.calls
+                .lock()
+                .expect("the mock lock is never poisoned")
+                .clone()
         }
     }
 
@@ -171,7 +174,10 @@ mod tests {
     fn capability_bits_match_the_core_definitions() {
         // The constants are part of the C ABI, so a drift between this layer and
         // `uda_core` would silently break every binding that hard-codes them.
-        assert_eq!(UDA_SESSION_CAP_MANAGEMENT, Capability::SESSION_MANAGEMENT.bits());
+        assert_eq!(
+            UDA_SESSION_CAP_MANAGEMENT,
+            Capability::SESSION_MANAGEMENT.bits()
+        );
         assert_eq!(UDA_SESSION_CAP_LOCK, Capability::LOCK.bits());
         assert_eq!(UDA_SESSION_CAP_LOGOUT, Capability::LOGOUT.bits());
         assert_eq!(UDA_SESSION_CAP_SUSPEND, Capability::SUSPEND.bits());
@@ -194,7 +200,10 @@ mod tests {
 
         for (index, bit) in bits.iter().enumerate() {
             // Each is a single bit (a power of two) ...
-            assert!(bit.is_power_of_two(), "bit {index} is not a lone flag: {bit}");
+            assert!(
+                bit.is_power_of_two(),
+                "bit {index} is not a lone flag: {bit}"
+            );
             // ... and it appears only once, so a bitmask can never be ambiguous.
             assert_eq!(
                 bits.iter().filter(|other| *other == bit).count(),
@@ -252,7 +261,9 @@ mod tests {
 
         impl SessionManager for Failing {
             fn lock(&self) -> Result<(), UdaError> {
-                Err(UdaError::CommandFailed("the lock service refused".to_string()))
+                Err(UdaError::CommandFailed(
+                    "the lock service refused".to_string(),
+                ))
             }
             fn logout(&self) -> Result<(), UdaError> {
                 Ok(())

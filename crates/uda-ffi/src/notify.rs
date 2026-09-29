@@ -59,7 +59,9 @@ fn build_notification(
     // as a blank row.
     let mut lines = actions.split('\n').filter(|part| !part.is_empty());
     while let (Some(key), Some(label)) = (lines.next(), lines.next()) {
-        notification.actions.push((key.to_string(), label.to_string()));
+        notification
+            .actions
+            .push((key.to_string(), label.to_string()));
     }
 
     notification

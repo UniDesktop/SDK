@@ -288,7 +288,9 @@ pub(crate) fn set_icon_rgba(
     len: usize,
 ) -> Result<(), Failure> {
     if data.is_null() {
-        return Err(Failure::InvalidArgument("`data` must not be null".to_string()));
+        return Err(Failure::InvalidArgument(
+            "`data` must not be null".to_string(),
+        ));
     }
     let needed = stride
         .checked_mul(height)
@@ -380,7 +382,10 @@ pub(crate) fn menu_add_text(
         );
     }
 
-    log::debug!("tray menu {menu_handle}: added text row {}", item_id.into_raw());
+    log::debug!(
+        "tray menu {menu_handle}: added text row {}",
+        item_id.into_raw()
+    );
     Ok(item_id.into_raw())
 }
 
@@ -603,13 +608,12 @@ mod tests {
         let _guard = registry_guard();
         let menu = create_menu().expect("menu");
 
-        let welcome_id = registry_text(menu, "welcome", None, std::ptr::null_mut())
-            .expect("text row");
+        let welcome_id =
+            registry_text(menu, "welcome", None, std::ptr::null_mut()).expect("text row");
         let checkbox_id = registry_checkbox(menu, "dark mode", false, None, std::ptr::null_mut())
             .expect("checkbox row");
         assert!(menu_add_separator(menu).is_ok(), "separator");
-        let quit_id =
-            registry_text(menu, "quit", None, std::ptr::null_mut()).expect("text row");
+        let quit_id = registry_text(menu, "quit", None, std::ptr::null_mut()).expect("text row");
 
         assert_ne!(welcome_id, 0);
         assert_ne!(checkbox_id, 0);
@@ -809,7 +813,10 @@ mod tests {
 
         // None of those rejections may have consumed the menu.
         let (_, menus) = TrayRegistry::global().live_counts();
-        assert!(menus >= 1, "a mis-addressed menu must survive every rejection");
+        assert!(
+            menus >= 1,
+            "a mis-addressed menu must survive every rejection"
+        );
         assert!(destroy_menu(menu).is_ok());
     }
 

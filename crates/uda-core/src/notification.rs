@@ -329,14 +329,20 @@ mod tests {
     #[test]
     fn a_relative_path_is_not_given_an_authority() {
         // UDA 没有可用于解析的工作目录，编造一个比原样传递更糟。
-        assert_eq!(image_source("pics/icon.png").as_deref(), Some("pics/icon.png"));
+        assert_eq!(
+            image_source("pics/icon.png").as_deref(),
+            Some("pics/icon.png")
+        );
     }
 
     #[test]
     fn the_linux_backend_accepts_the_same_plain_path() {
         // Linux 后端直接吃裸路径。规范化对无 scheme、无前导分隔符的值是恒等的，
         // 因此两个平台可以用同一个入口而不必分支。
-        assert_eq!(image_source("pics/icon.png").as_deref(), Some("pics/icon.png"));
+        assert_eq!(
+            image_source("pics/icon.png").as_deref(),
+            Some("pics/icon.png")
+        );
         assert_eq!(file_uri("pics/icon.png"), "pics/icon.png");
     }
 
@@ -346,7 +352,10 @@ mod tests {
 
     #[test]
     fn alt_text_comes_from_the_app_name_and_falls_back() {
-        assert_eq!(header_title("UDA Notification Demo"), Some("UDA Notification Demo"));
+        assert_eq!(
+            header_title("UDA Notification Demo"),
+            Some("UDA Notification Demo")
+        );
         assert_eq!(header_title("  UDA  "), Some("UDA"));
         assert_eq!(header_title(""), None);
     }

@@ -42,15 +42,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HBITMAP, HDC, HBRUSH,
+    DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
+use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 // `Shell_NotifyIconW`, `NOTIFYICONDATAW` and the `NIM_*`/`NIF_*` constants live in
 // `Win32::UI::Shell`; the icon-creation and window APIs (`CreateIcon`,
 // `CreateIconIndirect`, `ICONINFO`, `RegisterClassW`, ...) are exported from
@@ -62,12 +62,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    ICONINFO, IMAGE_ICON, KillTimer, LR_DEFAULTSIZE, LR_LOADFROMFILE, LoadImageW, PostMessageW,
-    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx,
-    TranslateMessage, UnregisterClassW, GWLP_USERDATA, HCURSOR, HICON, HMENU, MF_CHECKED,
-    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
-    WNDCLASS_STYLES, WS_OVERLAPPED,
+    KillTimer, LoadImageW, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage, UnregisterClassW, GWLP_USERDATA,
+    HCURSOR, HICON, HMENU, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_CHECKED,
+    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WNDCLASS_STYLES,
+    WS_OVERLAPPED,
 };
 
 use uda_core::capability::{Capability, SupportLevel};
@@ -496,7 +496,10 @@ fn icons_equal(left: Option<&TrayIconSource>, right: Option<&TrayIconSource>) ->
 /// `Arc::ptr_eq` is the right test: the host replaces the `Arc` when it swaps
 /// menus, and a mutating host keeps the same `Arc` (in which case the visible
 /// rows are rebuilt from it anyway, because the menu is re-read at open time).
-fn menus_equal(left: Option<&Arc<uda_core::tray::TrayMenu>>, right: Option<&Arc<uda_core::tray::TrayMenu>>) -> bool {
+fn menus_equal(
+    left: Option<&Arc<uda_core::tray::TrayMenu>>,
+    right: Option<&Arc<uda_core::tray::TrayMenu>>,
+) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
@@ -590,13 +593,13 @@ impl MenuTable {
                 // carries neither label nor callback.
                 self.allocate(String::new(), None)
             }
-            MenuItem::Text { label, action, .. } => {
-                self.allocate(label.clone(), action.clone())
-            }
+            MenuItem::Text { label, action, .. } => self.allocate(label.clone(), action.clone()),
             MenuItem::Checkbox { label, action, .. } => {
                 self.allocate(label.clone(), action.clone())
             }
-            MenuItem::Submenu { label, children, .. } => {
+            MenuItem::Submenu {
+                label, children, ..
+            } => {
                 let command_id = self.allocate(label.clone(), None);
                 for child in children.items() {
                     self.push_item(&child);
@@ -644,9 +647,14 @@ impl MenuTable {
         match item {
             MenuItem::Separator => {
                 // SAFETY: `menu` is a live popup created by `CreatePopupMenu`.
-                let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null()) };
+                let _ =
+                    unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null()) };
             }
-            MenuItem::Text { label, state, action } => {
+            MenuItem::Text {
+                label,
+                state,
+                action,
+            } => {
                 let command_id = self.allocate(label.clone(), action.clone());
                 append_row(menu, command_id, label, state.enabled, false, false);
             }
@@ -656,14 +664,7 @@ impl MenuTable {
                 action,
             } => {
                 let command_id = self.allocate(label.clone(), action.clone());
-                append_row(
-                    menu,
-                    command_id,
-                    label,
-                    state.enabled,
-                    true,
-                    state.checked,
-                );
+                append_row(menu, command_id, label, state.enabled, true, state.checked);
             }
             MenuItem::Submenu {
                 label, children, ..
@@ -708,7 +709,14 @@ fn create_popup() -> windows::core::Result<HMENU> {
 ///
 /// A disabled row gets both `MF_DISABLED` and `MF_GRAYED`: the first stops it
 /// firing, the second is what actually greys it out (`tray_specs.md` §2.5).
-fn append_row(menu: HMENU, command_id: u16, label: &str, enabled: bool, checkbox: bool, checked: bool) {
+fn append_row(
+    menu: HMENU,
+    command_id: u16,
+    label: &str,
+    enabled: bool,
+    checkbox: bool,
+    checked: bool,
+) {
     let wide = to_utf16(label);
     let mut flags = MF_STRING;
     if !enabled {
@@ -957,9 +965,7 @@ impl Worker {
             }
         };
         if hwnd.is_invalid() {
-            return Err(UdaError::Internal(
-                "the tray window is invalid".to_string(),
-            ));
+            return Err(UdaError::Internal("the tray window is invalid".to_string()));
         }
         self.hwnd = hwnd;
 
@@ -1870,7 +1876,9 @@ mod tests {
         assert!(menu.push(MenuItem::text_disabled("locked")).is_ok());
         let child = Arc::new(uda_core::tray::TrayMenu::new());
         assert!(child.push(MenuItem::text("inner")).is_ok());
-        assert!(menu.push(MenuItem::submenu("more", Arc::clone(&child))).is_ok());
+        assert!(menu
+            .push(MenuItem::submenu("more", Arc::clone(&child)))
+            .is_ok());
         menu
     }
 
@@ -2044,7 +2052,10 @@ mod tests {
         let mut state = TrayShared::from_config(&config);
         assert_eq!(state.name, "test");
         assert_eq!(state.tooltip, "hello");
-        assert_eq!(state.icon, Some(TrayIconSource::Path("app.ico".to_string())));
+        assert_eq!(
+            state.icon,
+            Some(TrayIconSource::Path("app.ico".to_string()))
+        );
         assert!(state.menu.is_some());
         // A freshly registered icon is visible; `TrayIcon::hide` is the only way
         // to change that, so the mirror must start out shown.
@@ -2161,7 +2172,10 @@ mod tests {
             WPARAM(((300u32 << 16) | 640) as usize),
             LPARAM(((2u32 << 16) | 0x0205) as isize),
         );
-        assert_eq!(payload.icon_id, 2, "the id comes from the high word of lParam");
+        assert_eq!(
+            payload.icon_id, 2,
+            "the id comes from the high word of lParam"
+        );
         assert_eq!(payload.cursor, POINT { x: 640, y: 300 });
         assert_ne!(payload.icon_id as i32, payload.cursor.x);
     }

@@ -263,7 +263,9 @@ impl LinuxSessionManager {
                 zbus::Proxy::new(&connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE),
             )
             .await
-            .map_err(|_| UdaError::CommandFailed("building the logind proxy timed out".to_string()))?
+            .map_err(|_| {
+                UdaError::CommandFailed("building the logind proxy timed out".to_string())
+            })?
             .map_err(|e| UdaError::DetectionFailed(format!("logind proxy: {e}")))?;
 
             tokio::time::timeout(
@@ -282,7 +284,9 @@ impl LinuxSessionManager {
                 // XFCE each expose a logout entry point under a different name,
                 // and all three are tried because `$XDG_CURRENT_DESKTOP` is not
                 // reliable enough to pick one.
-                log::debug!("logind logout failed ({logind_error}); trying the desktop session manager");
+                log::debug!(
+                    "logind logout failed ({logind_error}); trying the desktop session manager"
+                );
 
                 for (service, path, interface, method) in [
                     (
@@ -322,7 +326,10 @@ impl LinuxSessionManager {
 /// keeps trying the next candidate and only reports an error when all of them
 /// fail.
 fn logout_via_desktop(service: &str, path: &str, interface: &str, method: &str) -> bool {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
         return false;
     };
 
@@ -344,11 +351,7 @@ fn logout_via_desktop(service: &str, path: &str, interface: &str, method: &str) 
     };
 
     let call = runtime.block_on(async {
-        tokio::time::timeout(
-            DBUS_TIMEOUT,
-            proxy.call::<&str, (u32,), ()>(method, &(0,)),
-        )
-        .await
+        tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (u32,), ()>(method, &(0,))).await
     });
 
     match call {
@@ -385,9 +388,7 @@ fn map_login1_error(method: &str, text: &str) -> UdaError {
     }
 
     if text.contains("NoSuchOperation") || text.contains("NotSupported") {
-        return UdaError::NotSupported(format!(
-            "logind cannot {method} on this machine: {text}"
-        ));
+        return UdaError::NotSupported(format!("logind cannot {method} on this machine: {text}"));
     }
 
     UdaError::CommandFailed(format!("logind {method} failed: {text}"))
@@ -525,7 +526,9 @@ mod tests {
             "org.freedesktop.DBus.Error.AccessDenied"
         ));
         assert!(error_is_authorization("InteractiveAuthorizationRequired"));
-        assert!(!error_is_authorization("org.freedesktop.DBus.Error.ServiceUnknown"));
+        assert!(!error_is_authorization(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        ));
     }
 
     #[test]
