@@ -21,9 +21,16 @@ measure for the rare case a non-ASCII path is echoed back.
 
 from __future__ import annotations
 
+import argparse
 import pathlib
 import struct
 import sys
+
+# `scripts/` is not a package; add it to the import path so the header parser is
+# defined exactly once and shared with the CI workflow.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from header_symbols import header_symbols  # noqa: E402  (needs the path tweak above)
 
 #: Force UTF-8 output with a ``replace`` fallback so that a non-ASCII path echoed
 #: by the caller cannot trip the console code page (for example ``cp1252`` on the
@@ -136,11 +143,20 @@ def _exported_names(data: bytes) -> list[str]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2:
-        print(f"usage: {argv[0]} <path-to-dll>", file=sys.stderr)
-        return 2
+    parser = argparse.ArgumentParser(
+        description="Parse the export directory of a PE shared library and list ``uda_*`` symbols."
+    )
+    parser.add_argument("dll", help="path to the shared library to inspect")
+    parser.add_argument(
+        "--expect",
+        type=pathlib.Path,
+        metavar="HEADER",
+        help="C header whose declared ``uda_*`` functions must all be exported "
+        "(e.g. include/uda.h). Omit to only list the exports.",
+    )
+    args = parser.parse_args(argv[1:])
 
-    path = pathlib.Path(argv[1])
+    path = pathlib.Path(args.dll)
     if not path.is_file():
         print(f"file not found: {path}", file=sys.stderr)
         return 2
@@ -156,7 +172,54 @@ def main(argv: list[str]) -> int:
     print(f"uda_* symbols ({len(uda_names)}):")
     for name in uda_names:
         print(f"   {name}")
-    return 0 if uda_names else 1
+
+    # A shared library with no `uda_*` export is never a successful build: it
+    # means the `#[no_mangle]` symbols were stripped or never emitted, which is
+    # exactly the regression this script exists to catch. Fail loudly instead of
+    # printing an empty list and exiting 0.
+    if not uda_names:
+        print("error: no uda_* symbols exported", file=sys.stderr)
+        return 1
+
+    if args.expect is None:
+        return 0
+
+    if not args.expect.is_file():
+        print(f"header not found: {args.expect}", file=sys.stderr)
+        return 2
+
+    expected = header_symbols(args.expect)
+    if not expected:
+        print(f"error: no uda_* declarations found in {args.expect}", file=sys.stderr)
+        return 2
+
+    print(f"expected uda_* symbols from {args.expect} ({len(expected)}):")
+
+    exported = set(uda_names)
+    missing = [name for name in expected if name not in exported]
+    extra = [name for name in uda_names if name not in set(expected)]
+
+    for name in expected:
+        if name in missing:
+            print(f"   MISSING {name}")
+        else:
+            print(f"   ok      {name}")
+
+    if missing:
+        print(
+            f"error: {len(missing)} expected symbol(s) not exported: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # An extra export is not a failure on its own (the ABI is append-only and a
+    # helper may legitimately be `#[no_mangle]`ed), but it must be visible so a
+    # reviewer can decide whether it belongs in the header.
+    if extra:
+        print(f"note: {len(extra)} export(s) not declared in {args.expect}: {', '.join(extra)}")
+
+    print(f"all {len(expected)} expected symbols exported")
+    return 0
 
 
 if __name__ == "__main__":

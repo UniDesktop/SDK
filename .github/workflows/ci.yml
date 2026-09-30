@@ -175,7 +175,11 @@ jobs:
           # guard; these variables force UTF-8 for any child process too.
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        run: python scripts/pe_exports.py target/debug/uda_ffi.dll
+        # `include/uda.h` is the single source of truth for the exported surface:
+        # every function it declares must be present in the DLL, so a missing
+        # `#[no_mangle]` fails the build. Hard-coding a symbol count here instead
+        # broke every release once Phase 2 added exports past the stale number.
+        run: python scripts/pe_exports.py target/debug/uda_ffi.dll --expect include/uda.h
 
       - name: Run Python example against the freshly built DLL
         shell: bash
@@ -250,15 +254,39 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip
 
+      # `include/uda.h` is the source of truth for the exported surface. Both
+      # platforms are checked against it, so the expected symbol set can never
+      # drift from what the crate actually declares: a new `#[no_mangle]`
+      # export is picked up automatically, and a *missing* one fails the build.
+      # Hard-coding a symbol count here instead is what broke the release check
+      # once Phase 2 pushed the export list past the stale number.
       - name: Verify exported ABI symbols (Linux)
         run: |
           set -euo pipefail
-          count=$(nm -D --defined-only target/release/libuda_ffi.so | grep -cE ' (uda_[a-z_]+)$')
-          echo "exported uda_* symbols: $count"
-          if [ "$count" -ne 8 ]; then
-            echo "expected exactly 8 exported uda_* symbols, found $count"
+          # `scripts/header_symbols.py` emits LF-only output; strip any CR as a
+          # belt-and-braces measure so a `$`-anchored grep can never be broken
+          # by a carriage return when this step is replayed on a Windows host.
+          mapfile -t expected_names < <(python3 scripts/header_symbols.py include/uda.h | tr -d '\r')
+          expected=${#expected_names[@]}
+          if [ "$expected" -eq 0 ]; then
+            echo "error: no uda_* declarations found in include/uda.h"
             exit 1
           fi
+          count=$(nm -D --defined-only target/release/libuda_ffi.so | grep -cE ' (uda_[a-z_]+)$')
+          echo "exported uda_* symbols: $count (header declares: $expected)"
+          if [ "$count" -ne "$expected" ]; then
+            echo "expected $expected exported uda_* symbols (one per declaration in include/uda.h), found $count"
+            nm -D --defined-only target/release/libuda_ffi.so | grep -E ' (uda_[a-z_]+)$' | sort || true
+            exit 1
+          fi
+          # And every header declaration must be a *defined* export, so a symbol
+          # that is stripped or renamed is caught even when the count matches.
+          for name in "${expected_names[@]}"; do
+            if ! nm -D --defined-only target/release/libuda_ffi.so | grep -qE " ${name}$"; then
+              echo "missing export: $name"
+              exit 1
+            fi
+          done
 
       - name: Verify exported ABI symbols (Windows)
         env:
@@ -266,7 +294,9 @@ jobs:
           # keep Python in UTF-8 mode regardless of the runner's code page.
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        run: python3 scripts/pe_exports.py target/x86_64-pc-windows-gnu/release/uda_ffi.dll
+        # Same source-of-truth header as the Linux step above: every declared
+        # `uda_*` function must be exported by the cross-built DLL.
+        run: python3 scripts/pe_exports.py target/x86_64-pc-windows-gnu/release/uda_ffi.dll --expect include/uda.h
 
       - name: Package release archives
         run: |

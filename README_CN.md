@@ -70,7 +70,7 @@ uda.notify('标题', '正文内容');
 uda.dispose();
 ```
 
-完整安装步骤、能力教程与全部 API 参考：**[UniDesktop.github.io/Website](https://unidesktop.github.io/Website/)**。
+完整安装步骤、能力教程与全部 API 参考：**[unidesktop.github.io](https://unidesktop.github.io/)**。
 
 ## 🏗️ 架构与项目结构
 

@@ -70,7 +70,7 @@ uda.notify('标题', '正文内容');
 uda.dispose();
 ```
 
-Full install steps, capability guides and the complete API reference: **[UniDesktop.github.io/Website](https://unidesktop.github.io/Website/)**.
+Full install steps, capability guides and the complete API reference: **[unidesktop.github.io](https://unidesktop.github.io/)**.
 
 ## 🏗️ Architecture & Project Layout
 
