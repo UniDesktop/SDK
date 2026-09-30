@@ -9,23 +9,18 @@
         uda.wallpaper = "~/Pictures/a.png"  # 设置壁纸
         uda.notify("标题", "正文内容")        # 发一条系统通知
 
-设计原则
---------
-**零依赖**：只用 Python 标准库（``ctypes`` + ``zlib``），不引入 Pillow 等
-第三方包，也不要求安装 Rust 工具链之外的任何东西。
+**零依赖**：只用 Python 标准库（``ctypes`` + ``zlib``）。
 
-**不泄漏底层细节**：调用方看不到 ``ctypes.byref``、``c_void_p``、裸指针或
-十六进制状态码。所有指针出参、字符串内存释放、函数指针保活都封装在本模块内，
-失败时抛出带诊断消息的 :class:`UdaError`。
+**不泄漏底层细节**：调用方看不到 ``ctypes.byref``、``c_void_p``、裸指针或十六进制
+状态码。所有指针出参、字符串内存释放、函数指针保活都封装在本模块内，失败时抛出带
+诊断消息的 :class:`UdaError`。
 
 **图标可以只给一个路径**：托盘图标可以直接传 ``.png`` 文件路径，SDK 内部会用
-:mod:`_png`（纯标准库 PNG 解码器）读成 RGBA 再提交。之所以需要这一步：Linux 的
-``StatusNotifierItem`` 把 ``Path`` 当作 **freedesktop 图标主题名**而不是文件
-路径，直接传仓库内的 PNG 路径在 Linux 上什么都不会显示；RGBA 通道在两端语义
-一致。
+:mod:`_png` 读成 RGBA 再提交 —— Linux 的 ``StatusNotifierItem`` 把 ``Path`` 当作
+freedesktop 图标主题名而不是文件路径，直接传 PNG 路径在 Linux 上不会显示任何东西。
 
-动态库定位顺序：``UDA_LIBRARY`` 环境变量 > ``cargo metadata`` 报告的 target
-目录 > 仓库内常见构建目录 > 系统动态库搜索路径。
+动态库定位顺序：``UDA_LIBRARY`` 环境变量 > ``cargo metadata`` 报告的 target 目录 >
+仓库内常见构建目录 > 系统动态库搜索路径。
 """
 
 from __future__ import annotations
@@ -99,11 +94,7 @@ _LIBRARY_CANDIDATES: Final[tuple[str, ...]] = (
 #: 调用 ``cargo metadata`` 查询真实 target 目录时的超时（秒）。
 _CARGO_METADATA_TIMEOUT: Final[float] = 10.0
 
-#: 提交给 shell 的托盘图标最长边像素数。
-#: ``docs/internals/tray_specs.md`` §2.6 规定托盘图标为 ``SM_CXSMICON``（16px
-#: @96dpi），HiDPI 下常见 32px。把一张 1254x1254 的原图直接提交，会让
-#: ``IconPixmap`` 往会话总线广播 6 MB 数据、Windows 端还得为整张位图建 DIB，
-#: 因此先在这里降到两端都无需再缩放的大小。
+#: 提交给 shell 的托盘图标最长边像素数（``docs/internals/tray_specs.md`` §2.6）。
 TRAY_ICON_MAX_EXTENT: Final[int] = 32
 
 

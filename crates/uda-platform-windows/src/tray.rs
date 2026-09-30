@@ -1,7 +1,5 @@
 //! Windows system tray backend: `Shell_NotifyIconW` + a hidden message-only window.
 //!
-//! # Architecture
-//!
 //! ```text
 //!  host thread                     tray worker thread
 //!  ───────────                     ──────────────────
@@ -13,29 +11,20 @@
 //!
 //! A tray icon on Windows is a window, not an object: the shell posts callback
 //! messages to the `hWnd` recorded in `NOTIFYICONDATAW`, so that window must
-//! belong to a thread that runs a message loop. UDA therefore creates a
-//! message-only window (`HWND_MESSAGE` parent) on a dedicated worker thread and
-//! never touches the host's message queue, which keeps the host free of any
-//! requirement to pump messages itself.
+//! belong to a thread running a message loop. UDA creates a message-only window
+//! (`HWND_MESSAGE` parent) on a dedicated worker thread and never touches the
+//! host's message queue, so the host is never asked to pump messages itself.
 //!
-//! # No shared-state mirror
-//!
-//! Unlike the Linux backend (see `crates/uda-platform-linux/src/tray.rs`), the
-//! worker thread cannot just read a mirror: Win32 calls such as
-//! `Shell_NotifyIconW`, `CreatePopupMenu` and `TrackPopupMenuEx` must be issued
-//! from the thread that owns the window. The host's mutations are therefore
-//! *forwarded* to the worker as user messages, and the worker applies them
-//! under its own lock. This satisfies `tray_specs.md` §3.3 ("callbacks fire on
-//! the tray worker thread, never on the host's main thread") and is what keeps
-//! a `Drop` racing a menu open from corrupting the window.
-//!
-//! # Never panic (AGENTS.md §1)
+//! Unlike the Linux backend there is no shared-state mirror, because Win32 calls
+//! such as `Shell_NotifyIconW`, `CreatePopupMenu` and `TrackPopupMenuEx` must be
+//! issued from the thread that owns the window. Host mutations are *forwarded*
+//! to the worker as user messages and applied under its own lock, which is what
+//! keeps a `Drop` racing a menu open from corrupting the window.
 //!
 //! Every Win32 result is inspected and mapped into
-//! [`UdaError`](uda_core::error::UdaError). No `unwrap()`, `expect()`,
-//! `panic!()` or `unreachable!()` on a Win32 call; the FFI is inherently unsafe,
-//! so each unsafe block carries a `// SAFETY:` note naming the invariant it
-//! relies on.
+//! [`UdaError`](uda_core::error::UdaError); no `unwrap()`, `expect()`, `panic!()`
+//! or `unreachable!()` is used on a Win32 call, and each unsafe block carries a
+//! `// SAFETY:` note naming the invariant it relies on.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
@@ -78,31 +67,22 @@ use uda_core::tray::{
 
 /// Callback message id posted by the shell into the hidden window.
 ///
-/// `tray_specs.md` §2.4 requires `>= WM_USER`; `WM_APP` (0x8000) is the
-/// conventional choice because it leaves the whole `WM_USER` range free for the
-/// host application should it ever share a window.
+/// `tray_specs.md` §2.4 requires `>= WM_USER`; `WM_APP` (0x8000) leaves the whole
+/// `WM_USER` range free for a host application that ever shares the window.
 const CALLBACK_MESSAGE: u32 = 0x8000;
 
-/// Window style used for the hidden window.
-///
-/// `WS_OVERLAPPED` is the harmless default; a message-only window shows nothing
-/// and has no Z-order, so no extended style (`WS_EX_*`) is requested.
+/// Window style for the hidden window: `WS_OVERLAPPED` is the harmless default,
+/// and a message-only window shows nothing and has no Z-order.
 const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_OVERLAPPED;
 
-/// Extended style for the hidden window.
-///
-/// No flags: the window is invisible by virtue of its `HWND_MESSAGE` parent, so
-/// there is nothing to hide from the taskbar or the Alt-Tab list.
+/// Extended style for the hidden window: none, since it is invisible by virtue
+/// of its `HWND_MESSAGE` parent.
 const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE = WINDOW_EX_STYLE(0);
 
-/// Window class name registered once per process.
-///
-/// Unique by construction: the PID and a process-wide counter are folded in so
-/// two UDA tray icons in the same process never collide, and a class name that
-/// happens to match the host application's own class cannot be claimed.
+/// Window class name registered once per process. A per-process unique suffix is
+/// appended by `register_window_class`, which owns the counter, so two UDA tray
+/// icons in one process never collide.
 const fn class_name() -> &'static str {
-    // A per-process unique suffix is appended by `register_window_class`, which
-    // owns the counter; this is the stable prefix.
     "UDA_TrayMessageWindow"
 }
 
@@ -113,10 +93,7 @@ static TRAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 // UTF-16 helpers
 // ---------------------------------------------------------------------------
 
-/// Encode a Rust string as a NUL-terminated UTF-16 buffer.
-///
-/// Win32's `*W` APIs take `PCWSTR`; owning the buffer (rather than borrowing a
-/// temporary) is what makes it safe to hand to an FFI call.
+/// Encode a Rust string as a NUL-terminated UTF-16 buffer for a Win32 `*W` call.
 fn to_utf16(text: &str) -> Vec<u16> {
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     wide.push(0);
@@ -136,17 +113,14 @@ fn from_utf16(wide: &[u16]) -> String {
 
 /// Encode a string into a fixed-size UTF-16 field, NUL-padded.
 ///
-/// `NOTIFYICONDATAW::szTip` is a `[u16; 128]` inline array (not a pointer), so
-/// the caller needs a sized, NUL-terminated copy. The truncation happens on a
-/// char boundary because [`uda_core::tray::sanitize_tooltip`] already capped the
-/// Rust string, so this only has to avoid splitting a surrogate pair.
+/// `NOTIFYICONDATAW::szTip` is an inline `[u16; 128]`, not a pointer, so the
+/// caller needs a sized copy. [`uda_core::tray::sanitize_tooltip`] already
+/// capped the string in chars, so this only has to stop at `limit` units to keep
+/// a surrogate pair intact.
 fn to_fixed_utf16<const N: usize>(text: &str) -> [u16; N] {
     let mut buffer = [0u16; N];
     // Reserve one element for the terminator.
     let limit = N.saturating_sub(1);
-    // `encode_utf16` yields one u16 per BMP char and two per astral char, so
-    // stopping once `limit` units are written keeps a pair intact whenever the
-    // string was already capped in chars.
     let mut written = 0;
     for unit in text.encode_utf16() {
         if written >= limit {
@@ -165,17 +139,14 @@ fn to_fixed_utf16<const N: usize>(text: &str) -> [u16; N] {
 
 /// A tray callback message, unpacked from its `wParam` / `lParam` pair.
 ///
-/// Under `NOTIFYICON_VERSION_4` the shell packs two values into `lParam` and puts
-/// a third into `wParam` (`tray_specs.md` §2.3):
+/// Under `NOTIFYICON_VERSION_4` the shell packs two values into `lParam` and a
+/// third into `wParam` (`tray_specs.md` §2.3):
+/// `lParam` low 16 bits are the mouse message, its high 16 bits the icon id from
+/// `NOTIFYICONDATAW::uID`, and `wParam` is the cursor position with `x` low and
+/// `y` high, each signed 16-bit.
 ///
-/// | Slot | Contents |
-/// |------|----------|
-/// | `lParam` low 16 bits  | the mouse message (`WM_LBUTTONUP`, ...) |
-/// | `lParam` high 16 bits | the icon id from `NOTIFYICONDATAW::uID` |
-/// | `wParam`             | the cursor position, `x` low / `y` high, signed 16-bit |
-///
-/// Keeping this in a struct with a parser means the packing contract is stated
-/// once, tested on its own, and never re-derived inline at each call site.
+/// A struct with one parser states the packing contract once, instead of
+/// re-deriving it at each call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CallbackPayload {
     /// The mouse message the shell reported.
@@ -188,12 +159,9 @@ struct CallbackPayload {
 
 /// Unpack a tray callback message.
 fn unpack_callback(wparam: WPARAM, lparam: LPARAM) -> CallbackPayload {
-    // The words are unsigned 16-bit lanes; reinterpreting them as signed only
-    // happens at the very end, where they become a `POINT`.
     let packed = lparam.0 as u32;
-    // `wParam` is an `isize` on 64-bit Windows, so a plain shift would drag the
-    // upper half of `y` into the result; the `as u32` truncates to the low word
-    // first, which is the documented width of `x`.
+    // `wParam` is an `isize` on 64-bit Windows; the `as u32` truncates to the low
+    // word, the documented width of `x`, before the high half is read as `y`.
     let coordinates = wparam.0 as u32;
     CallbackPayload {
         event: packed & 0xFFFF,
@@ -211,14 +179,10 @@ fn unpack_callback(wparam: WPARAM, lparam: LPARAM) -> CallbackPayload {
 
 /// The tray icon size Win32 wants, in pixels.
 ///
-/// The shell draws the notification area at the small-icon size, which
-/// `GetSystemMetrics(SM_CXSMICON)` reports (16x16 at 96 DPI, larger when the user
-/// scales up). It is captured once, lazily, rather than cached in a `const`,
-/// because a DPI change or a theme switch can move it while the process lives.
-///
-/// `LoadImageW` is handed the same pair so a multi-resolution `.ico` picks the
-/// entry closest to what the shell will actually draw instead of its largest
-/// frame.
+/// Read lazily rather than held in a `const`, because a DPI change or a theme
+/// switch can move `GetSystemMetrics(SM_CXSMICON)` while the process lives.
+/// `LoadImageW` is handed the same pair, so a multi-resolution `.ico` picks the
+/// entry closest to what the shell will draw.
 fn tray_icon_extent() -> (i32, i32) {
     // SAFETY: `GetSystemMetrics` only reads process-wide window metrics and has
     // no failure mode to report.
@@ -226,27 +190,15 @@ fn tray_icon_extent() -> (i32, i32) {
     if extent > 0 {
         (extent, extent)
     } else {
-        // Defensive: a zero or negative extent would make `LoadImageW` fail, so
-        // fall back to the documented default rather than passing it through.
         (16, 16)
     }
 }
 
-/// Load a Win32 `HICON` from a file path.
-///
-/// `LoadImageW` with `LR_LOADFROMFILE | LR_DEFAULTSIZE` is the documented route
-/// for a `.ico` / `.cur` / `.bmp` on disk, and `LR_DEFAULTSIZE` makes it fall
-/// back to the system's small-icon size when the resource carries no size of
-/// its own. Without this branch a `TrayIconSource::Path` produced no image at
-/// all: the shell still reserved taskbar space for the item (hence the empty
-/// placeholder) but had nothing to draw.
-///
-/// Returns `None` when the file is missing, unreadable or not an image, so the
-/// caller can degrade instead of failing registration.
+/// Load a Win32 `HICON` from a file path, returning `None` when the file is
+/// missing, unreadable or not an image so the caller can degrade.
 fn icon_from_path(path: &str) -> Option<HICON> {
-    // The source contract already rejects blank and whitespace-only paths
-    // (`tray_specs.md` §3.1); re-checking here keeps the helper honest when it
-    // is called directly.
+    // The source contract already rejects blank paths (`tray_specs.md` §3.1);
+    // re-checking keeps the helper honest when called directly.
     if path.trim().is_empty() {
         log::warn!("tray icon path is blank; no icon will be set");
         return None;
@@ -255,16 +207,14 @@ fn icon_from_path(path: &str) -> Option<HICON> {
     let wide = to_utf16(path);
     let (width, height) = tray_icon_extent();
 
-    // A null module handle is what makes `LoadImageW` read `name` as a *file
-    // name* instead of a resource ordinal. windows-rs 0.58 does not implement
-    // `Param<HINSTANCE>` for `Option<HINSTANCE>`, so the null handle is spelled
-    // as a default `HINSTANCE` rather than `None`.
+    // A null module handle makes `LoadImageW` read `name` as a file name rather
+    // than a resource ordinal. windows-rs has no `Param<HINSTANCE>` for
+    // `Option<HINSTANCE>`, so the null handle is spelled as a default value.
     let module = windows::Win32::Foundation::HINSTANCE::default();
 
     // SAFETY: `wide` is a live, null-terminated UTF-16 buffer for the duration of
-    // the call, and `module` is a null handle, so the name parameter is read as
-    // the file name above. `LoadImageW` copies the image it decodes into an icon
-    // handle the caller owns.
+    // the call and `module` is null, so the name is read as the file name above.
+    // `LoadImageW` copies the decoded image into a handle the caller owns.
     let handle = unsafe {
         LoadImageW(
             module,
@@ -285,21 +235,17 @@ fn icon_from_path(path: &str) -> Option<HICON> {
     }
 }
 
-/// Convert a validated source into a Win32 `HICON`.
+/// Convert a validated source into a Win32 `HICON`, returning `None` when the
+/// source cannot be turned into an icon so the caller can degrade.
 ///
-/// `tray_specs.md` §2.6 says an RGBA icon is wrapped in a bitmap and scaled; the
-/// smallest faithful path is a 32bpp top-down DIB section fed to
-/// `CreateIconIndirect` with an opaque mask. The DIB is created from the
-/// *validated source* rather than through the Linux transcoder, because Win32
-/// wants top-down BGRA while the Linux path produces bottom-up B, G, R, A rows
-/// for `IconPixmap`.
-///
-/// Returns `None` when the source cannot be turned into an icon, so the caller
-/// can degrade instead of failing registration.
+/// An RGBA icon is wrapped in a 32bpp top-down DIB section fed to
+/// `CreateIconIndirect` with an opaque mask (`tray_specs.md` §2.6). The DIB is
+/// built from the source directly rather than through the Linux transcoder,
+/// which produces bottom-up rows for `IconPixmap`.
 fn icon_from_source(source: &TrayIconSource) -> Option<HICON> {
-    // A path icon is decoded by Win32 itself rather than transcoded here: the
-    // loader understands `.ico`, `.cur` and `.bmp`, including the multi-image
-    // entries an author packs for several DPI levels.
+    // A path icon is decoded by Win32 itself: the loader understands `.ico`,
+    // `.cur` and `.bmp`, including the multi-image entries packed for several
+    // DPI levels.
     if let TrayIconSource::Path(path) = source {
         return icon_from_path(path);
     }
@@ -384,11 +330,9 @@ fn icon_from_source(source: &TrayIconSource) -> Option<HICON> {
     }
 }
 
-/// Build a 32bpp top-down BGRA `HBITMAP` holding `pixels`.
-///
-/// A DIB section is used instead of `CreateBitmap` so the pixel layout is
-/// exactly `BI_RGB` with no palette translation, which is what keeps an RGBA
-/// icon from appearing with swapped channels.
+/// Build a 32bpp top-down BGRA `HBITMAP` holding `pixels`. A DIB section is used
+/// instead of `CreateBitmap` so the layout is exactly `BI_RGB` with no palette
+/// translation.
 fn create_color_bitmap(dc: HDC, width: i32, height: i32, pixels: &[u8]) -> Option<HBITMAP> {
     let header = BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -434,23 +378,20 @@ fn create_color_bitmap(dc: HDC, width: i32, height: i32, pixels: &[u8]) -> Optio
     Some(bitmap)
 }
 
-/// Build a 1bpp monochrome mask covering the whole icon.
-///
-/// All-zero bits mean "leave the colour bitmap visible", which is the correct
-/// mask when alpha already encodes the shape.
+/// Build a 1bpp monochrome mask covering the whole icon. All-zero bits mean
+/// "leave the colour bitmap visible", the correct mask when alpha already
+/// encodes the shape.
 fn create_mask_bitmap(width: i32, height: i32) -> HBITMAP {
-    // A monochrome bitmap row is padded to 16 bits; `width <= 32` for any tray
-    // icon, so one u16 per row is enough and the rest stays zero.
+    // A monochrome row is padded to 16 bits; `width <= 32` for any tray icon, so
+    // one u16 per row is enough and the rest stays zero.
     let row_bytes = (((width + 15) / 16) * 2) as usize;
     let mut zeros = vec![0u8; row_bytes * height as usize];
     // SAFETY: `CreateBitmap` reads `zeros` as planar data of the documented size.
     unsafe { CreateBitmap(width, height, 1, 1, Some(zeros.as_mut_ptr().cast())) }
 }
 
-/// Destroy an icon built by [`icon_from_source`], if the shell lost it.
-///
-/// Kept as a named function so the drop path and the icon-swap path call the
-/// same code, and so a failed `DestroyIcon` is only a log line.
+/// Destroy an icon built by [`icon_from_source`]. A named function so the drop
+/// path and the icon-swap path share it, and a failure is only a log line.
 fn destroy_icon(icon: HICON) {
     if icon.is_invalid() {
         return;
@@ -464,11 +405,8 @@ fn destroy_icon(icon: HICON) {
     }
 }
 
-/// Whether two icon sources describe the same image.
-///
-/// `TrayIconSource` has no `PartialEq` (it owns a pixel buffer), so equality is
-/// decided structurally. A `Path` change and an RGBA change are both detected
-/// without comparing every byte when the shapes already differ.
+/// Whether two icon sources describe the same image. `TrayIconSource` has no
+/// `PartialEq` (it owns a pixel buffer), so equality is decided structurally.
 fn icons_equal(left: Option<&TrayIconSource>, right: Option<&TrayIconSource>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -491,11 +429,8 @@ fn icons_equal(left: Option<&TrayIconSource>, right: Option<&TrayIconSource>) ->
     }
 }
 
-/// Whether two menus are the same menu.
-///
-/// `Arc::ptr_eq` is the right test: the host replaces the `Arc` when it swaps
-/// menus, and a mutating host keeps the same `Arc` (in which case the visible
-/// rows are rebuilt from it anyway, because the menu is re-read at open time).
+/// Whether two menus are the same menu: `Arc::ptr_eq`, because a mutating host
+/// keeps the same `Arc` and the rows are rebuilt at open time anyway.
 fn menus_equal(
     left: Option<&Arc<uda_core::tray::TrayMenu>>,
     right: Option<&Arc<uda_core::tray::TrayMenu>>,
@@ -513,10 +448,10 @@ fn menus_equal(
 
 /// One command id allocated for a menu row, plus the callback it fires.
 ///
-/// `WM_COMMAND` carries a 16-bit id, so the backend keeps a `id -> row` table
+/// `WM_COMMAND` carries a 16-bit id, so the backend keeps an `id -> row` table
 /// rebuilt on every menu mutation (`tray_specs.md` §2.5 item 4). The callback is
-/// cloned out of the host's row at build time, so a click never has to reach
-/// back into `TrayMenu` while the shell menu is open.
+/// cloned out of the host's row at build time, so a click never reaches back
+/// into `TrayMenu` while the shell menu is open.
 struct MenuEntry {
     /// Win32 command id used in `AppendMenuW`.
     command_id: u16,
@@ -554,8 +489,7 @@ impl MenuTable {
     /// Allocate one id and remember the row it addresses.
     fn allocate(&mut self, label: String, action: Option<uda_core::tray::TrayAction>) -> u16 {
         let command_id = self.next_id;
-        // Saturating: a menu with more than 65k rows is pathological, and
-        // wrapping would alias an existing command.
+        // Saturating: wrapping would alias an existing command.
         self.next_id = self.next_id.saturating_add(1);
         self.entries.push(MenuEntry {
             command_id,
@@ -573,10 +507,8 @@ impl MenuTable {
             .and_then(|entry| entry.action.clone())
     }
 
-    /// Rebuild the table from a host menu.
-    ///
-    /// The table is treated as disposable: every menu mutation produces a fresh
-    /// one, so a stale id can never fire an outdated callback.
+    /// Rebuild the table from a host menu. It is disposable: every mutation
+    /// produces a fresh one, so a stale id can never fire an outdated callback.
     fn from_menu(menu: &uda_core::tray::TrayMenu) -> Self {
         let mut table = Self::new();
         for item in menu.items() {
@@ -589,8 +521,7 @@ impl MenuTable {
     fn push_item(&mut self, item: &MenuItem) -> u16 {
         match item {
             MenuItem::Separator => {
-                // A separator still consumes an id so positions line up, but it
-                // carries neither label nor callback.
+                // A separator still consumes an id so positions line up.
                 self.allocate(String::new(), None)
             }
             MenuItem::Text { label, action, .. } => self.allocate(label.clone(), action.clone()),
@@ -609,10 +540,8 @@ impl MenuTable {
         }
     }
 
-    /// Log which command id landed on which row.
-    ///
-    /// The table is rebuilt on every menu open, so this is the only place a host
-    /// can see the mapping the shell is about to be handed.
+    /// Log which command id landed on which row, the mapping the shell is about
+    /// to be handed.
     fn trace(&self) {
         for entry in &self.entries {
             log::debug!(
@@ -669,8 +598,7 @@ impl MenuTable {
             MenuItem::Submenu {
                 label, children, ..
             } => {
-                // The submenu row claims one id so its position is stable, and
-                // its children are allocated afterwards.
+                // The submenu row claims one id so its position is stable.
                 let command_id = self.allocate(label.clone(), None);
                 let child_menu = match create_popup() {
                     Ok(child_menu) => child_menu,

@@ -1,55 +1,35 @@
 //! Windows media backend: WinRT SMTC (`GlobalSystemMediaTransportControls`).
 //!
-//! # Backend selection
-//!
-//! Windows has exactly one supported media-control surface, the Global System
-//! Media Transport Controls session manager:
-//!
-//! | Concern              | API                                                                  |
-//! |----------------------|----------------------------------------------------------------------|
-//! | Session lookup       | `GlobalSystemMediaTransportControlsSessionManager::RequestAsync()`   |
-//! | Current session      | `GetCurrentSession()`                                                |
-//! | Metadata             | `TryGetMediaPropertiesAsync()` -> `Title`/`Artist`/`AlbumTitle`      |
-//! | Playback status      | `GetPlaybackInfo()` -> `Controls.PlaybackStatus`                     |
-//! | Timeline             | `GetTimelineProperties()` -> `EndTime`/`Position`                    |
-//! | Transport commands   | `TryTogglePlayPauseAsync()`, `TrySkipNextAsync()`, ...                |
-//!
-//! `GetCurrentSession()` returns the session that currently has system focus,
-//! which is the Windows equivalent of MPRIS picking an active player. It returns
-//! nothing when no media is playing at all; that is the "no player" case and is
-//! reported as [`UdaError::NotSupported`] for commands and `None`/`Unknown` for
-//! reads.
+//! Windows has exactly one supported media-control surface. `RequestAsync()`
+//! resolves the session manager, `GetCurrentSession()` returns the session
+//! holding system focus (the Windows equivalent of MPRIS picking an active
+//! player), and `TryGetMediaPropertiesAsync()` / `GetPlaybackInfo()` /
+//! `GetTimelineProperties()` / the `Try*Async()` commands cover the rest. See
+//! `docs/internals/media_specs.md` for the full property mapping.
 //!
 //! # Three quirks that cost hours if missed
 //!
 //! 1. **Every `Try*Async()` command returns `bool`, not a `Result`.** `false`
-//!    means the session *refused* the command (for example `Next` when the app
-//!    does not enable it), while `true` only means the app *accepted* it - the
-//!    app can still fail afterwards. UDA maps `false` to
-//!    [`UdaError::CommandFailed`] so a caller can distinguish "sent" from
-//!    "refused", which a bare `Result` would hide.
-//! 2. **`TimeSpan` is in 100-nanosecond ticks, not milliseconds.**
-//!    `Duration / 10_000` converts to milliseconds. A `Duration` of zero means
-//!    "unknown", which happens for live streams, and is reported as `None`
-//!    rather than `Some(0)`.
-//! 3. **"No current session" arrives as an `Err`, not a null.** WinRT reports it
-//!    through the `HRESULT`, so the *absence* of a player looks like a failure
-//!    unless the caller reads it as a value. Because a machine with nothing
-//!    playing is the everyday state - a CI runner, a fresh desktop, any user
-//!    between songs - reads answer `Ok(None)` / `Ok(Unknown)` and only commands
-//!    raise `NotSupported`. This matches the Linux backend, where an MPRIS
-//!    lookup over a session bus with no player name yields `None` as well.
+//!    means the session *refused* the command; `true` only means the app
+//!    *accepted* it and can still fail afterwards. UDA maps `false` to
+//!    [`UdaError::CommandFailed`] so a caller can tell "sent" from "refused".
+//! 2. **`TimeSpan` is in 100-nanosecond ticks.** `Duration / 10_000` converts to
+//!    milliseconds, and a zero `Duration` means "unknown" (a live stream), so it
+//!    is reported as `None` rather than `Some(0)`.
+//! 3. **"No current session" arrives as an `Err`, not a null.** The *absence* of
+//!    a player therefore looks like a failure unless it is read as a value. A
+//!    machine with nothing playing is the everyday state, so reads answer
+//!    `Ok(None)` / `Ok(Unknown)` and only commands raise
+//!    [`UdaError::NotSupported`] - the same contract as the Linux backend, where
+//!    a session bus with no `org.mpris.MediaPlayer2.*` name yields `None`.
 //!
 //! # Threading
 //!
-//! The WinRT activation of the session manager must run on a multi-threaded
-//! apartment, and the `IAsyncOperation::get()` completion used here blocks on an
-//! event that the worker pumps. Each call therefore builds a short-lived
-//! current-thread runtime and drives the async chain inside it, which keeps
+//! The WinRT activation must run on a multi-threaded apartment and
+//! `IAsyncOperation::get()` blocks on a completion the worker pumps, so each call
+//! builds a short-lived current-thread runtime. That keeps
 //! [`MediaManager`](uda_core::media::MediaManager) synchronous without parking a
 //! runtime for the lifetime of the process.
-//!
-//! See `docs/internals/media_specs.md` for the full property mapping.
 
 use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager,
@@ -60,10 +40,8 @@ use uda_core::capability::Capability;
 use uda_core::error::UdaError;
 use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
 
-/// Windows media manager.
-///
-/// A zero-sized marker: every method resolves the current session on its own, so
-/// the manager cannot hold a stale session from a previous call.
+/// Windows media manager, a zero-sized marker: every method resolves the current
+/// session on its own, so the manager cannot hold a stale one.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsMediaManager;
 
@@ -74,9 +52,8 @@ impl WindowsMediaManager {
 
     /// Run an asynchronous SMTC query to completion.
     ///
-    /// The `IAsyncOperation::get()` helper installs a completion handler and
-    /// waits for it, so the body must run inside a runtime that can pump its own
-    /// events - hence the current-thread runtime in the [`MediaManager`] methods.
+    /// `IAsyncOperation::get()` installs a completion handler and waits for it,
+    /// so the body must run inside a runtime that can pump its own events.
     fn block<F, T>(operation: F) -> Result<T, UdaError>
     where
         F: std::future::Future<Output = Result<T, UdaError>>,
@@ -92,9 +69,6 @@ impl WindowsMediaManager {
     /// Resolve the SMTC session manager.
     async fn session_manager() -> Result<GlobalSystemMediaTransportControlsSessionManager, UdaError>
     {
-        // `RequestAsync` hands back an `IAsyncOperation`, whose `get()` waits for
-        // the result without a message pump of its own; running it inside the
-        // caller's task satisfies that requirement.
         let request = GlobalSystemMediaTransportControlsSessionManager::RequestAsync()
             .map_err(|e| UdaError::DetectionFailed(format!("SMTC manager request: {e}")))?;
 
@@ -107,18 +81,15 @@ impl WindowsMediaManager {
 
     /// Resolve the session that currently holds media focus, if any.
     ///
-    /// Returns `Ok(None)` when nothing is playing. **A machine with no running
-    /// player is the everyday state, not a fault**, so this is an ordinary answer
-    /// rather than an error - the same contract the Linux backend keeps, where a
-    /// session bus with no `org.mpris.MediaPlayer2.*` name simply yields `None`.
+    /// Returns `Ok(None)` when nothing is playing: a machine with no running
+    /// player is the everyday state, not a fault.
     async fn current_session(
     ) -> Result<Option<windows::Media::Control::GlobalSystemMediaTransportControlsSession>, UdaError>
     {
         let manager = Self::session_manager().await?;
 
         // `GetCurrentSession()` reports "nothing playing" as an error rather than
-        // as a null/nullable result, which is why the Err arm is a *value* here
-        // and not a propagated failure.
+        // a null, which is why the Err arm is a *value* here.
         match manager.GetCurrentSession() {
             Ok(session) => Ok(Some(session)),
             Err(_) => {
@@ -129,11 +100,9 @@ impl WindowsMediaManager {
     }
 }
 
-/// Map an SMTC playback status onto the core enum.
-///
-/// `Closed` and `Changing` have no MPRIS counterpart and both describe a session
-/// that is not holding stable playback, so they become `Unknown` rather than
-/// being guessed as `Paused`.
+/// Map an SMTC playback status onto the core enum. `Closed` and `Changing` have
+/// no MPRIS counterpart and both describe a session that is not holding stable
+/// playback, so they become `Unknown` rather than being guessed as `Paused`.
 pub(crate) fn status_from_smtc(
     status: GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 ) -> PlaybackStatus {

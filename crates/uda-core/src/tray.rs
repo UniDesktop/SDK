@@ -1,25 +1,13 @@
-//! Platform-independent core for the system tray module.
+//! Platform-independent core for the system tray module: data model and
+//! lifecycle only. OS integration lives in `uda-platform-linux`
+//! (`org.kde.StatusNotifierItem`) and `uda-platform-windows`
+//! (`Shell_NotifyIconW`); see `docs/internals/tray_specs.md` for the protocol
+//! details both backends must honour.
 //!
-//! This module owns only *data model* and *lifecycle* types. The actual OS
-//! integration lives in `uda-platform-linux` (`org.kde.StatusNotifierItem`) and
-//! `uda-platform-windows` (`Shell_NotifyIconW`); see
-//! `docs/internals/tray_specs.md` for the protocol details both backends must
-//! honour.
-//!
-//! # Design highlights
-//!
-//! * **Never panic** - every fallible step returns `Result<_, UdaError>`; icon
-//!   bytes and menu text supplied by the host are validated before use, and a
-//!   poisoned lock is recovered instead of propagated (the menu is pure data,
-//!   so continuing is strictly better than failing every later update).
-//! * **Capability-driven** - [`TrayIcon::support_level`],
-//!   [`TrayIcon::capabilities`] and [`TrayManager::support_level`] let a host
-//!   degrade gracefully when a shell lacks a feature.
-//! * **Non-blocking** - the platform backend owns a worker thread; [`TrayIcon`]
-//!   is `Send + Sync` and every mutation is applied to shared state, so the
-//!   host's main thread is never blocked or polled.
-//! * **RAII** - dropping a [`TrayIcon`] marks it for unregistration, the same
-//!   way [`crate::wakelock::WakeLockGuard`] releases its lock.
+//! Every fallible step returns `Result<_, UdaError>`; a poisoned lock is
+//! recovered rather than propagated. [`TrayIcon`] is `Send + Sync`, is mutated
+//! through shared state on the backend's worker thread, and unregisters itself
+//! on `Drop` the way [`crate::wakelock::WakeLockGuard`] releases its lock.
 
 use crate::capability::{Capability, SupportLevel};
 use crate::error::UdaError;
@@ -28,25 +16,17 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A callback that fires when a menu row is activated, or on a tray interaction.
 ///
-/// The callback runs on the **tray worker thread**. It must therefore be cheap,
-/// must not block, and must not touch host UI state directly - forward the event
-/// into the host's own loop instead.
+/// It runs on the **tray worker thread**, so it must be cheap, must not block,
+/// and must not touch host UI state directly - forward the event into the host's
+/// own loop instead.
 ///
 /// Shared rather than owned so a [`MenuItem`] stays cheaply `Clone`: rows are
 /// snapshotted on every layout export, and a boxed closure cannot be cloned.
-/// Replacing a callback goes through `set_action`, which swaps the closure for
-/// every holder of the same `Arc`.
 ///
-/// The wrapper exists only to supply `Debug`, which a `dyn FnMut` does not
-/// implement; without it `MenuItem` could not derive `Debug` and hosts would
-/// lose the ability to log a menu tree.
-/// The boxed, shared, interior-mutable form a row action takes.
-///
-/// Named because the raw type is long enough to obscure every signature that
-/// mentions it, and because the pieces each carry a constraint worth stating
-/// once: `Arc` so a row can be cloned cheaply and every holder sees the same
-/// callback, `Mutex` because `FnMut` needs `&mut`, and `Send` because the tray
-/// worker thread - not the host - is what invokes it.
+/// The boxed, shared, interior-mutable form a row action takes: `Arc` so a row
+/// can be cloned cheaply, `Mutex` because `FnMut` needs `&mut`, and `Send`
+/// because the worker thread - not the host - is what invokes it. The wrapper
+/// supplies the `Debug` a `dyn FnMut` does not implement.
 type SharedTrayCallback = Arc<Mutex<dyn FnMut(&TrayEvent) + Send + 'static>>;
 
 #[derive(Clone)]
@@ -62,11 +42,9 @@ impl TrayAction {
         Self(Arc::new(Mutex::new(callback)))
     }
 
-    /// Invoke the callback.
-    ///
-    /// A poisoned lock is recovered: the closure owns its own state, so the
-    /// worst case is a callback that was interrupted mid-update, which is still
-    /// strictly better than failing every later activation.
+    /// Invoke the callback, recovering a poisoned lock: the closure owns its own
+    /// state, so the worst case is a callback interrupted mid-update, which is
+    /// still better than failing every later activation.
     pub fn invoke(&self, event: &TrayEvent) {
         let mut callback = match self.0.lock() {
             Ok(guard) => guard,
@@ -87,8 +65,8 @@ impl fmt::Debug for TrayAction {
 
 /// Callback fired for a tray interaction.
 ///
-/// A plain boxed closure rather than the shared [`TrayAction`] wrapper: there is
-/// exactly one owner (the config) and no snapshotting, so there is nothing to
+/// A plain boxed closure rather than the shared [`TrayAction`] wrapper: the
+/// config is the only owner and is never snapshotted, so there is nothing to
 /// clone and no reason to pay for a `Mutex`.
 pub type TrayEventHandler = Box<dyn FnMut(&TrayEvent) + Send + 'static>;
 
@@ -106,10 +84,8 @@ pub const TOOLTIP_MAX_CHARS: usize = 127;
 /// [`SupportLevel::Partial`] report rather than silent clipping.
 pub const TOOLTIP_TARGET_CHARS: usize = 80;
 
-/// Truncate `text` to at most `limit` `char`s without splitting a `char`.
-///
-/// Returns the original borrow when it already fits, keeping the common path
-/// allocation-free.
+/// Truncate `text` to at most `limit` `char`s without splitting a `char`,
+/// returning the original borrow when it already fits.
 #[must_use]
 pub fn truncate_chars(text: &str, limit: usize) -> &str {
     match text.char_indices().nth(limit) {
@@ -121,8 +97,8 @@ pub fn truncate_chars(text: &str, limit: usize) -> &str {
 /// Clamp `text` to the platform-safe tooltip length.
 ///
 /// No ellipsis is appended on purpose: U+2026 is non-ASCII, and this project
-/// keeps its build scripts ASCII-only so a Windows `cp1252` console cannot trip
-/// over them.
+/// keeps its scripts ASCII-only so a Windows `cp1252` console cannot trip over
+/// them.
 #[must_use]
 pub fn sanitize_tooltip(text: &str) -> &str {
     truncate_chars(text, TOOLTIP_MAX_CHARS)
@@ -201,12 +177,10 @@ impl MenuItemState {
 
 /// A single row of a [`TrayMenu`].
 ///
-/// Note that labels are validated non-empty by [`TrayMenu::push`]; constructors
-/// here stay infallible so item construction reads naturally, and the menu
-/// enforces the invariant at insertion time.
+/// Labels are validated non-empty by [`TrayMenu::push`]; the constructors here
+/// stay infallible so item construction reads naturally.
 #[derive(Debug, Clone)]
 pub enum MenuItem {
-    // `PartialEq` is hand-written below: `TrayAction` has no meaningful equality.
     /// Plain text row; optional callback fires on activation.
     Text {
         /// Displayed label.
@@ -239,11 +213,8 @@ pub enum MenuItem {
     },
 }
 
-// `PartialEq` is hand-written because `TrayAction` is a shared closure with no
-// meaningful equality: two rows that differ only in callback identity are equal
-// for every purpose a host cares about, and a derived impl would not compile.
-// Submenu children are excluded because `TrayMenu` is interior-mutable by
-// design; use `items()` when a deep comparison is genuinely needed.
+// Hand-written: a shared closure has no meaningful equality, and submenu
+// children are excluded because `TrayMenu` is interior-mutable by design.
 impl PartialEq for MenuItem {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -412,11 +383,8 @@ impl MenuItem {
         matches!(self, Self::Submenu { .. })
     }
 
-    /// Borrow the row's callback, if it has one.
-    ///
-    /// Exposed so a host (or the FFI layer's tests) can tell a row that *fires*
-    /// from one that merely renders, without depending on the variant's private
-    /// field. `Submenu` and `Separator` never carry a callback.
+    /// Borrow the row's callback, if it has one. `Submenu` and `Separator` never
+    /// carry a callback.
     #[must_use]
     pub fn action(&self) -> Option<&TrayAction> {
         match self {
@@ -490,9 +458,8 @@ struct Entry {
 /// A context menu attached to a tray icon.
 ///
 /// Rows live behind a `Mutex`, which is what makes updates thread-safe: any
-/// thread may lock, mutate the tree, and the backend re-exports the new layout
-/// to the shell. The lock is never held while calling into the OS, so a slow
-/// shell cannot block a host update indefinitely.
+/// thread may lock and mutate the tree, and the backend re-exports the new
+/// layout to the shell. The lock is never held while calling into the OS.
 #[derive(Debug, Default)]
 pub struct TrayMenu {
     entries: Mutex<Vec<Entry>>,
@@ -523,7 +490,8 @@ impl TrayMenu {
         }
     }
 
-    /// Allocate the next monotonic id.
+    /// Allocate the next monotonic id, saturating so it can never wrap into a
+    /// duplicate even on a menu rebuilt billions of times.
     fn allocate_id(&self) -> MenuItemId {
         let mut next_id = match self.next_id.lock() {
             Ok(guard) => guard,
@@ -532,13 +500,11 @@ impl TrayMenu {
                 poisoned.into_inner()
             }
         };
-        // Saturating so the counter can never wrap into a duplicate id, even on
-        // a pathological menu that is rebuilt billions of times.
         *next_id = next_id.saturating_add(1);
         MenuItemId(*next_id)
     }
 
-    /// Reject rows that would be invisible yet still occupy a slot.
+    /// Reject a row that would be invisible yet still occupy a slot.
     fn validate(item: &MenuItem) -> Result<(), UdaError> {
         if let Some(label) = item.label() {
             if label.trim().is_empty() {
@@ -576,8 +542,8 @@ impl TrayMenu {
         entries.len() != before
     }
 
-    /// Remove every row. The id counter keeps counting upward so live handles
-    /// never alias a freshly inserted row.
+    /// Remove every row. The id counter keeps counting upward, so a live handle
+    /// never aliases a freshly inserted row.
     pub fn clear(&self) {
         self.lock_entries().clear();
     }
@@ -632,14 +598,10 @@ impl TrayMenu {
 
     /// Borrow a live handle to a row.
     ///
-    /// Takes `self: &Arc<Self>` because a handle must hold a strong reference so
-    /// the menu stays alive independently of the tray icon; a plain `&self`
-    /// cannot express that lifetime.
+    /// Takes `self: &Arc<Self>` so the handle can hold a strong reference and
+    /// keep the menu alive independently of the tray icon.
     #[must_use]
     pub fn handle(self: &Arc<Self>, id: MenuItemId) -> Option<TrayMenuHandle> {
-        // The existence check *is* the early return: `find` already answers
-        // whether the id is live, so its `Option` is propagated rather than
-        // reopened by hand.
         self.find(id)?;
         Some(TrayMenuHandle::new(Arc::clone(self), id))
     }
@@ -782,8 +744,8 @@ impl TrayMenuBuilder {
 
 /// A live reference to one row of a [`TrayMenu`].
 ///
-/// The handle addresses the row by its stable [`MenuItemId`], so inserting a row
-/// above it does not invalidate it.
+/// Addressed by the stable [`MenuItemId`], so inserting a row above it does not
+/// invalidate the handle.
 #[derive(Debug, Clone)]
 pub struct TrayMenuHandle {
     menu: Arc<TrayMenu>,
@@ -791,7 +753,7 @@ pub struct TrayMenuHandle {
 }
 
 impl TrayMenuHandle {
-    /// Wrap an existing `Arc<TrayMenu>` and id. Backend and host use.
+    /// Wrap an existing `Arc<TrayMenu>` and id.
     #[must_use]
     pub(crate) const fn new(menu: Arc<TrayMenu>, id: MenuItemId) -> Self {
         Self { menu, id }
@@ -895,10 +857,8 @@ impl fmt::Display for IconError {
 impl std::error::Error for IconError {}
 
 impl TrayIconSource {
-    /// Validate the source.
-    ///
-    /// Both backends call this before touching the OS, so a host-supplied icon
-    /// is rejected with a typed error instead of crashing inside FFI.
+    /// Validate the source. Both backends call this before touching the OS, so
+    /// a host-supplied icon is rejected with a typed error.
     pub fn validate(&self) -> Result<(), IconError> {
         match self {
             Self::Path(path) => {
@@ -935,8 +895,8 @@ impl TrayIconSource {
 pub enum TrayEvent {
     /// Primary (left) click.
     Click,
-    /// Double click. Without a native event (Linux SNI) this is synthesised from
-    /// two [`TrayEvent::Click`]s inside a short window.
+    /// Double click. On Linux SNI, which has no such event, this is synthesised
+    /// from two clicks inside a short window.
     DoubleClick,
 }
 
@@ -953,9 +913,8 @@ pub(crate) struct TrayConfig {
 
 /// Builder for [`TrayIconConfig`].
 ///
-/// Construction never touches the OS: `build()` only packages the
-/// configuration. Registration happens when the config is handed to
-/// [`TrayManager::create`].
+/// Construction never touches the OS: registration happens when the config is
+/// handed to [`TrayManager::create`].
 #[derive(Default)]
 pub struct TrayIconBuilder {
     config: TrayConfig,
@@ -1040,9 +999,8 @@ impl TrayIconBuilder {
     }
 }
 
-/// A fully specified, OS-independent tray icon description.
-///
-/// Handed to a platform backend by [`TrayManager::create`].
+/// A fully specified, OS-independent tray icon description, handed to a platform
+/// backend by [`TrayManager::create`].
 pub struct TrayIconConfig {
     /// Application name for registration.
     pub name: String,
@@ -1127,13 +1085,8 @@ impl fmt::Display for TrayFeature {
 
 /// The mutable part of a live icon, shared with the platform worker thread.
 ///
-/// `Default` is hand-written because `Capability` has no `Default` impl, and
-/// deriving would silently require one. Starting empty is the deliberate
-/// choice: nothing is claimed until a backend proves it.
-///
-/// Public since the platform backends took ownership of it (Phase 2, Step 2): a
-/// backend must read the very state the host writes, otherwise its worker thread
-/// could only ever serve a stale copy.
+/// `Default` is hand-written because `Capability` has no `Default` impl;
+/// starting empty is deliberate: nothing is claimed until a backend proves it.
 pub struct TrayIconState {
     /// Current tooltip text.
     pub tooltip: String,
@@ -1145,16 +1098,14 @@ pub struct TrayIconState {
     pub visible: bool,
     /// Set once and never cleared: makes `Drop` idempotent even under races.
     pub shutdown: bool,
-    /// Feature support reported by the backend that registered this icon.
-    ///
-    /// Empty until the backend publishes it, which is why the accessors below
-    /// fall back to a conservative answer instead of claiming a feature.
+    /// Feature support reported by the backend that registered this icon. Empty
+    /// until the backend publishes it, so the accessors fall back to a
+    /// conservative answer instead of claiming a feature.
     pub capabilities: Capability,
 }
 
-/// Shared state of a [`TrayIcon`]. Opaque to hosts except through the accessors
-/// on [`TrayIcon`]; the platform backends read it directly to mirror host
-/// updates into their own worker thread.
+/// Shared state of a [`TrayIcon`]: the platform backends read it directly to
+/// mirror host updates into their own worker thread.
 pub struct TrayIconInner {
     /// Application name used at registration.
     pub name: String,
@@ -1176,11 +1127,8 @@ impl Default for TrayIconState {
 }
 
 impl TrayIconInner {
-    /// Wrap shared state. Backend use only.
-    ///
-    /// A backend calls this once, hands the `Arc` to its worker thread, and
-    /// returns the matching [`TrayIcon`] to the host. The two halves then stay
-    /// in sync through this state.
+    /// Wrap shared state. Backend use only: a backend hands the `Arc` to its
+    /// worker thread and returns the matching [`TrayIcon`] to the host.
     #[must_use]
     pub fn new(name: String) -> Self {
         Self {
@@ -1196,19 +1144,16 @@ impl TrayIconInner {
         }
     }
 
-    /// Publish what the active backend actually supports. Backend use only.
-    ///
-    /// Called once registration succeeds, so a host that queries a freshly
-    /// created icon never sees a stale or optimistic answer.
+    /// Publish what the active backend actually supports. Backend use only;
+    /// called once registration succeeds, so a freshly created icon never
+    /// reports a stale or optimistic answer.
     pub fn set_capabilities(&self, capabilities: Capability) {
         self.lock_state().capabilities = capabilities;
     }
 
-    /// Lock the shared state, recovering from a poisoned lock.
-    ///
-    /// The icon is pure data plus a "please unregister" flag; every field is
-    /// independently overwritable, so resuming after a panic in one callback is
-    /// safe and far better than failing all later updates.
+    /// Lock the shared state, recovering from a poisoned lock: the state is
+    /// pure data plus a "please unregister" flag, and every field is
+    /// independently overwritable, so resuming is safe.
     pub fn lock_state(&self) -> MutexGuard<'_, TrayIconState> {
         match self.state.lock() {
             Ok(guard) => guard,
@@ -1238,19 +1183,15 @@ impl fmt::Debug for TrayIcon {
 }
 
 impl TrayIcon {
-    /// Wrap backend-owned shared state. Backend use only.
-    ///
-    /// The backend creates the state, keeps an `Arc` for its worker thread, and
-    /// returns the handle built here to the host.
+    /// Wrap backend-owned shared state. Backend use only: the backend keeps an
+    /// `Arc` for its worker thread and returns this handle to the host.
     #[must_use]
     pub fn from_inner(inner: Arc<TrayIconInner>) -> Self {
         Self { inner }
     }
 
-    /// Access the shared state. Backend use only.
-    ///
-    /// Read-only on purpose: a backend observes the host's updates through it
-    /// and must not mutate the state behind the host's back.
+    /// Access the shared state. Backend use only, and read-only on purpose: a
+    /// backend observes the host's updates and must not mutate them itself.
     #[must_use]
     pub const fn inner(&self) -> &Arc<TrayIconInner> {
         &self.inner
@@ -1264,8 +1205,7 @@ impl TrayIcon {
 
     /// Replace the tooltip, clamped to [`TOOLTIP_MAX_CHARS`].
     ///
-    /// Never fails: clamping is the documented degradation path. Use
-    /// [`tooltip_needs_truncation`] first if the host wants to warn the user.
+    /// Never fails: clamping is the documented degradation path.
     pub fn set_tooltip(&self, tooltip: impl Into<String>) {
         let tooltip = sanitize_tooltip(&tooltip.into()).to_string();
         self.inner.lock_state().tooltip = tooltip;
@@ -1278,10 +1218,8 @@ impl TrayIcon {
         self.inner.lock_state().tooltip.clone()
     }
 
-    /// Replace the icon.
-    ///
-    /// The new source is validated first, so an invalid value leaves the
-    /// previous icon in place and returns a typed error.
+    /// Replace the icon. The source is validated first, so an invalid value
+    /// leaves the previous icon in place and returns a typed error.
     pub fn set_icon(&self, icon: TrayIconSource) -> Result<(), UdaError> {
         icon.validate().map_err(|error| {
             log::warn!("tray '{}' rejected an icon: {error}", self.inner.name);
@@ -1304,10 +1242,8 @@ impl TrayIcon {
         log::debug!("tray '{}' menu cleared", self.inner.name);
     }
 
-    /// The current context menu, if one is attached.
-    ///
-    /// The backend reads this to re-export a layout whenever the host mutates
-    /// the menu, so it must observe the live `Arc` rather than a snapshot.
+    /// The current context menu, if one is attached. The backend re-exports a
+    /// layout whenever the host mutates the menu, so it observes this live `Arc`.
     #[must_use]
     pub fn menu(&self) -> Option<Arc<TrayMenu>> {
         self.inner.lock_state().menu.clone()
@@ -1334,24 +1270,22 @@ impl TrayIcon {
     /// Support level for one feature on the active backend.
     ///
     /// Answers from the capability set the backend published at registration, so
-    /// the value is always a statement about *this* icon's environment. Before a
-    /// backend publishes, the answer stays [`SupportLevel::None`]: the honest
-    /// default when no tray mechanism could be reached at all.
+    /// the value always describes *this* icon's environment. Before a backend
+    /// publishes, the answer stays [`SupportLevel::None`].
     #[must_use]
     pub fn support_level(&self, feature: TrayFeature) -> SupportLevel {
         let capabilities = self.inner.lock_state().capabilities;
         if !capabilities.contains(Capability::SYSTEM_TRAY) {
             return SupportLevel::None;
         }
-        // `Icon` is the one feature every tray backend guarantees once an icon
+        // `Icon` is the one feature every backend guarantees once an icon
         // exists; `Tooltip` rides along because every backend exposes hover text.
         match feature {
             TrayFeature::Icon | TrayFeature::Tooltip => SupportLevel::Full,
             other if capabilities.contains(feature_flag(other)) => SupportLevel::Full,
-            // An absent flag is a plain `None`: a backend either answers for a
-            // feature or does not. `Partial` stays reserved for backends that
-            // publish a degraded answer explicitly (e.g. Linux double-click
-            // synthesis), which is expressed through their own flag set.
+            // An absent flag is a plain `None`; `Partial` is reserved for a
+            // backend that publishes a degraded answer explicitly (e.g. Linux
+            // double-click synthesis).
             other => {
                 log::debug!(
                     "tray feature '{other}' is not reported by this backend; treating it as unavailable"
@@ -1361,10 +1295,8 @@ impl TrayIcon {
         }
     }
 
-    /// The capability set of the active backend.
-    ///
-    /// Backends that cannot reach any tray mechanism report an empty set, which
-    /// is the caller's cue to hide its tray UI entirely.
+    /// The capability set of the active backend. An empty set is the caller's
+    /// cue to hide its tray UI entirely.
     #[must_use]
     pub fn capabilities(&self) -> Capability {
         self.inner.lock_state().capabilities
@@ -1372,9 +1304,6 @@ impl TrayIcon {
 }
 
 /// The capability flag a feature maps onto.
-///
-/// Features with no flag of their own reuse `SYSTEM_TRAY`, because a backend
-/// that can host an icon can always show it.
 #[must_use]
 fn feature_flag(feature: TrayFeature) -> Capability {
     match feature {
@@ -1391,8 +1320,8 @@ fn feature_flag(feature: TrayFeature) -> Capability {
 impl Drop for TrayIcon {
     fn drop(&mut self) {
         // Idempotent by construction: only the first caller observes
-        // `shutdown == false`, so a double drop, a drop during teardown, or a
-        // drop racing a menu open can never unregister twice.
+        // `shutdown == false`, so a double drop or a drop racing a menu open can
+        // never unregister twice.
         let first_shutdown = {
             let mut state = self.inner.lock_state();
             let first = !state.shutdown;
@@ -1414,10 +1343,8 @@ impl Drop for TrayIcon {
 /// AppIndicator fallback) and `uda-platform-windows` (`Shell_NotifyIconW` on a
 /// dedicated worker thread).
 pub trait TrayManager {
-    /// Register a tray icon and return its handle.
-    ///
-    /// The backend starts its worker thread on first use and keeps it alive for
-    /// as long as any handle exists.
+    /// Register a tray icon and return its handle. The backend starts its worker
+    /// thread on first use and keeps it alive while any handle exists.
     fn create(&self, config: TrayIconConfig) -> Result<TrayIcon, UdaError>;
 
     /// The capability set of the active backend.

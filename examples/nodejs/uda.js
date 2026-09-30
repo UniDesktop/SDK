@@ -10,22 +10,17 @@
  *     uda.notify('标题', '正文内容');
  *     uda.dispose();
  *
- * 设计原则
- * --------
- * **不泄漏底层细节**：调用方看不到 `koffi.alloc` 出参槽、`BigInt` 句柄或十六进制
- * 状态码。指针槽位分配、字符串内存释放、函数指针保活全部封装在本模块内，失败时
- * 抛出带诊断消息的 `Error`。
+ * 调用方看不到 `koffi.alloc` 出参槽、`BigInt` 句柄或十六进制状态码：指针槽位分配、
+ * 字符串内存释放、函数指针保活全部封装在本模块内，失败时抛出带诊断消息的 `Error`。
  *
- * **图标可以只给一个路径**：`createTrayIcon()` 接受 `.png` 文件路径，SDK 内部会
- * 读文件、解码成 RGBA、降采样后提交。之所以需要这一步：Linux 的
- * `StatusNotifierItem` 把 `Path` 当作 **freedesktop 图标主题名**而不是文件路径，
- * 直接传仓库内的 PNG 路径在 Linux 上什么都不会显示；RGBA 通道在两端语义一致。
+ * `createTrayIcon()` 接受 `.png` 文件路径，SDK 内部读文件、解码成 RGBA、降采样后
+ * 提交 —— Linux 的 `StatusNotifierItem` 把 `Path` 当作 freedesktop 图标主题名而不是
+ * 文件路径，直接传 PNG 路径在 Linux 上不会显示任何东西。
  *
- * **依赖**：仅 `koffi`（零编译 C-ABI 绑定库）。PNG 解码用 Node 内置 `zlib`，
- * 不引入 sharp / canvas 等原生依赖。
+ * 依赖仅 `koffi`（零编译 C-ABI 绑定库）；PNG 解码用 Node 内置 `zlib`。
  *
- * 动态库定位顺序：`UDA_LIBRARY` 环境变量 > `cargo metadata` 报告的 target 目录
- * > 仓库内常见构建目录 > 系统动态库搜索路径。
+ * 动态库定位顺序：`UDA_LIBRARY` 环境变量 > `cargo metadata` 报告的 target 目录 >
+ * 仓库内常见构建目录 > 系统动态库搜索路径。
  */
 
 'use strict';
@@ -70,7 +65,7 @@ const SESSION_ACTION_CAPABILITY = {
   shutdown: 0x00400000,
 };
 
-/** 全部会话能力位，便于掩码求差集时筛掉未文档化的位。 */
+/** 全部会话能力位。 */
 const SESSION_CAPABILITY_ALL =
   (0x00010000 |
     0x00020000 |
@@ -95,12 +90,7 @@ const WINDOWS_TARGET_TRIPLES = [
 // 动态库定位与加载（内部）
 // ---------------------------------------------------------------------------
 
-/**
- * 通过 `cargo metadata` 查询真实的 target 目录。
- *
- * @param {string} repoRoot 仓库根目录（含 Cargo.toml）。
- * @returns {string|null} target 目录绝对路径；查询失败时返回 null。
- */
+/** 查询真实的 target 目录，失败时返回 null。 */
 function queryCargoTargetDirectory(repoRoot) {
   try {
     const stdout = execFileSync(
@@ -116,11 +106,7 @@ function queryCargoTargetDirectory(repoRoot) {
   }
 }
 
-/**
- * 返回动态库候选路径列表（按优先级）。
- *
- * @returns {string[]} 候选路径。
- */
+/** 按优先级返回动态库候选路径列表。 */
 function candidateLibraries() {
   const candidates = [];
 
@@ -157,8 +143,6 @@ function candidateLibraries() {
 /**
  * 加载 UDA 动态库并声明全部函数原型。
  *
- * @returns {{ koffi: object, lib: object, types: object, registerTextCallback: Function,
- *            registerCheckboxCallback: Function, unregisterCallback: Function }}
  * @throws {Error} 当 koffi 未安装或找不到动态库时。
  */
 function loadUda() {
@@ -318,14 +302,7 @@ const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0
 /** 色彩类型 -> 每像素通道数。 */
 const PNG_CHANNELS = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
 
-/**
- * 反演一行的 PNG 过滤器。
- *
- * @param {Buffer} row 本行原始字节（会被就地修改）。
- * @param {Buffer} previous 上一行还原后的字节。
- * @param {number} filterType 过滤器编号。
- * @param {number} channels 每像素通道数。
- */
+/** 反演一行 PNG 过滤器（`row` 被就地修改）。 */
 function pngUnfilter(row, previous, filterType, channels) {
   const stride = row.length;
   for (let i = 0; i < stride; i += 1) {
@@ -359,16 +336,7 @@ function pngUnfilter(row, previous, filterType, channels) {
   }
 }
 
-/**
- * 把解码后的像素展开成 RGBA。
- *
- * @param {number} width 宽。
- * @param {number} height 高。
- * @param {number} color 色彩类型。
- * @param {Buffer} palette 调色板（色彩类型 3）。
- * @param {Buffer} raw 反演过滤器后的像素。
- * @returns {Buffer} 长 `width * height * 4` 的 RGBA 数据，自上而下。
- */
+/** 把反演过滤器后的像素展开成自上而下的 RGBA（长 `width * height * 4`）。 */
 function pngExpand(width, height, color, palette, raw) {
   const channels = PNG_CHANNELS[color];
   const rgba = Buffer.alloc(width * height * 4);
@@ -408,12 +376,10 @@ function pngExpand(width, height, color, palette, raw) {
 /**
  * 把一个 PNG 文件解码成 RGBA。
  *
- * 支持位深 8 位、色彩类型 0/2/3/4/6、非隔行扫描——覆盖仓库自带图标所需的全部
- * 形式。隔行（Adam7）与其它位深会抛错，因为托盘图标无需支持。
+ * 支持位深 8 位、色彩类型 0/2/3/4/6、非隔行扫描；隔行（Adam7）与其它位深会抛错，
+ * 因为托盘图标无需支持。
  *
- * @param {string} filePath PNG 文件路径。
  * @returns {{ width: number, height: number, rgba: Buffer }}
- * @throws {Error} 文件缺失、不是 PNG、形式不受支持或内容损坏。
  */
 function decodePngRgba(filePath) {
   let data;
@@ -557,8 +523,7 @@ function downsampleRgba(width, height, rgba, maxExtent) {
 
       const samples = (y1 - y0) * columns;
       const target = (ty * targetWidth + tx) * 4;
-      // 每个通道值都不超过 0xff，故 `red <= 0xff * alpha` 恒成立；alpha 为 0
-      // 时三个颜色通道保持 0（全透明像素不携带可见颜色）。
+      // alpha 为 0 时颜色通道保持 0（全透明像素不携带可见颜色）。
       if (alpha) {
         out[target] = Math.floor(red / alpha);
         out[target + 1] = Math.floor(green / alpha);
@@ -571,13 +536,7 @@ function downsampleRgba(width, height, rgba, maxExtent) {
   return { width: targetWidth, height: targetHeight, rgba: out };
 }
 
-/**
- * 读一个 PNG 并缩放到托盘可用尺寸。
- *
- * @param {string} filePath PNG 路径。
- * @param {number} [maxExtent] 最长边；省略时按原尺寸返回。
- * @returns {{ width: number, height: number, rgba: Buffer }}
- */
+/** 读一个 PNG 并缩放到托盘可用尺寸；省略 `maxExtent` 时按原尺寸返回。 */
 function loadIconRgba(filePath, maxExtent) {
   const { width, height, rgba } = decodePngRgba(filePath);
   if (maxExtent === undefined) {
@@ -590,20 +549,9 @@ function loadIconRgba(filePath, maxExtent) {
 // 公共 API
 // ---------------------------------------------------------------------------
 
-/**
- * UniDesktop API 入口。
- *
- * @example
- * const { Uda } = require('./uda');
- *
- * const uda = new Uda();
- * console.log(uda.theme);
- * uda.dispose();
- */
+/** UniDesktop API 入口。 */
 class Uda {
-  /**
-   * @param {string} [libraryPath] 显式指定动态库路径；省略时按默认顺序查找。
-   */
+  /** @param {string} [libraryPath] 显式指定动态库路径；省略时按默认顺序查找。 */
   constructor(libraryPath) {
     const loaded = libraryPath
       ? loadUda(require('koffi').load(libraryPath))
@@ -626,13 +574,7 @@ class Uda {
     this._disposed = false;
   }
 
-  /**
-   * 读取线程本地的最新失败原因。
-   *
-   * @param {string} action 失败动作名。
-   * @returns {string} 诊断消息。
-   * @private
-   */
+  /** @returns {string} 线程本地的最新失败原因的诊断消息。 */
   _lastErrorMessage(action) {
     const message = this._lib.lastErrorMessage();
     if (message) {
@@ -641,13 +583,7 @@ class Uda {
     return `${action} 失败`;
   }
 
-  /**
-   * 状态码非 0 时抛出带诊断的异常。
-   *
-   * @param {number} status 状态码。
-   * @param {string} action 动作名。
-   * @private
-   */
+  /** 状态码非 0 时抛出带诊断的异常。 */
   _check(status, action) {
     if (status === 0) {
       return;
@@ -655,39 +591,23 @@ class Uda {
     throw new Error(this._lastErrorMessage(action));
   }
 
-  /**
-   * 系统深浅色。
-   *
-   * @returns {'dark' | 'light' | 'unknown'}
-   */
+  /** @returns {'dark' | 'light' | 'unknown'} 系统深浅色。 */
   get theme() {
     const slot = this._lib.outSlot(this._types.int32);
     this._check(this._lib.detectTheme(slot), 'detect_theme');
     return THEME_NAMES[this._lib.readSlot(this._types.int32, slot)] ?? 'unknown';
   }
 
-  /**
-   * 系统强调色。
-   *
-   * @returns {{ r: number, g: number, b: number, a: number } | null}
-   *   平台不提供时为 `null`。
-   */
+  /** @returns {{ r, g, b, a } | null} 平台不提供强调色时为 `null`。 */
   get accentColor() {
-    // `uda_get_accent_color` 写入四个字节。平台不暴露强调色时（多数 Linux
-    // 桌面）库不会写入，四字节保持 0，因此全 0 即"无强调色"。
+    // 库写入四个字节；平台不暴露强调色时（多数 Linux 桌面）四字节保持 0。
     const slot = this._lib.outSlot('uint8[4]');
     this._check(this._lib.getAccentColor(slot), 'get_accent_color');
     const [r, g, b, a] = Array.from(this._lib.readSlot('uint8[4]', slot), Number);
     return r || g || b || a ? { r, g, b, a } : null;
   }
 
-  /**
-   * 媒体播控入口。
-   *
-   * 返回一个绑定到本实例的控制器，用于查询正在播放的曲目并发送播控指令。
-   *
-   * @returns {MediaController}
-   */
+  /** @returns {MediaController} 绑定到本实例的播控控制器。 */
   get media() {
     if (!this._media) {
       this._media = new MediaController(this);
@@ -696,13 +616,11 @@ class Uda {
   }
 
   /**
-   * 会话与电源生命周期入口。
+   * 会话与电源生命周期入口：六个动作（`lock`、`logout`、`suspend`、`hibernate`、
+   * `reboot`、`shutdown`）与一个能力查询 `capabilities`。
    *
-   * 提供六个动作（`lock`、`logout`、`suspend`、`hibernate`、`reboot`、
-   * `shutdown`）与一个能力查询 `capabilities`。
-   *
-   * **除锁屏外，其余五个动作会结束用户会话或停止机器**，返回成功时已不可撤
-   * 销。请先用 `capabilities` 确认平台支持，并在调用前取得用户显式确认。
+   * **除锁屏外，其余五个动作会结束用户会话或停止机器**，返回成功时已不可撤销。
+   * 请先用 `capabilities` 确认平台支持，并在调用前取得用户显式确认。
    *
    * @returns {SessionController}
    */
@@ -713,11 +631,7 @@ class Uda {
     return this._session;
   }
 
-  /**
-   * 当前壁纸路径。
-   *
-   * @returns {string | null} 未设置或平台不支持时为 `null`。
-   */
+  /** @returns {string | null} 未设置或平台不支持时为 `null`。 */
   get wallpaper() {
     return this._readWallpaper();
   }
@@ -725,7 +639,6 @@ class Uda {
   /**
    * 设置桌面壁纸。
    *
-   * @param {string} wallpaperPath 图片路径。
    * @param {'crop' | 'fill' | 'fit' | 'stretch'} [fillMode] 填充模式，默认 `fill`。
    */
   setWallpaper(wallpaperPath, fillMode = 'fill') {
@@ -769,17 +682,13 @@ class Uda {
   /**
    * 发送一条系统通知。
    *
-   * `appName` 不是装饰：在 Windows 上它就是 toast 的 AppUserModelID，而未打包
-   * 进程没有该身份。UDA 会在第一次弹 toast 前把它注册为进程的显式 AUMID，
-   * 这正是让普通 `node script.js` 能显示原生 Toast 的关键。省略时使用通用身份
+   * `appName` 在 Windows 上就是 toast 的 AppUserModelID；未打包进程没有该身份，UDA
+   * 会在第一次弹 toast 前把它注册为进程的显式 AUMID。省略时使用通用身份
    * `UniDesktop.Notification`。
    *
-   * @param {string} title 单行标题。
-   * @param {string} [body] 多行正文。
    * @param {{ appName?: string, icon?: string, actions?: Record<string, string> }} [options]
-   *   `appName` 为发送方应用名（Windows toast 身份）；`icon` 为图标路径或 URI；
-   *   `actions` 为按钮表，如 `{ open: '查看详情' }`。Windows 上 toast *按钮*
-   *   仍需 MSIX 打包身份，因此不呈现按钮，但 toast 本身正常显示。
+   *   `icon` 为图标路径或 URI；`actions` 为按钮表，如 `{ open: '查看详情' }`。Windows
+   *   上 toast *按钮* 仍需 MSIX 打包身份，因此不呈现按钮，但 toast 本身正常显示。
    * @returns {number} 服务器分配的通知 id。
    */
   notify(title, body = '', options = {}) {
@@ -802,7 +711,6 @@ class Uda {
   /**
    * 申请防休眠常亮锁。
    *
-   * @param {{ type?: 'display' | 'system', reason?: string }} [options]
    * @returns {WakeLock} 调用 `release()` 释放；退出 `with` 块时自动释放。
    */
   wakelock(options = {}) {
@@ -813,8 +721,8 @@ class Uda {
    * 创建托盘图标。
    *
    * @param {string} [name] 应用名（Linux 上用于 D-Bus bus name，Windows 上用于窗口类名）。
-   * @param {{ tooltip?: string, icon?: string }} [options]
-   *   `icon` 为 `.png` 等图片路径，SDK 内部会解码成 RGBA 后提交。
+   * @param {{ tooltip?: string, icon?: string }} [options] `icon` 为 `.png` 等图片
+   *   路径，SDK 内部会解码成 RGBA 后提交。
    * @returns {TrayIcon} 调用方负责最终调用 `destroy()`。
    */
   createTrayIcon(name = 'UDA', options = {}) {
@@ -826,11 +734,7 @@ class Uda {
     return icon;
   }
 
-  /**
-   * 创建空的托盘右键菜单。
-   *
-   * @returns {TrayMenu} 调用方负责最终调用 `destroy()`。
-   */
+  /** @returns {TrayMenu} 调用方负责最终调用 `destroy()`。 */
   createTrayMenu() {
     const menu = new TrayMenu(this);
     this._menus.push(menu);
@@ -901,29 +805,13 @@ class Uda {
     this._menus = [];
   }
 
-  /**
-   * 便于用 `Symbol.dispose` / `using` 声明（Node 20+ 显式资源管理）。
-   *
-   * @returns {void}
-   */
+  /** 便于用 `Symbol.dispose` / `using` 声明（Node 20+ 显式资源管理）。 */
   [Symbol.dispose]() {
     this.dispose();
   }
 }
 
-/**
- * 媒体播控命名空间（`uda.media`）。
- *
- * 把三个 C 导出函数与"字符串出参由库分配、需释放"的细节收在一处：调用方只看
- * 到纯 JS 对象的曲目快照、状态字符串与指令名。
- *
- * @example
- * const track = uda.media.nowPlaying;
- * if (track) {
- *   console.log(`${track.title} - ${track.artist}`);
- * }
- * uda.media.playPause();
- */
+/** 媒体播控命名空间（`uda.media`）：把三个 C 导出函数与字符串出参释放的细节收在一处。 */
 class MediaController {
   /** @param {Uda} uda 拥有该控制器的 Uda 实例。 */
   constructor(uda) {
@@ -933,11 +821,10 @@ class MediaController {
   /**
    * 当前播放的曲目快照。
    *
-   * 没有播放器运行时返回 `null`（而非抛错），某字段播放器未发布时是空串，例如
-   * 电台流通常没有专辑名。
+   * 没有播放器运行时返回 `null`（而非抛错），某字段播放器未发布时是空串，例如电台流
+   * 通常没有专辑名。
    *
-   * @returns {{ title: string, artist: string, album: string,
-   *             durationMs: number, positionMs: number } | null}
+   * @returns {{ title, artist, album, durationMs, positionMs } | null}
    */
   get nowPlaying() {
     const titleSlot = this._uda._lib.outSlot('char *');

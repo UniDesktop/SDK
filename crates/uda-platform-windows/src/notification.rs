@@ -1,80 +1,48 @@
 //! Windows notification manager: native toasts via WinRT.
 //!
-//! # Backend selection
-//!
-//! Windows has no FreeDesktop-style daemon; the supported mechanism is the WinRT
-//! `Windows.UI.Notifications` API (see `AGENTS.md` section 3):
-//!
-//! 1. `ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastImageAndText02)`
-//!    produces an XML document with the standard title/body text nodes and an
-//!    `<image>` node. A text-only host falls back to `ToastText02` (see
-//!    [`build_document`]).
-//! 2. The `text` and `image` nodes are located with XPath and filled from the
-//!    [`Notification`] fields.
-//! 3. `ToastNotificationManager::CreateToastNotifierWithId(app_name)` +
-//!    `ToastNotifier::Show()` displays the toast. The explicit id (rather than
-//!    the parameterless `CreateToastNotifier()`) is what lets an unpackaged
-//!    process show a toast at all; see "App identity" below.
+//! The supported mechanism is `Windows.UI.Notifications` (see `AGENTS.md` §3):
+//! `GetTemplateContent` produces an XML document, the `text` and `image` nodes
+//! are located with XPath and filled from the [`Notification`] fields, and
+//! `CreateToastNotifierWithId(app_name)` + `Show()` displays it.
 //!
 //! # App identity
 //!
-//! A packaged (MSIX/APPX) application is addressed by its package identity. A
-//! classic Win32 process has none, so the parameterless
+//! A classic Win32 process has no package identity, so the parameterless
 //! `CreateToastNotifier()` fails with `ELEMENT_NOT_FOUND` (`0x80070490`) and no
-//! toast ever appears - which is what an unpackaged `node script.js` hits.
-//!
-//! UDA fixes that two ways, and **both are required**:
+//! toast appears. **Both** of these are therefore required:
 //!
 //! 1. `CreateToastNotifierWithId(app_name)` addresses the toast to an explicit
-//!    id instead of letting WinRT resolve one from the process. This is the call
-//!    that actually succeeds for an unpackaged binary; the parameterless
-//!    `CreateToastNotifier()` keeps failing even after an AUMID is registered,
-//!    because the process still has no *resolved* identity.
+//!    id instead of letting WinRT resolve one.
 //! 2. `SetCurrentProcessExplicitAppUserModelID(app_name)` records the same id on
-//!    the process so the shell can match it when deciding where to display the
-//!    toast. Registered once per process (see [`ensure_app_identity`]); a host
-//!    that already set its own AUMID keeps it, because overwriting it would
-//!    break that host's activation routing.
+//!    the process, registered once per process (see [`ensure_app_identity`]) and
+//!    never overwriting an AUMID the host already set, which would break its
+//!    activation routing.
 //!
-//! Neither requires a Start-menu shortcut, so a plain `node script.js` or a
-//! Python interpreter shows a native toast.
-//!
-//! The caller can still probe the outcome through
-//! [`WindowsNotificationManager::availability`], which reports
-//! [`NotificationSetting`].
+//! Neither needs a Start-menu shortcut, so a plain `node script.js` or a Python
+//! interpreter shows a native toast. The caller can probe the outcome through
+//! [`WindowsNotificationManager::availability`].
 //!
 //! # Limitations
 //!
-//! - **Action buttons.** Toast buttons require the `actions` content plus an
-//!   activated handler that only a packaged app can register, so
-//!   `Notification::actions` is accepted for trait parity but not surfaced as
-//!   buttons in an unpackaged host — the notification degrades to a read-only
-//!   text card. See `docs/internals/notification_specs.md` §3.2.
-//! - **Progress.** The FreeDesktop progress concept has no direct toast
-//!   equivalent; it is intentionally ignored rather than approximated.
-//! - **Toast source name.** On a host the shell has already bound to a package
-//!   identity (for example a Microsoft Store runtime), the card's source line
-//!   shows that package family name and cannot be overridden. See
-//!   `docs/internals/notification_specs.md` §3.1.
+//! - **Action buttons** need an activation handler only a packaged app can
+//!   register, so `Notification::actions` is accepted for trait parity but
+//!   degrades to a read-only text card in an unpackaged host. See
+//!   `docs/internals/notification_specs.md` §3.2.
+//! - **Progress** has no direct toast equivalent and is ignored.
+//! - **Toast source name** cannot be overridden on a host the shell already
+//!   bound to a package identity. See `notification_specs.md` §3.1.
 //!
 //! # Icons
 //!
-//! `Notification::app_icon` is the *caller's* bitmap, which is separate from the
-//! icon Windows draws for the toast's identity (the small square in the card's
-//! top-left corner, taken from the AUMID/app registration). The two are
-//! independent, and an unpackaged process has no identity icon at all, so the
-//! `<image>` node has to be filled for any picture to appear.
+//! `Notification::app_icon` is the *caller's* bitmap, separate from the identity
+//! icon Windows draws for the AUMID. An unpackaged process has no identity icon,
+//! so the `<image>` node has to be filled for any picture to appear, and the
+//! template varies with the input ([`build_document`]).
 //!
-//! The template therefore varies with the input, because the two shapes have
-//! different schemas — see [`build_document`].
-//!
-//! The `src` attribute accepts a filesystem path, a `file://` URI, or an
-//! `http(s)://` URL. A plain Windows path is converted to a `file://` URI here
-//! because the notification platform resolves the attribute relative to the
-//! *shell's* context, not the sender's working directory, so a bare
-//! `C:\pics\a.png` is not reliably located. A value that already carries a
-//! scheme is passed through untouched, which keeps a caller that already built a
-//! URI from being double-prefixed.
+//! `src` accepts a path, a `file://` URI or an `http(s)://` URL. A plain Windows
+//! path becomes a `file://` URI because the platform resolves the attribute in
+//! the *shell's* context, not the sender's working directory; a value that
+//! already carries a scheme passes through untouched.
 
 use std::sync::OnceLock;
 
@@ -98,23 +66,17 @@ const TITLE_XPATH: &str = "/toast/visual/binding/text[1]";
 /// XPath selecting the body text node of the toast templates.
 const BODY_XPATH: &str = "/toast/visual/binding/text[2]";
 
-/// XPath selecting the image node of the `ToastImageAndText02` template.
-///
-/// Present in both image templates, so the same expression covers either of
-/// them. It is only queried for the image-carrying template, whose binding is
-/// guaranteed to contain the node.
+/// XPath selecting the image node, present in both image templates and only
+/// queried for the image-carrying one.
 const IMAGE_XPATH: &str = "/toast/visual/binding/image";
 
-/// Text carried in `alt` when the caller supplied no name to draw alt text from.
-///
-/// The attribute is read aloud by a screen reader, so an empty value is worse
-/// than a generic word.
+/// Text carried in `alt` when the caller supplied no name to derive it from. The
+/// attribute is read aloud by a screen reader, so an empty value is worse than a
+/// generic word.
 const ICON_ALT_FALLBACK: &str = "notification";
 
-/// Windows notification manager.
-///
-/// The manager is stateless: WinRT resolves the notifier from the calling
-/// process's identity at `Show` time.
+/// Windows notification manager, stateless: WinRT resolves the notifier from the
+/// calling process's identity at `Show` time.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsNotificationManager;
 
@@ -125,10 +87,9 @@ impl WindowsNotificationManager {
 
     /// Fill the text nodes of a toast template from a [`Notification`].
     ///
-    /// `GetTemplateContent` returns a document whose `text` elements already
-    /// exist, so the nodes are looked up rather than created. If a node is
-    /// missing the template is malformed, which is reported rather than ignored,
-    /// because silently dropping the body would produce a truncated toast.
+    /// `GetTemplateContent` already contains the `text` elements, so they are
+    /// looked up rather than created. A missing node means a malformed template,
+    /// which is reported: silently dropping the body would truncate the toast.
     fn fill_template(document: &XmlDocument, notification: &Notification) -> Result<(), UdaError> {
         // `SelectNodes` takes an `HSTRING`, so the XPath literals are converted
         // here rather than at the call site to keep the constants readable.
@@ -169,10 +130,8 @@ impl WindowsNotificationManager {
             UdaError::Internal(format!("SelectSingleNode({IMAGE_XPATH}) failed: {e}"))
         })?;
 
-        // `SelectSingleNode` returns an `IXmlNode`, but attributes live on an
-        // *element*: `SetAttribute` is declared on `XmlElement`. The cast is the
-        // query interface for the same COM object, so it costs no copy and
-        // cannot fail for a node the XPath already typed as an element.
+        // `SelectSingleNode` returns an `IXmlNode`, but `SetAttribute` is declared
+        // on `XmlElement`; the cast is a query interface for the same COM object.
         let element = node.cast::<XmlElement>().map_err(|e| {
             UdaError::Internal(format!("the toast image node is not an element: {e}"))
         })?;
@@ -200,14 +159,11 @@ impl WindowsNotificationManager {
 
     /// Build the toast XML document for a notification.
     ///
-    /// The template is chosen from `app_icon` rather than fixed, because the two
-    /// shapes have different schemas: only `ToastImageAndText02` carries the
-    /// `<image>` node this fill needs. Selecting an image template
-    /// unconditionally would work too, but picking the text template when there
-    /// is no icon keeps the card from advertising a picture it does not have.
+    /// The template follows `app_icon` because the two shapes have different
+    /// schemas: only `ToastImageAndText02` carries the `<image>` node this fill
+    /// needs. `ToastImageAndText02` is the two-line text toast with a leading
+    /// image, mapping onto `summary` + `body` + `app_icon`.
     fn build_document(notification: &Notification) -> Result<XmlDocument, UdaError> {
-        // `ToastImageAndText02` is the two-line text toast with a leading
-        // image, which maps exactly onto `summary` + `body` + `app_icon`.
         let (template, with_image) = if notification::image_source(&notification.app_icon).is_some()
         {
             (ToastTemplateType::ToastImageAndText02, true)
@@ -233,36 +189,32 @@ fn set_text_node(nodes: &XmlNodeList, text: &str, field: &str) -> Result<(), Uda
         .Item(0)
         .map_err(|e| UdaError::Internal(format!("toast template has no {field} text node: {e}")))?;
 
-    // `IXmlNode::InnerText` escapes the value for us, so quotes and newlines in
-    // the summary/body cannot break the XML document.
+    // `InnerText` escapes the value, so quotes and newlines cannot break the
+    // document.
     node.SetInnerText(&text.into())
         .map_err(|e| UdaError::Internal(format!("SetInnerText for {field} failed: {e}")))?;
 
     Ok(())
 }
 
-/// Fallback AppUserModelID used when the caller supplies no `app_name`.
-///
-/// AUMIDs are dotted reverse-DNS strings by convention; a fixed value keeps
-/// every UDA notification from an unnamed host grouped under one identity
-/// instead of one toast per empty name.
+/// Fallback AppUserModelID when the caller supplies no `app_name`, so every
+/// notification from an unnamed host lands under one identity.
 const FALLBACK_AUMID: &str = "UniDesktop.Notification";
 
 /// The AUMID this process has already registered, if any.
 ///
-/// `OnceLock` rather than a `Mutex<bool>`: the registration must happen exactly
-/// once and before the first notifier is created, and `get_or_init` gives that
-/// without a lock on the read path. A second notification with a different
-/// `app_name` keeps the first id rather than switching mid-process, because the
-/// shell has already associated the running process with it.
+/// `OnceLock` rather than a `Mutex<bool>`: registration happens exactly once and
+/// before the first notifier is created, with no lock on the read path. A second
+/// notification with a different `app_name` keeps the first id, because the shell
+/// has already associated the running process with it.
 static REGISTERED_AUMID: OnceLock<String> = OnceLock::new();
 
 /// Normalise a caller-supplied `app_name` into a usable AUMID.
 ///
 /// An empty or whitespace-only name cannot be registered (Win32 rejects it), so
-/// it becomes [`FALLBACK_AUMID`]. Everything else is passed through verbatim:
-/// the shell treats the AUMID as an opaque string, and a caller that already
-/// uses a real identity (MSIX package name, or its own AUMID) must keep it.
+/// it becomes [`FALLBACK_AUMID`]. Everything else passes through verbatim: the
+/// shell treats the AUMID as opaque, and a caller that already uses a real
+/// identity (MSIX package name, or its own AUMID) must keep it.
 fn resolve_aumid(app_name: &str) -> String {
     let trimmed = app_name.trim();
     if trimmed.is_empty() {
@@ -275,27 +227,20 @@ fn resolve_aumid(app_name: &str) -> String {
 /// Register the process's toast identity exactly once.
 ///
 /// `SetCurrentProcessExplicitAppUserModelID` is the documented way to let an
-/// unpackaged Win32 process receive toasts; without it
-/// `CreateToastNotifier()` fails with `ELEMENT_NOT_FOUND` and nothing is shown.
-///
-/// The first call wins. A host that registered its own AUMID before UDA ran is
-/// detected through `GetCurrentProcessExplicitAppUserModelID` and left alone,
-/// because overwriting it would break that host's own activation routing.
+/// unpackaged Win32 process receive toasts. The first call wins, and a host that
+/// registered its own AUMID before UDA ran keeps it.
 fn ensure_app_identity(app_name: &str) -> Result<(), UdaError> {
-    // An already-initialised cell means this process registered an identity,
-    // either through UDA or through the host before UDA ran.
+    // An initialised cell means an identity exists, from UDA or from the host.
     if REGISTERED_AUMID.get().is_some() {
         return Ok(());
     }
 
-    // A host that set its own AUMID keeps it: overwriting would break that
-    // host's activation routing. `GetCurrentProcessExplicitAppUserModelID`
-    // returns a borrowed string the shell owns, so it is only inspected here.
+    // `GetCurrentProcessExplicitAppUserModelID` returns a string the shell owns,
+    // so it is only inspected and then released.
     if let Ok(existing) = unsafe { GetCurrentProcessExplicitAppUserModelID() } {
         if !existing.is_null() {
-            // SAFETY: the shell hands back a null-terminated UTF-16 string that
-            // stays valid for the lifetime of the process identity; it is read
-            // once into an owned `String` before anything else touches it.
+            // SAFETY: a null-terminated UTF-16 string owned by the shell, read
+            // once into an owned `String` here.
             let text = unsafe { existing.to_string() };
             if let Ok(text) = text {
                 if !text.is_empty() {
@@ -304,8 +249,8 @@ fn ensure_app_identity(app_name: &str) -> Result<(), UdaError> {
                     return Ok(());
                 }
             }
-            // SAFETY: the string was allocated by the shell with the COM task
-            // allocator, so it is released exactly once with the matching call.
+            // SAFETY: allocated by the shell with the COM task allocator, so it
+            // is released with the matching call.
             unsafe {
                 let _ = CoTaskMemFree(Some(existing.0.cast()));
             }
@@ -339,18 +284,11 @@ impl WindowsNotificationManager {
     ///
     /// `CreateToastNotifierWithId` is what makes an unpackaged process work: the
     /// parameterless `CreateToastNotifier()` resolves the identity from the
-    /// process, and a plain `node script.js` has none, so it fails with
-    /// `ELEMENT_NOT_FOUND` no matter what AUMID was registered. Passing the id
-    /// explicitly addresses the toast directly.
+    /// process, and an unpackaged host has none, so it fails with
+    /// `ELEMENT_NOT_FOUND` no matter what AUMID was registered.
     ///
-    /// `ensure_app_identity` still runs first, because the shell also matches
-    /// the id against the process's registered AUMID when it decides where to
-    /// show the toast; keeping both in step avoids a toast that is created but
-    /// silently dropped.
-    ///
-    /// A failure to resolve the identity is mapped to [`UdaError::NotSupported`]
-    /// per `AGENTS.md` Principle 1 (degrade gracefully), so the caller gets a
-    /// diagnosis instead of an opaque WinRT error.
+    /// `ensure_app_identity` still runs first, because the shell also matches the
+    /// id against the process's AUMID when deciding where to show the toast.
     fn create_notifier(app_name: &str) -> Result<ToastNotifier, UdaError> {
         ensure_app_identity(app_name)?;
         let application_id: HSTRING = resolve_aumid(app_name).into();
@@ -372,23 +310,19 @@ impl WindowsNotificationManager {
 
     /// Report whether toasts can actually be displayed for this process.
     ///
-    /// This is the Windows analogue of a capability probe. It returns
-    /// `DisabledForApplication` for a process that has an identity but has had
-    /// toasts turned off, and [`UdaError::NotSupported`] for a process with no
-    /// identity at all.
+    /// The Windows analogue of a capability probe: `DisabledForApplication` for a
+    /// process whose toasts are turned off, [`UdaError::NotSupported`] for one
+    /// with no identity at all.
     pub fn availability(
         &self,
     ) -> Result<windows::UI::Notifications::NotificationSetting, UdaError> {
-        // Probe with the same fallback identity a send with no `app_name` uses,
-        // so the probe answers the same question the send would ask.
+        // Probe with the fallback identity a send with no `app_name` uses, so the
+        // probe answers the same question the send would ask.
         let notifier = Self::create_notifier("")?;
 
         notifier.Setting().map_err(|e| {
-            // `Setting` resolves the identity a second time, so an unresolved
-            // id surfaces here as `ELEMENT_NOT_FOUND` just as it does in
-            // `create_notifier`. Mapping it to the same `NotSupported` keeps a
-            // probe consistent with a send rather than reporting an internal
-            // failure for a condition the caller can act on.
+            // `Setting` resolves the identity again, so an unresolved id surfaces
+            // here too and maps to the same `NotSupported` as `create_notifier`.
             if is_element_not_found(&e) {
                 UdaError::NotSupported(
                     "toast availability cannot be resolved: the process has no app identity"
@@ -401,27 +335,19 @@ impl WindowsNotificationManager {
     }
 }
 
-/// Convert a UTF-8 Rust string into a null-terminated UTF-16 buffer.
-///
-/// The Win32 shell calls take `PCWSTR`, which is a borrowed pointer to exactly
-/// this layout. The caller must keep the returned `Vec` alive across the call.
+/// Convert a UTF-8 Rust string into a null-terminated UTF-16 buffer. The Win32
+/// shell calls take `PCWSTR`, so the caller keeps the `Vec` alive across the call.
 fn to_wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// HRESULT for Win32 `ERROR_NOT_FOUND` (`0x80070490`), surfaced by WinRT as
-/// `ELEMENT_NOT_FOUND` when no app identity can be resolved.
-///
-/// `0x80070490` interpreted as a signed 32-bit value is `-2147024752`; writing
-/// the constant in hex and letting the compiler convert avoids the classic
-/// hand-conversion bug that silently disables the check.
+/// `ELEMENT_NOT_FOUND` when no app identity can be resolved. Written in hex and
+/// let the compiler convert, since the signed value is easy to get wrong by hand.
 const ELEMENT_NOT_FOUND_HRESULT: i32 = 0x8007_0490_u32 as i32;
 
-/// Whether a WinRT error is `ELEMENT_NOT_FOUND`.
-///
-/// `windows_core::Error` exposes the code through `Debug` only, so the numeric
-/// comparison is done on the raw `HRESULT` obtained from `as_ptr`, which is
-/// stable across the `windows` crate versions used by this workspace.
+/// Whether a WinRT error is `ELEMENT_NOT_FOUND`, compared on the raw HRESULT,
+/// which is stable across the `windows` crate versions this workspace uses.
 fn is_element_not_found(error: &windows::core::Error) -> bool {
     error.code().0 == ELEMENT_NOT_FOUND_HRESULT
 }
@@ -431,25 +357,19 @@ impl NotificationManager for WindowsNotificationManager {
     async fn send(&self, notification: &Notification) -> Result<u32, UdaError> {
         let document = Self::build_document(notification)?;
 
-        // `CreateToastNotification` is the WinRT activation factory on
+        // `CreateToastNotification` is the activation factory on
         // `ToastNotification` itself, not a method on the manager.
         let toast = ToastNotification::CreateToastNotification(&document)
             .map_err(|e| UdaError::Internal(format!("CreateToastNotification failed: {e}")))?;
 
-        // The identity is registered and then passed explicitly to
-        // `CreateToastNotifierWithId`. The parameterless
-        // `CreateToastNotifier()` resolves the identity from the process, which
-        // for an unpackaged binary means "none" and fails with
-        // `ELEMENT_NOT_FOUND` - registering an AUMID alone does not change that.
         let notifier = Self::create_notifier(&notification.app_name)?;
 
         notifier
             .Show(&toast)
             .map_err(|e| UdaError::Internal(format!("ToastNotifier::Show failed: {e}")))?;
 
-        // WinRT does not hand back a notification ID: the toast object is opaque
-        // and cannot be queried after `Show`. `replaces_id` is therefore
-        // meaningless on Windows, and `0` is returned for FreeDesktop parity.
+        // WinRT hands back no notification ID and the toast object is opaque
+        // after `Show`, so `replaces_id` is meaningless here and `0` is returned.
         if notification.replaces_id != 0 {
             log::debug!(
                 "Windows toasts cannot replace an existing notification; replaces_id={} ignored",

@@ -64,77 +64,54 @@ impl SessionAction {
         }
     }
 
-    /// Whether performing this action can lose the user's unsaved work.
-    ///
-    /// Only [`SessionAction::Lock`] is non-destructive, which makes it the one
-    /// action a demo or a test may automate. Every other action must be gated
-    /// behind an explicit confirmation in the host application.
+    /// Whether performing this action can lose the user's unsaved work. Only
+    /// [`SessionAction::Lock`] is safe to automate; the rest must be gated behind
+    /// an explicit confirmation in the host application.
     pub const fn is_destructive(self) -> bool {
         !matches!(self, Self::Lock)
     }
 }
 
 /// Read and drive the machine's session and power state.
+///
+/// Each method leaves running programs alone where the platform allows it, and
+/// the protocol-level mapping lives in `docs/internals/session_specs.md`.
 pub trait SessionManager {
     /// Lock the session.
-    ///
-    /// On Linux this is `org.freedesktop.ScreenSaver.Lock()` on the session bus,
-    /// falling back to `loginctl lock-session`. On Windows it is
-    /// `LockWorkStation()`. Both leave running programs untouched.
     fn lock(&self) -> Result<(), UdaError>;
 
     /// End the calling user's session.
-    ///
-    /// On Linux this is `org.freedesktop.login1.Manager.TerminateSession("")` on
-    /// the system bus, falling back to the desktop's own session manager. On
-    /// Windows it is `ExitWindowsEx(EWX_LOGOFF, 0)`.
     fn logout(&self) -> Result<(), UdaError>;
 
     /// Suspend the machine to RAM.
-    ///
-    /// On Linux this is `org.freedesktop.login1.Manager.Suspend(false)`. On
-    /// Windows it is `SetSuspendState(false, ...)`.
     fn suspend(&self) -> Result<(), UdaError>;
 
     /// Hibernate the machine to disk.
-    ///
-    /// On Linux this is `org.freedesktop.login1.Manager.Hibernate(false)`. On
-    /// Windows it is `SetSuspendState(true, ...)`, which the platform rejects
-    /// when hibernation is not enabled.
     fn hibernate(&self) -> Result<(), UdaError>;
 
     /// Restart the machine.
-    ///
-    /// On Windows this requires the `SE_SHUTDOWN_NAME` privilege, which the
-    /// backend acquires before calling `ExitWindowsEx(EWX_REBOOT | ...)`.
     fn reboot(&self) -> Result<(), UdaError>;
 
     /// Power the machine off.
-    ///
-    /// On Linux this is `org.freedesktop.login1.Manager.PowerOff(false)`. On
-    /// Windows it requires `SE_SHUTDOWN_NAME` and calls
-    /// `ExitWindowsEx(EWX_POWEROFF | ...)`.
     fn shutdown(&self) -> Result<(), UdaError>;
 
     /// The session actions this platform's backend can deliver.
     ///
-    /// The flag is computed once at construction and answers for the platform,
-    /// not the moment: a machine that *could* sleep but has hibernation switched
-    /// off still reports [`Capability::HIBERNATE`], because the code path exists
-    /// and the failure would be a runtime `Err`, not an `Unsupported`.
+    /// Computed once at construction and answering for the platform, not the
+    /// moment: a machine that *could* sleep but has hibernation switched off
+    /// still reports [`Capability::HIBERNATE`], because the code path exists and
+    /// the failure would be a runtime `Err`, not an `Unsupported`.
     fn capabilities(&self) -> Capability;
 }
 
 /// Perform `action` on `manager`, refusing a call the platform cannot deliver.
 ///
-/// Every caller shares this guard - the C-ABI layer, a Rust host, and the unit
-/// tests - so the "unsupported" answer is identical regardless of which method
-/// was chosen. It lives in the core (rather than in each backend) so the check
-/// is unit-testable without a D-Bus session or a Windows host.
+/// Every caller shares this guard, so the "unsupported" answer is identical
+/// whichever method was chosen. It lives in the core rather than in each backend
+/// so the check is unit-testable without a D-Bus session or a Windows host.
 ///
-/// `manager` is a `&dyn` rather than a generic so the guard costs one dynamic
-/// dispatch per call, which is irrelevant next to the D-Bus round trip or the
-/// Win32 call it protects.
+/// `manager` is a `&dyn` so one dynamic dispatch per call is all it costs, which
+/// is irrelevant next to the round trip it protects.
 pub fn perform(manager: &dyn SessionManager, action: SessionAction) -> Result<(), UdaError> {
     let capabilities = manager.capabilities();
 
@@ -158,9 +135,8 @@ pub fn perform(manager: &dyn SessionManager, action: SessionAction) -> Result<()
 mod tests {
     use super::*;
 
-    /// A manager that records what it was asked to do and reports a fixed
-    /// capability set. Using a mock (rather than the real backend) is what keeps
-    /// the test suite from ever touching the machine's power state.
+    /// A manager that records calls and reports a fixed capability set, so the
+    /// suite never touches the machine's power state.
     struct RecordingManager {
         capabilities: Capability,
         calls: std::sync::Mutex<Vec<&'static str>>,

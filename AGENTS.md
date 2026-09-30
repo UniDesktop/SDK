@@ -2,7 +2,7 @@
 
 > **Target Audience:** Autonomous AI Code Agents (Claude Code, Cursor, Windsurf, Devin, etc.)  
 > **Project Scope:** Cross-platform Desktop Shell Integration SDK for Windows 10/11 & Modern Linux (GNOME, KDE, Wayland Tiling, X11).  
-> **Primary Goal:** Fill the "missing bottom half of Qt" by providing deep, unified OS desktop control.
+> **Primary Goal:** Provide deep, unified OS desktop control through one type-safe Rust API.
 
 ---
 

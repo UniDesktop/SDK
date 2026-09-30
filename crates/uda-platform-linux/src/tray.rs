@@ -1,7 +1,5 @@
 //! Linux system tray backend: `org.kde.StatusNotifierItem` (SNI) + `com.canonical.dbusmenu`.
 //!
-//! # Architecture
-//!
 //! ```text
 //!  host thread                     D-Bus worker thread
 //!  ───────────                     ───────────────────
@@ -15,31 +13,16 @@
 //!                                   waits on the bus
 //! ```
 //!
-//! # State sharing: `Arc<Mutex<..>>`, never `RwLock`
-//!
-//! AGENTS.md forbids deriving `Clone` on a `Mutex`; the wrapper is what gets
-//! cloned, and the lock is shared behind an `Arc`. `zbus` requires `Clone` on
-//! an interface type, which is exactly why the state lives in
-//! `Arc<Mutex<TrayShared>>` and the interface is a thin handle over it.
-//!
-//! A `RwLock` would look cheaper (readers dominate: every property getter is a
-//! read), but it is the wrong tool here:
-//!
-//! * `zbus` dispatches each method call in its own task, so readers really can
-//!   overlap. However every handler also takes a **second** guard while
-//!   replying, and a read guard held across an `.await` is precisely the
-//!   pattern that deadlocks against a waiting writer. `Mutex` makes the hazard
-//!   impossible: one guard per `lock()`, always dropped before the next
-//!   acquisition, never held across `await`.
-//! * Poisoning has one obvious recovery story, which is what
-//!   [`uda_core::tray`] already does everywhere: recover and keep serving,
-//!   because the state is pure data that is rewritten field by field.
-//!
-//! # Never panic (AGENTS.md §1)
+//! The state is `Arc<Mutex<TrayShared>>` rather than `RwLock`: a read guard held
+//! across an `.await` is what deadlocks against a waiting writer, and `zbus`
+//! dispatches each method call in its own task. A `Mutex` makes the hazard
+//! impossible - one guard per `lock()`, always dropped before the next
+//! acquisition. Locking is always recovered from poisoning, as in
+//! [`uda_core::tray`].
 //!
 //! No `unwrap()`, `expect()`, `panic!`, `unreachable!` or `unsafe` in this
-//! module. Locks are recovered from poisoning, every D-Bus call is fallible,
-//! and every host-supplied buffer is validated before it is transcribed.
+//! module; every D-Bus call is fallible and every host-supplied buffer is
+//! validated before it is transcribed.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -57,10 +40,10 @@ use zbus::{interface, Connection};
 
 /// Window inside which two `Activate` calls are reported as a double click.
 ///
-/// Matches the Windows default `GetDoubleClickTime()` so a host behaves the same
-/// on both platforms. SNI itself has no double-click signal (see
-/// `docs/internals/tray_specs.md` §1.7), so this is a host-visible
-/// approximation and `TRAY_DOUBLE_CLICK` is deliberately not advertised.
+/// Matches the Windows default `GetDoubleClickTime()`. SNI has no double-click
+/// signal of its own (`docs/internals/tray_specs.md` §1.7), so this is a
+/// host-visible approximation and `TRAY_DOUBLE_CLICK` is deliberately not
+/// advertised.
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
 /// How often the worker checks whether the host still owns its icon.
@@ -87,11 +70,8 @@ const WATCHER_FALLBACK_INTERFACE: &str = "org.freedesktop.StatusNotifierWatcher"
 /// Per-process counter making every generated bus name unique.
 static TRAY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Lock a mutex, recovering from a poisoned lock.
-///
-/// The tray state is pure data that is rewritten field by field, so resuming
-/// after a panic inside one callback is strictly better than failing every
-/// later update. This mirrors `TrayAction::invoke` in `uda-core`.
+/// Lock a mutex, recovering from a poisoned lock: the state is pure data
+/// rewritten field by field, so resuming beats failing every later update.
 fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -120,11 +100,8 @@ enum IconPayload {
 }
 
 impl IconPayload {
-    /// Derive the payload from a validated [`TrayIconSource`].
-    ///
-    /// A path icon travels through as a theme name. An RGBA icon is transcoded:
-    /// straight RGBA top-down becomes ARGB32 little-endian bottom-up, with
-    /// `stride` padding skipped rather than copied (`tray_specs.md` §1.4).
+    /// Derive the payload from a validated [`TrayIconSource`]: a path travels
+    /// through as a theme name, RGBA is transcoded (see `tray_specs.md` §1.4).
     fn from_source(source: &TrayIconSource) -> Self {
         if source.validate().is_err() {
             log::warn!("tray icon failed validation; reporting it as missing");
@@ -150,11 +127,10 @@ impl IconPayload {
     }
 }
 
-/// Convert straight RGBA top-down bytes into bottom-up 32bpp rows (B, G, R, A).
-///
-/// Returns `None` when the source is not an RGBA buffer or does not match its
-/// declared dimensions. Every access is bounds-checked through slice indexing,
-/// so a malformed buffer produces `None` rather than a panic.
+/// Convert straight RGBA top-down bytes into bottom-up 32bpp rows (B, G, R, A),
+/// returning `None` for a source that is not RGBA or does not match its declared
+/// dimensions. All access is bounds-checked, so a malformed buffer yields
+/// `None` rather than a panic.
 fn rgba_to_argb(source: &TrayIconSource) -> Option<Vec<(i32, i32, Vec<u8>)>> {
     let TrayIconSource::Rgba {
         width,
@@ -183,20 +159,17 @@ fn rgba_to_argb(source: &TrayIconSource) -> Option<Vec<(i32, i32, Vec<u8>)>> {
 
     let mut out = vec![0u8; width * 4 * height];
     for row in 0..height {
-        // Start of this source row; `stride` bytes per row, of which the last
-        // `width * 4` carry pixels.
+        // `stride` bytes per source row, of which the first `width * 4` carry
+        // pixels; the padding is skipped rather than copied.
         let src_row = &data[row * stride..row * stride + width * 4];
         // Bottom-up: source row 0 lands at the end of the destination.
         let dst_row = &mut out[(height - 1 - row) * width * 4..(height - row) * width * 4];
         for column in 0..width {
             let pixel = &src_row[column * 4..column * 4 + 4];
             let base = column * 4;
-            // RGBA -> BGRA little-endian byte order.
-            //
-            // `IconPixmap` is documented as `a(iiay)` "ARGB32 rows" — which in
-            // practice means **byte** order B, G, R, A (see the SNI spec and
-            // `tray_specs.md` §1.4). Writing the channels as A, R, G, B swaps
-            // red and blue, so an icon that should be red arrives blue.
+            // RGBA -> BGRA little-endian byte order. `IconPixmap` is documented
+            // as `a(iiay)` "ARGB32 rows", which in practice means **byte** order
+            // B, G, R, A; writing A, R, G, B instead swaps red and blue.
             dst_row[base] = pixel[2];
             dst_row[base + 1] = pixel[1];
             dst_row[base + 2] = pixel[0];
@@ -230,18 +203,17 @@ struct MenuRow {
     children: Vec<MenuRow>,
     /// Callback fired when the shell reports this row as clicked.
     ///
-    /// Stored beside the exported row so an `Event` can be dispatched without
-    /// re-walking [`uda_core::tray::TrayMenu`], which the host may have mutated
-    /// in the meantime. Snapshotting at layout time is what keeps a click
-    /// addressed to the row the user actually saw.
+    /// Stored beside the exported row so an `Event` dispatches without re-walking
+    /// [`uda_core::tray::TrayMenu`], which the host may have mutated since the
+    /// layout was exported.
     action: Option<uda_core::tray::TrayAction>,
 }
 
 impl MenuRow {
     /// Map a [`MenuItem`] onto a row, allocating the dbusmenu id.
     ///
-    /// `menuid` is a counter owned by the caller so nested submenus allocate
-    /// from one monotonic sequence. It saturates rather than wrapping: a wrapped
+    /// `menuid` is a caller-owned counter so nested submenus allocate from one
+    /// monotonic sequence; it saturates rather than wrapping, since a wrapped
     /// counter would alias a live row.
     fn from_item(item: &MenuItem, menuid: &mut i32) -> Self {
         let id = *menuid;
@@ -320,8 +292,7 @@ impl MenuRow {
         props.insert("enabled", self.enabled.into());
         props.insert("visible", true.into());
         if self.checkbox {
-            // `checkmark` is what makes a shell draw a real checkbox instead of
-            // a plain text row.
+            // `checkmark` is what makes a shell draw a real checkbox.
             props.insert("toggle-type", "checkmark".into());
             props.insert("toggle-state", i32::from(self.checked).into());
         }
@@ -332,9 +303,6 @@ impl MenuRow {
     }
 
     /// Find a row by dbusmenu id, depth-first.
-    ///
-    /// The returned borrow is tied to `rows` by elision, which is all the
-    /// signature needs to say; naming the lifetime would add nothing.
     fn find(rows: &[MenuRow], id: i32) -> Option<&MenuRow> {
         for row in rows {
             if row.id == id {
@@ -357,22 +325,20 @@ type MenuChildren = Vec<(i32, OwnedProps, zvariant::OwnedValue)>;
 /// One dbusmenu layout node: `(ia{sv}ia{sv}v)`.
 type MenuNode = (i32, OwnedProps, MenuChildren, zvariant::OwnedValue);
 
-/// The property map a row exposes.
-///
-/// Keys are `'static` literals and values are borrowed `Value`s, so this is the
-/// cheap in-memory form; [`owned_props`] converts it for the wire.
+/// The cheap in-memory property map a row exposes: `'static` keys and borrowed
+/// values. [`owned_props`] converts it for the wire.
 fn row_properties(row: &MenuRow) -> HashMap<&'static str, zvariant::Value<'_>> {
     row.properties()
 }
 
 /// Own the property values so they can travel back over D-Bus.
+///
+/// `try_to_owned` reports the rare case where a payload cannot be cloned into a
+/// static one (an `Fd`, for instance), which cannot happen for our types.
 fn owned_props(props: HashMap<&'static str, zvariant::Value<'_>>) -> OwnedProps {
     props
         .into_iter()
         .filter_map(|(key, value)| {
-            // `to_owned` on a `Value` clones the payload into a static one;
-            // `try_to_owned` reports the rare case where that is impossible
-            // (an `Fd`, for instance), which cannot happen for our types.
             value
                 .try_to_owned()
                 .ok()
@@ -381,18 +347,17 @@ fn owned_props(props: HashMap<&'static str, zvariant::Value<'_>>) -> OwnedProps 
         .collect()
 }
 
-/// An empty variant payload.
+/// An empty variant payload, filling dbusmenu's `v` "no icon" slots.
 ///
-/// dbusmenu's `v` slots carry "no icon" for UDA. A zero-field structure is the
-/// canonical filler: it serialises to a valid variant body without asserting a
-/// concrete type on the receiving side, which a bare unit would not express.
+/// A zero-field structure is the canonical filler: it serialises to a valid
+/// variant body without asserting a concrete type on the receiving side, which a
+/// bare unit would not express.
 fn empty_variant() -> zvariant::OwnedValue {
     let filler = zvariant::StructureBuilder::new().build();
     match zvariant::Value::from(filler).try_to_owned() {
         Ok(owned) => owned,
-        // Unreachable for a zero-field structure (there is nothing to clone);
-        // routing through the same encoder used for children keeps the function
-        // total without an `expect`.
+        // Unreachable for a zero-field structure; routing through the same
+        // encoder used for children keeps the function total without an `expect`.
         Err(error) => {
             log::warn!("tray could not encode an empty variant: {error}");
             empty_variant_with(Vec::new())
@@ -400,10 +365,8 @@ fn empty_variant() -> zvariant::OwnedValue {
     }
 }
 
-/// A snapshot of the menu attached to an icon, taken per request.
-///
-/// Rows are captured with their callbacks, so an `Event` never reaches back into
-/// the host's live menu tree.
+/// A snapshot of the menu attached to an icon, taken per request, with callbacks
+/// captured so an `Event` never reaches back into the host's live menu tree.
 #[derive(Debug, Clone)]
 struct MenuSnapshot {
     rows: Vec<MenuRow>,
@@ -427,10 +390,9 @@ impl MenuSnapshot {
         MenuRow::find(&self.rows, id)
     }
 
-    /// Encode the whole tree as the `GetLayout` root node.
-    ///
-    /// The root carries id 0 and no properties; the children are the top-level
-    /// rows, each wrapped in a variant so the wire signature stays `(ia{sv}ia{sv}v)`.
+    /// Encode the whole tree as the `GetLayout` root node: id 0, no properties,
+    /// and the top-level rows each wrapped in a variant so the wire signature
+    /// stays `(ia{sv}ia{sv}v)`.
     fn root_node(&self, recurse: bool) -> MenuNode {
         let children: MenuChildren = self
             .rows
@@ -503,11 +465,8 @@ fn empty_variant_with(children: MenuChildren) -> zvariant::OwnedValue {
 // Shared worker state
 // ---------------------------------------------------------------------------
 
-/// The state the D-Bus worker serves.
-///
-/// Pure data: the worker copies it out of the host's [`TrayIconInner`] on every
-/// mutation and answers D-Bus queries from this mirror, so no handler ever has
-/// to reach into the icon's lock (which the platform crate cannot see anyway).
+/// The state the D-Bus worker serves, copied out of the host's
+/// [`TrayIconInner`] on every mutation and answered from this mirror.
 struct TrayShared {
     /// Application name; also the dbusmenu `Id`.
     name: String,
@@ -531,12 +490,10 @@ struct TrayShared {
 }
 
 impl Default for TrayShared {
-    /// A registered icon is visible by default.
-    ///
-    /// `TrayIconInner` starts visible, and `TrayIcon::hide` is the only way to
-    /// turn that off, so a freshly created mirror must agree with it. Deriving
-    /// `Default` would instead yield `visible: false` and the worker would
-    /// publish `status = Passive` for an icon the host never hid.
+    /// A registered icon is visible by default: `TrayIconInner` starts visible
+    /// and `TrayIcon::hide` is the only way to turn that off, so a fresh mirror
+    /// must agree, otherwise the worker would publish `status = Passive` for an
+    /// icon the host never hid.
     fn default() -> Self {
         Self {
             name: String::new(),
@@ -569,14 +526,9 @@ impl fmt::Debug for TrayShared {
 }
 
 impl TrayShared {
-    /// Copy the host-visible state into the mirror.
-    ///
-    /// Values are read from the public accessors (`tooltip()`, `menu()`, …) and
-    /// the icon through [`TrayIconInner::lock_state`], always under exactly one
-    /// lock, so this stays in step with the host without ever nesting locks.
+    /// Copy the host-visible state into the mirror under exactly one lock, so
+    /// this stays in step with the host without ever nesting locks.
     fn sync_from(&mut self) {
-        // Borrowing the host through one guard: `lock_or_recover` returns a
-        // `MutexGuard`, and everything is copied out before it is dropped.
         let Some(host) = self.host.as_ref() else {
             return;
         };
@@ -649,20 +601,17 @@ struct ItemSnapshot {
 
 /// The SNI interface exported at `/StatusNotifierItem`.
 ///
-/// `zbus` requires `Clone` on an interface type (the object server clones it
-/// when serving). The shared state lives behind one `Arc<Mutex<TrayShared>>`,
-/// so cloning is a pointer bump and every clone observes the same state.
+/// `zbus` requires `Clone` on an interface type; the state behind one
+/// `Arc<Mutex<TrayShared>>` makes cloning a pointer bump.
 #[derive(Clone)]
 pub struct StatusNotifierItemInterface {
     shared: Arc<Mutex<TrayShared>>,
 }
 
 impl StatusNotifierItemInterface {
-    /// Wrap shared state.
-    ///
-    /// Module-private: only [`Worker`] builds an interface, and it already owns
-    /// the shared state. Exposing a constructor would let a caller fabricate a
-    /// second, unrelated view of an icon's state.
+    /// Wrap shared state. Module-private: only [`Worker`] builds an interface,
+    /// and a public constructor would let a caller fabricate a second,
+    /// unrelated view of an icon's state.
     #[must_use]
     fn new(shared: Arc<Mutex<TrayShared>>) -> Self {
         Self { shared }
@@ -679,8 +628,8 @@ impl StatusNotifierItemInterface {
     /// Two activations inside [`DOUBLE_CLICK_WINDOW`] are reported as a
     /// [`TrayEvent::DoubleClick`] and routed to `on_double_click`; every other
     /// activation is a plain [`TrayEvent::Click`]. The callback runs **without**
-    /// the state lock held, so host code may safely update the icon or the menu
-    /// from inside it.
+    /// the state lock held, so host code may update the icon or the menu from
+    /// inside it.
     fn dispatch_activation(&mut self) {
         // One guard: read the timestamp, record the new one, take the handler.
         let (event, handler) = {
@@ -690,8 +639,7 @@ impl StatusNotifierItemInterface {
                 Some(last) => now.duration_since(last) <= DOUBLE_CLICK_WINDOW,
                 None => false,
             };
-            // The window always restarts, so a triple click reads as
-            // click-then-double rather than one long double.
+            // The window restarts, so a triple click reads as click-then-double.
             shared.last_activate = Some(now);
             if double_click {
                 (TrayEvent::DoubleClick, shared.on_double_click.take())
@@ -700,13 +648,10 @@ impl StatusNotifierItemInterface {
             }
         };
 
-        // A `FnMut` closure needs a mutable borrow, and the boxed handler was
-        // moved out of the state, so `handler` is taken by value and called
-        // through `as_mut()` here.
         if let Some(mut handler) = handler {
             handler(&event);
             // Put the closure back even if it panicked: a handler that is never
-            // restored would silently stop receiving clicks. The state lock was
+            // restored would silently stop receiving clicks. The lock was
             // released before the call, so re-acquiring it here is safe.
             let mut shared = lock_or_recover(&self.shared, "status notifier item");
             match event {
@@ -717,11 +662,8 @@ impl StatusNotifierItemInterface {
     }
 }
 
-/// The four fields of the SNI `ToolTip` property, in specification order.
-///
-/// `(icon name, icon pixmap, title, description)`. Named because the raw tuple is
-/// long enough to obscure the property it types, and because the field order is
-/// fixed by the protocol rather than by anything in this crate.
+/// The four fields of the SNI `ToolTip` property, in specification order:
+/// `(icon name, icon pixmap, title, description)`.
 type ToolTipShape = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 
 #[interface(name = "org.kde.StatusNotifierItem")]
@@ -731,18 +673,14 @@ impl StatusNotifierItemInterface {
         self.dispatch_activation();
     }
 
-    /// Secondary activation (middle click on most shells).
-    ///
-    /// `TrayEvent` has no distinct variant for it, so it is reported as a click
-    /// rather than dropped on the floor.
+    /// Secondary activation (middle click on most shells). `TrayEvent` has no
+    /// distinct variant for it, so it is reported as a click rather than dropped.
     async fn secondary_activate(&mut self, _x: i32, _y: i32) {
         self.dispatch_activation();
     }
 
-    /// The shell wants the context menu at (x, y).
-    ///
-    /// dbusmenu already carries the geometry, so UDA only logs it; the shell
-    /// renders the menu itself from the `Menu` property.
+    /// The shell wants the context menu at (x, y). dbusmenu carries the geometry,
+    /// so UDA only logs it; the shell renders the menu from `Menu`.
     async fn context_menu(&self, _x: i32, _y: i32) {
         log::debug!("tray context menu requested by the shell");
     }
@@ -885,10 +823,8 @@ impl StatusNotifierItemInterface {
 // com.canonical.dbusmenu
 // ---------------------------------------------------------------------------
 
-/// The dbusmenu interface exported at `/MenuBar`.
-///
-/// Shares the icon's state plus a layout revision, so the shell is told to
-/// re-read when the menu changes.
+/// The dbusmenu interface exported at `/MenuBar`, sharing the icon's state plus
+/// a layout revision so the shell is told to re-read when the menu changes.
 #[derive(Clone)]
 pub struct DBusMenuInterface {
     shared: Arc<Mutex<TrayShared>>,
@@ -896,11 +832,9 @@ pub struct DBusMenuInterface {
 }
 
 impl DBusMenuInterface {
-    /// Wrap shared state.
-    ///
-    /// Module-private for the same reason as
+    /// Wrap shared state. Module-private for the same reason as
     /// [`StatusNotifierItemInterface::new`]: one worker owns the state, and a
-    /// second view could only ever serve stale data.
+    /// second view could only serve stale data.
     #[must_use]
     fn new(shared: Arc<Mutex<TrayShared>>, revision: Arc<Mutex<u32>>) -> Self {
         Self { shared, revision }
@@ -921,11 +855,8 @@ impl DBusMenuInterface {
 
 #[interface(name = "com.canonical.dbusmenu")]
 impl DBusMenuInterface {
-    /// Return the menu tree.
-    ///
-    /// `recursion_depth` of 0 means "unlimited", which is what the shells send;
-    /// a negative value is clamped to the same behaviour rather than returning
-    /// an empty layout.
+    /// Return the menu tree. A `recursion_depth` of 0 (or below) means
+    /// "unlimited", which is what the shells send.
     async fn get_layout(
         &self,
         _parent_id: i32,
@@ -979,12 +910,9 @@ impl DBusMenuInterface {
         }
     }
 
-    /// A shell-reported interaction with a row.
-    ///
-    /// dbusmenu carries an integer id, not a path, so UDA keeps the snapshot's
-    /// id-to-row map and looks the row up here. The callback is invoked **after**
-    /// the state lock is dropped: holding a D-Bus dispatch guard across host
-    /// code would stall every other request.
+    /// A shell-reported interaction with a row, addressed by dbusmenu id. The
+    /// callback is invoked **after** the state lock is dropped: holding a D-Bus
+    /// dispatch guard across host code would stall every other request.
     async fn event(&self, id: i32, event_id: String, _data: zvariant::Value<'_>, _timestamp: u32) {
         if event_id != "clicked" {
             // `hovered` carries no host-visible meaning in UDA's model.
@@ -1020,10 +948,9 @@ impl DBusMenuInterface {
         }
     }
 
-    /// Whether the shell should re-read a submenu before showing it.
-    ///
-    /// Always `true`: the rows are snapshotted per call, so a re-read is cheap
-    /// and the shell can never show a stale submenu.
+    /// Whether the shell should re-read a submenu before showing it. Always
+    /// `true`: rows are snapshotted per call, so a re-read is cheap and the shell
+    /// can never show a stale submenu.
     async fn about_to_show(&self, _id: i32) -> zbus::fdo::Result<bool> {
         Ok(true)
     }
@@ -1060,10 +987,8 @@ impl DBusMenuInterface {
 /// Everything the worker thread needs.
 ///
 /// There is deliberately no command enum: the worker's lifetime is bound to the
-/// host's icon handle, so dropping the sender is the one and only shutdown
-/// signal. A `Shutdown` variant would be a second, redundant way to say the same
-/// thing, and the spec's "Drop joins the worker with a bounded wait" is satisfied
-/// by the disconnect path alone.
+/// host's icon handle, so a disconnected sender is the one and only shutdown
+/// signal.
 struct Worker {
     /// The unique bus name this item owns.
     bus_name: String,
@@ -1091,7 +1016,6 @@ impl Worker {
         runtime.block_on(self.run_async());
     }
 
-    /// The async body of the worker.
     async fn run_async(mut self) {
         let connection = match Connection::session().await {
             Ok(connection) => connection,
@@ -1101,7 +1025,7 @@ impl Worker {
             }
         };
 
-        // Own a unique bus name so several icons in one process never collide.
+        // A unique bus name keeps several icons in one process from colliding.
         if let Err(error) = connection.request_name(self.bus_name.as_str()).await {
             log::warn!("tray bus name '{}' was refused: {error}", self.bus_name);
             return;
@@ -1120,9 +1044,8 @@ impl Worker {
             return;
         }
 
-        // Announce the item to the shell. A missing watcher is not fatal: the
-        // item stays exported so a watcher that starts later can still find it
-        // through `RegisterStatusNotifierItem` or `NameOwnerChanged`.
+        // A missing watcher is not fatal: the item stays exported, so a watcher
+        // that starts later can still find it.
         if let Err(error) = register_with_watcher(&connection, &self.bus_name).await {
             log::warn!("tray registered without a watcher ({error}); the shell may not show it");
         }
@@ -1130,16 +1053,14 @@ impl Worker {
         log::info!("tray item '{}' is live", self.bus_name);
 
         loop {
-            // A disconnected channel means the sender is gone, which is the
-            // documented signal that nothing owns this icon any more. An empty
-            // channel is the normal case and simply falls through.
+            // A disconnected sender means nothing owns this icon any more; an
+            // empty channel is the normal case and falls through.
             if let Err(std::sync::mpsc::TryRecvError::Disconnected) = self.commands.try_recv() {
                 break;
             }
             if self.host_released() {
                 break;
             }
-            // Mirror the host's state, then tell the shell what changed.
             if self.refresh(&connection).await {
                 self.bump_revision();
             }
@@ -1151,10 +1072,9 @@ impl Worker {
 
     /// Copy the host's state into the mirror and announce any change.
     ///
-    /// Returns whether the menu layout changed, which is the only case that
-    /// needs a revision bump. Exactly one guard is taken while comparing, and it
-    /// is dropped before any signal is emitted: emitting a signal while holding
-    /// the lock could deadlock against a shell that immediately calls back into
+    /// Returns whether the menu layout changed, the only case that needs a
+    /// revision bump. The guard is dropped before any signal is emitted: holding
+    /// it across a signal could deadlock against a shell that calls back into
     /// the item while we still own the lock.
     async fn refresh(&mut self, connection: &Connection) -> bool {
         let (previous, changed) = {
@@ -1203,10 +1123,8 @@ impl Worker {
         changed.3
     }
 
-    /// Whether the host has dropped its icon.
-    ///
-    /// `TrayIcon::drop` sets `shutdown` exactly once, which is the one
-    /// unambiguous "unregister and exit" signal.
+    /// Whether the host has dropped its icon: `TrayIcon::drop` sets `shutdown`
+    /// exactly once, the one unambiguous "unregister and exit" signal.
     fn host_released(&self) -> bool {
         let shared = lock_or_recover(&self.shared, "tray worker state");
         match shared.host.as_ref() {
@@ -1227,10 +1145,8 @@ impl Worker {
         log::debug!("tray menu layout is now at revision {revision}");
     }
 
-    /// Unregister everything, in the order the specification requires.
-    ///
-    /// Interfaces are removed before the bus name is released, so the shell
-    /// never observes a name with no objects behind it.
+    /// Unregister everything: interfaces are removed before the bus name is
+    /// released, so the shell never observes a name with no objects behind it.
     async fn shutdown(self, connection: &Connection) {
         let server = connection.object_server();
         if let Err(error) = server
@@ -1249,10 +1165,9 @@ impl Worker {
     }
 }
 
-/// Register the item with a StatusNotifierWatcher.
-///
-/// Tries the KDE interface first, then the freedesktop one (Tier 2 fallback from
-/// `tray_specs.md` §1.6). Returns an error when neither is reachable.
+/// Register the item with a StatusNotifierWatcher: the KDE interface first, then
+/// the freedesktop one (`tray_specs.md` §1.6), erroring when neither is
+/// reachable.
 async fn register_with_watcher(connection: &Connection, service: &str) -> Result<(), UdaError> {
     for interface_name in [WATCHER_INTERFACE, WATCHER_FALLBACK_INTERFACE] {
         let proxy =
@@ -1286,10 +1201,8 @@ async fn register_with_watcher(connection: &Connection, service: &str) -> Result
 // Manager
 // ---------------------------------------------------------------------------
 
-/// The Linux tray manager.
-///
-/// Cheap to construct: no connection is opened until [`TrayManager::create`]
-/// runs, so probing capabilities never touches the bus.
+/// The Linux tray manager. Cheap to construct: no connection is opened until
+/// [`TrayManager::create`] runs, so probing capabilities never touches the bus.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxTrayManager;
 
@@ -1303,9 +1216,8 @@ impl LinuxTrayManager {
     /// The capability set this backend publishes for a registered item.
     ///
     /// `TRAY_DOUBLE_CLICK` is deliberately absent: SNI has no double-click
-    /// signal, so claiming it would violate the "honest capability" contract
-    /// (`tray_specs.md` §1.7). A host that wants double-click behaviour must
-    /// synthesise it from two `Click`s.
+    /// signal, so claiming it would break the "honest capability" contract
+    /// (`tray_specs.md` §1.7). A host synthesises it from two `Click`s.
     fn advertised_capabilities() -> Capability {
         Capability::SYSTEM_TRAY
             | Capability::TRAY_ICON
@@ -1316,11 +1228,9 @@ impl LinuxTrayManager {
             | Capability::TRAY_DYNAMIC_MENU
     }
 
-    /// Allocate a unique bus name for a new item.
-    ///
-    /// The PID makes the name unique per process; the counter disambiguates a
-    /// second icon in the same process. The application name is sanitised into
-    /// dotted name components so a host cannot inject a dot or a newline.
+    /// Allocate a unique bus name for a new item: the PID makes it unique per
+    /// process, the counter disambiguates a second icon in the same process, and
+    /// the application name is sanitised into dotted components.
     fn bus_name(app_name: &str) -> String {
         let pid = std::process::id();
         let index = TRAY_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -1342,10 +1252,8 @@ impl LinuxTrayManager {
         format!("org.kde.StatusNotifierItem-{safe}-{pid}-{index}")
     }
 
-    /// Start the worker thread that owns the D-Bus connection.
-    ///
-    /// Returns the shutdown sender, whose drop tells the worker to tear down, or
-    /// an error when the thread could not be spawned at all.
+    /// Start the worker thread that owns the D-Bus connection, returning the
+    /// shutdown sender whose drop tells the worker to tear down.
     fn spawn_worker(
         shared: Arc<Mutex<TrayShared>>,
         bus_name: String,
@@ -1375,13 +1283,10 @@ impl LinuxTrayManager {
     }
 }
 
-/// Copy the registration-time values into the host-visible state.
-///
-/// Both halves read this state: the host through `TrayIcon::tooltip()`,
-/// `TrayIcon::menu()` and `TrayIcon::is_visible()`, and the worker through
+/// Copy the registration-time values into the host-visible state, which both
+/// halves read: the host through its accessors, the worker through
 /// [`TrayShared::sync_from`]. Seeding it in one place keeps a freshly created
-/// icon self-consistent, instead of showing the shell the registered icon while
-/// telling the host it had none.
+/// icon self-consistent.
 fn seed_host_state(inner: &uda_core::tray::TrayIconInner, config: &TrayIconConfig) {
     let mut state = inner.lock_state();
     state.tooltip = config.tooltip.clone();
@@ -1392,20 +1297,13 @@ fn seed_host_state(inner: &uda_core::tray::TrayIconInner, config: &TrayIconConfi
 
 impl TrayManager for LinuxTrayManager {
     fn create(&self, config: TrayIconConfig) -> Result<TrayIcon, UdaError> {
-        // The D-Bus round-trip is async, so a dedicated thread owns a runtime
-        // and the host gets its handle back immediately; it is never asked to
-        // drive a message loop or to poll.
         let inner = Arc::new(uda_core::tray::TrayIconInner::new(config.name.clone()));
         let icon = TrayIcon::from_inner(Arc::clone(&inner));
 
-        // Seed the host-visible state so both halves agree on what was
-        // registered. `seed_host_state` is shared with the unit tests, which
-        // assert exactly this consistency contract.
         seed_host_state(&inner, &config);
 
-        // Copy the callbacks out of the config before it is consumed: a
-        // `Box<dyn FnMut>` cannot be cloned, so this is the only chance to move
-        // them into the worker state.
+        // A `Box<dyn FnMut>` cannot be cloned, so this is the only chance to
+        // move the callbacks into the worker state.
         let mut config = config;
         let on_click = config.on_click.take();
         let on_double_click = config.on_double_click.take();
@@ -1427,10 +1325,8 @@ impl TrayManager for LinuxTrayManager {
         inner.set_capabilities(Self::advertised_capabilities());
 
         // The sender is deliberately leaked: dropping it would shut the worker
-        // down immediately. Its endpoint stays open for as long as the process
-        // lives, and the worker exits on its own once the host drops the icon,
-        // because then `TrayIconInner::state.shutdown` is set and the worker's
-        // refresh loop stops finding a live owner.
+        // down immediately. The worker exits on its own once the host drops the
+        // icon, because `TrayIconInner::state.shutdown` is then set.
         std::mem::forget(shutdown);
 
         Ok(icon)
@@ -1475,8 +1371,6 @@ mod tests {
     fn padded_rgba() -> TrayIconSource {
         let mut data = Vec::new();
         for row in 0..2u8 {
-            // Every channel is `base + row`, so each source row is one step
-            // brighter and the bottom-up reordering is visible in the output.
             data.extend_from_slice(&[
                 10 + row,
                 20 + row,
@@ -1511,14 +1405,9 @@ mod tests {
         assert_eq!(*height, 2);
         assert_eq!(bytes.len(), 16);
 
-        // `IconPixmap` is `a(iiay)` documented as "ARGB32", which in **byte**
-        // order means B, G, R, A. The output is bottom-up, so the destination
-        // rows are the source rows in reverse order while the column order
-        // inside each row is preserved:
-        //   dst row 0 = src row 1, dst row 1 = src row 0
-        // The fixture's pixels are:
-        //   src row 0 -> (10, 20, 30, 255) , (40, 50, 60, 255)
-        //   src row 1 -> (11, 21, 31, 255) , (41, 51, 61, 255)
+        // `a(iiay)` "ARGB32" in **byte** order means B, G, R, A. The output is
+        // bottom-up, so the destination rows are the source rows reversed while
+        // the column order inside each row is preserved.
         assert_eq!(&bytes[0..4], &[31, 21, 11, 255]);
         assert_eq!(&bytes[4..8], &[61, 51, 41, 255]);
         assert_eq!(&bytes[8..12], &[30, 20, 10, 255]);
@@ -1527,10 +1416,8 @@ mod tests {
 
     #[test]
     fn red_and_blue_are_not_swapped() {
-        // A pure red pixel must come out with the red channel in byte 2 and blue
-        // in byte 0. Writing A, R, G, B instead swaps the two, which turns every
-        // icon's reds blue — the classic "tray icon has the wrong colours"
-        // defect that is invisible in a unit test using evenly spaced channels.
+        // A pure red pixel must come out with red in byte 2 and blue in byte 0;
+        // writing A, R, G, B instead swaps them and turns every icon's reds blue.
         let source = TrayIconSource::Rgba {
             width: 1,
             height: 1,
@@ -1544,8 +1431,8 @@ mod tests {
 
     #[test]
     fn a_fully_transparent_pixel_keeps_its_colour_channels() {
-        // Premultiplication is *not* applied by the shell, so a fully
-        // transparent pixel must retain its RGB rather than being zeroed.
+        // Premultiplication is *not* applied by the shell, so a fully transparent
+        // pixel must retain its RGB.
         let source = TrayIconSource::Rgba {
             width: 1,
             height: 1,

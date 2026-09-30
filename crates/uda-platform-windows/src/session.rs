@@ -1,7 +1,5 @@
 //! Windows session backend: Win32 session and power APIs.
 //!
-//! # API mapping
-//!
 //! | Action   | API                                                              |
 //! |----------|------------------------------------------------------------------|
 //! | Lock     | `user32!LockWorkStation`                                          |
@@ -14,29 +12,28 @@
 //! # Why the privilege dance is required
 //!
 //! `ExitWindowsEx` with `EWX_REBOOT` or `EWX_POWEROFF` fails with
-//! `ERROR_PRIVILEGE_NOT_HELD` (1314) unless the calling process's token carries
-//! the `SeShutdownPrivilege` privilege **and** it is *enabled*. Two steps are
-//! therefore needed, and skipping either produces the same misleading failure:
+//! `ERROR_PRIVILEGE_NOT_HELD` (1314) unless the process token carries the
+//! `SeShutdownPrivilege` privilege **and** it is *enabled*, so two steps are
+//! needed and skipping either produces the same misleading failure:
 //!
 //! 1. `OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)`
-//!    opens the process token. `TOKEN_QUERY` is required because
-//!    `AdjustTokenPrivileges` reports what it actually did through the
+//!    opens the token. `TOKEN_QUERY` is required because
+//!    `AdjustTokenPrivileges` reports what it actually did through its
 //!    `previousstate` out parameter.
 //! 2. `AdjustTokenPrivileges(token, false, &privileges, ...)` enables the
 //!    privilege. It returns a *success* status even when it granted nothing, so
 //!    `GetLastError()` must be checked for `ERROR_NOT_ALL_ASSIGNED` - the only
 //!    reliable way to tell "the account lacks the privilege" from "done".
 //!
-//! `Logout` and the two sleep states need no privilege, which is why only the
-//! two power-off paths go through [`acquire_shutdown_privilege`].
+//! Logout and the two sleep states need no privilege, which is why only the two
+//! power-off paths go through [`acquire_shutdown_privilege`].
 //!
 //! # Handle hygiene
 //!
-//! The token handle is owned by a small guard whose `Drop` calls
-//! `CloseHandle`, so every early return between `OpenProcessToken` and the end of
-//! the operation releases it. Following `AGENTS.md` Principle 1 there is no
+//! The token handle is owned by a guard whose `Drop` calls `CloseHandle`, so
+//! every early return releases it. Following `AGENTS.md` Principle 1 there is no
 //! `unwrap`/`expect`: every Win32 `BOOL`/`Result` is inspected and mapped into a
-//! typed [`UdaError`] that carries the Win32 error code in its message.
+//! typed [`UdaError`] carrying the Win32 error code in its message.
 //!
 //! See `docs/internals/session_specs.md` for the full mapping.
 
@@ -59,9 +56,8 @@ use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 
 /// The privilege name Windows requires for reboot and shutdown.
-///
 /// `SE_SHUTDOWN_NAME` is already a wide-string constant in the `windows` crate,
-/// so the text form is only used in error messages.
+/// so this text form is only used in error messages.
 const SE_SHUTDOWN_DISPLAY: &str = "SeShutdownPrivilege";
 
 /// Win32 error code reported when a privilege cannot be granted.
@@ -100,9 +96,8 @@ impl WindowsSessionManager {
             .ok_or_else(|| UdaError::Internal("logout lost its ExitWindowsEx flags".to_string()))?;
 
         // `EWX_LOGOFF` needs no privilege: a user may always end their own
-        // session. `EWX_FORCEIFHUNG` is deliberately *not* used here, because
-        // forcing a hung application out of the user's session would discard
-        // whatever it had not saved.
+        // session. `EWX_FORCEIFHUNG` is deliberately *not* used, because forcing
+        // a hung application out would discard whatever it had not saved.
         exit_windows(flags, "logout")
     }
 

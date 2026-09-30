@@ -53,26 +53,22 @@ impl Default for Notification {
 
 /// Decide what a notification card's image should display, if anything.
 ///
-/// Returns `None` for a value that carries no image, so the caller can degrade
-/// to a text-only card. Otherwise returns the value normalised into the form
-/// the platform resolves. Both backends need this answer, which is why it lives
-/// in the core rather than in either platform crate.
+/// Returns `None` for a value that carries no image, so the caller can degrade to
+/// a text-only card; otherwise the value normalised into the form the platform
+/// resolves. Both backends need this answer, which is why it lives in the core.
 ///
-/// * A bare filesystem path becomes a `file://` URI. This is not cosmetic: the
-///   Windows toast platform resolves `src` from the *shell's* context rather
-///   than the sender's working directory, so `C:\pics\a.png` is not reliably
-///   located even though the file is right there.
-/// * A value that already carries a scheme (`file:`, `http:`, `https:`,
-///   `ms-appx:`, ...) is passed through untouched, so a caller that built a URI
-///   already is not double-prefixed into `file:///file:///...`.
-/// * The FreeDesktop backend on Linux accepts a plain path and needs no
-///   conversion, but the same normalisation is harmless there: a path with no
-///   scheme and no leading separator is returned unchanged.
+/// - A bare filesystem path becomes a `file://` URI: the Windows toast platform
+///   resolves `src` from the *shell's* context rather than the sender's working
+///   directory, so `C:\pics\a.png` is not reliably located even when the file is
+///   right there. The FreeDesktop backend accepts a plain path, and the same
+///   normalisation is harmless there.
+/// - A value that already carries a scheme (`file:`, `http:`, `https:`,
+///   `ms-appx:`, ...) passes through untouched, so a caller that built a URI is
+///   not double-prefixed into `file:///file:///...`.
 ///
-/// Only the *syntax* is decided. The file's existence is deliberately not
-/// checked: a typo would then become a hard failure, whereas the platforms'
-/// own answer for an unreadable image is to draw the card without one - the
-/// same degradation an empty value already gets.
+/// Only the *syntax* is decided. Existence is deliberately not checked: a typo
+/// would then be a hard failure, whereas the platforms' own answer for an
+/// unreadable image is to draw the card without one.
 pub fn image_source(app_icon: &str) -> Option<String> {
     let trimmed = app_icon.trim();
     if trimmed.is_empty() {
@@ -88,11 +84,9 @@ pub fn image_source(app_icon: &str) -> Option<String> {
 
 /// Whether `value` starts with a URI scheme rather than a Windows drive letter.
 ///
-/// RFC 3986 requires a scheme to begin with a letter. It also allows a
-/// single-character scheme, so the length test cannot do the work of telling a
-/// drive letter apart - but a drive letter only appears before a colon in the
-/// two-character form `C:`, where the prefix is exactly one character long. The
-/// "at least two" rule below is what keeps `C:/pics` on the conversion path.
+/// RFC 3986 requires a scheme to begin with a letter. A drive letter only
+/// appears in the two-character form `C:`, so the "at least two" rule below is
+/// what keeps `C:/pics` on the conversion path.
 pub fn has_uri_scheme(value: &str) -> bool {
     let Some((prefix, _)) = value.split_once(':') else {
         return false;
@@ -118,11 +112,9 @@ pub fn has_uri_scheme(value: &str) -> bool {
 /// Build a `file://` URI from a filesystem path.
 ///
 /// Backslashes become forward slashes because the URI grammar treats `\` as an
-/// ordinary character, so a Windows path kept verbatim would not resolve.
-/// Absolute paths get the authority-less form `file:///C:/...`; relative ones
-/// keep what the caller supplied, because UDA has no working directory to
-/// resolve them against and inventing one would be worse than passing the value
-/// through.
+/// ordinary character. Absolute paths get the authority-less form `file:///C:/...`;
+/// relative ones keep what the caller supplied, because UDA has no working
+/// directory to resolve them against.
 ///
 /// Absolute-ness comes from [`is_absolute_path`], which is host-independent.
 pub fn file_uri(path: &str) -> String {
@@ -132,31 +124,25 @@ pub fn file_uri(path: &str) -> String {
         return forward;
     }
 
-    // Exactly one slash must follow the `file://` authority marker. Concatenating
-    // blindly gives `file:////home/...` when the path already starts with a
-    // separator, and `file://C:/...` when it does not.
+    // Exactly one slash must follow the authority marker: concatenating blindly
+    // gives `file:////home/...` when the path already starts with a separator.
     format!("file:///{}", forward.trim_start_matches('/'))
 }
 
 /// Whether `path` names a location that does not depend on a working directory,
-/// on either platform's syntax.
+/// in either platform's syntax: a leading separator (`/home/u/a.png`) or a
+/// drive-letter root (`C:/a.png`).
 ///
-/// Two forms count: a leading separator (`/home/u/a.png`) and a drive-letter
-/// root (`C:/a.png`). `std::path::Path::is_absolute()` is deliberately *not*
-/// used, because it is host-dependent: on the Linux host that runs CI it reports
-/// `C:/pics/a.png` as relative, since POSIX accepts only a leading separator as a
-/// root. A Windows caller's icon would then silently lose its `file:///` prefix,
-/// and the tests asserting that form would pass nowhere.
-///
-/// Both separators are accepted after the drive letter, so the answer holds
-/// whether or not the caller has already normalised the string.
+/// `std::path::Path::is_absolute()` is deliberately *not* used because it is
+/// host-dependent: on the Linux host that runs CI it reports `C:/pics/a.png` as
+/// relative, so a Windows caller's icon would silently lose its `file:///` prefix.
 fn is_absolute_path(path: &str) -> bool {
     if path.starts_with('/') {
         return true;
     }
 
-    // `C:/...` - one ASCII letter, a colon, and a separator, i.e. the root of a
-    // drive rather than a stream name (`C:foo`) or a bare drive (`C:`).
+    // `C:/...` - one ASCII letter, a colon and a separator: the root of a drive
+    // rather than a stream name (`C:foo`) or a bare drive (`C:`).
     let mut characters = path.chars();
     let Some(drive) = characters.next() else {
         return false;
@@ -171,11 +157,9 @@ fn is_absolute_path(path: &str) -> bool {
     matches!(characters.next(), Some('/' | '\\'))
 }
 
-/// Decide what a card's `alt` text (the description a screen reader reads for
-/// the image) should be, if the caller named itself.
-///
-/// A blank name yields `None` so the caller can substitute a generic word: an
-/// empty `alt` is schema-valid on some platforms and silent to a screen reader.
+/// Decide what a card's `alt` text (read aloud for the image) should be. A blank
+/// name yields `None` so the caller can substitute a generic word: an empty `alt`
+/// is schema-valid on some platforms and silent to a screen reader.
 pub fn header_title(app_name: &str) -> Option<&str> {
     let trimmed = app_name.trim();
     if trimmed.is_empty() {

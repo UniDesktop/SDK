@@ -1,10 +1,8 @@
-//! Cross-platform media playback control interface.
-//!
-//! The model is deliberately small: one snapshot of what is playing, one enum of
-//! what a player can be told to do, and three read/act methods. It mirrors what
-//! both MPRIS v2 (Linux) and SMTC (Windows) can express; anything richer
-//! (seek, shuffle, queue inspection) is left to the platform traits because the
-//! two backends cannot agree on it.
+//! Cross-platform media playback control interface: one snapshot of what is
+//! playing, one enum of what a player can be told to do, and three read/act
+//! methods. It mirrors what both MPRIS v2 (Linux) and SMTC (Windows) can
+//! express; anything richer (seek, shuffle, queue inspection) is left to the
+//! platform traits because the two backends cannot agree on it.
 //!
 //! See `docs/internals/media_specs.md` for the protocol-level mapping.
 
@@ -13,10 +11,10 @@ use crate::error::UdaError;
 
 /// What the active player is doing right now.
 ///
-/// `Unknown` is a first-class state rather than an error: it covers "no session
-/// has focus" (Windows), "the player did not publish the property" (MPRIS), and
-/// "the bus answered but the value was unparseable". A caller must treat it as
-/// "cannot tell", never as `Paused`.
+/// `Unknown` is a first-class state, not an error: it covers "no session has
+/// focus" (Windows), "the player did not publish the property" (MPRIS), and "the
+/// bus answered with an unparseable value". Treat it as "cannot tell", never as
+/// `Paused`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlaybackStatus {
     /// Audio or video is actively progressing.
@@ -31,9 +29,8 @@ pub enum PlaybackStatus {
 }
 
 impl PlaybackStatus {
-    /// The C-ABI code for this status.
-    ///
-    /// The mapping is part of the ABI: renumbering it breaks every binding.
+    /// The C-ABI code for this status, part of the ABI: renumbering it breaks
+    /// every binding.
     pub const fn code(self) -> i32 {
         match self {
             Self::Playing => 0,
@@ -43,10 +40,9 @@ impl PlaybackStatus {
         }
     }
 
-    /// Recover a status from its C-ABI code.
-    ///
-    /// An unrecognised code becomes `Unknown` rather than an error, so an older
-    /// binding cannot make a newer library refuse to answer.
+    /// Recover a status from its C-ABI code. An unrecognised code becomes
+    /// `Unknown` rather than an error, so an older binding cannot make a newer
+    /// library refuse to answer.
     pub const fn from_code(code: i32) -> Self {
         match code {
             0 => Self::Playing,
@@ -60,8 +56,8 @@ impl PlaybackStatus {
 /// A snapshot of the track the active player is holding.
 ///
 /// Every field is owned and pre-joined for display: an MPRIS `xesam:artist` is a
-/// list, but a UI wants one string, so the platform backend does that join
-/// (`", "`) and the struct stays free of the wire types.
+/// list, but a UI wants one string, so the backend does the join and the struct
+/// stays free of the wire types.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaMetadata {
     /// Track title. Empty when the player publishes none.
@@ -79,11 +75,9 @@ pub struct MediaMetadata {
 }
 
 impl MediaMetadata {
-    /// Whether this snapshot carries no usable information at all.
-    ///
-    /// Used to turn "the player answered, but said nothing" into the same
-    /// `Ok(None)` a host with no player gets, so a binding never has to
-    /// distinguish the two.
+    /// Whether this snapshot carries no usable information at all, turning "the
+    /// player answered but said nothing" into the same `Ok(None)` a host with no
+    /// player gets.
     pub fn is_empty(&self) -> bool {
         self.title.is_empty()
             && self.artist.is_empty()
@@ -123,11 +117,9 @@ impl MediaCommand {
         }
     }
 
-    /// Recover a command from its C-ABI code.
-    ///
-    /// Returns `None` for an unrecognised code so the FFI boundary can report
-    /// `UDA_ERR_INVALID_ARGUMENT` instead of sending a bogus instruction to the
-    /// user's player.
+    /// Recover a command from its C-ABI code, returning `None` for an
+    /// unrecognised code so the FFI boundary reports `UDA_ERR_INVALID_ARGUMENT`
+    /// instead of sending a bogus instruction to the user's player.
     pub const fn from_code(code: i32) -> Option<Self> {
         match code {
             0 => Some(Self::Play),
@@ -143,25 +135,20 @@ impl MediaCommand {
 
 /// Read and drive the system's active media session.
 pub trait MediaManager {
-    /// Describe what the active player is holding.
-    ///
-    /// `Ok(None)` is the normal answer when nothing is playing *or* when no
-    /// player responds; it is not a failure. A platform that cannot answer at
-    /// all returns [`UdaError::NotSupported`].
+    /// Describe what the active player is holding. `Ok(None)` is the normal
+    /// answer when nothing is playing or no player responds, not a failure; a
+    /// platform that cannot answer at all returns [`UdaError::NotSupported`].
     fn active_metadata(&self) -> Result<Option<MediaMetadata>, UdaError>;
 
-    /// Report what the active player is doing.
-    ///
-    /// Returns [`PlaybackStatus::Unknown`] when there is no session or the state
-    /// cannot be read, rather than an error.
+    /// Report what the active player is doing, returning
+    /// [`PlaybackStatus::Unknown`] when there is no session or the state cannot
+    /// be read rather than an error.
     fn playback_status(&self) -> Result<PlaybackStatus, UdaError>;
 
-    /// Send `command` to the active player.
-    ///
-    /// A player that refuses the command (pausing an already-paused stream, for
-    /// instance) is a successful call: the platform cannot distinguish "declined"
-    /// from "done" through these APIs, and reporting an error would make a
-    /// perfectly normal toggle look like a failure.
+    /// Send `command` to the active player. A player that refuses the command
+    /// (pausing an already-paused stream, for instance) is still a successful
+    /// call: the platform cannot distinguish "declined" from "done", and an error
+    /// would make a normal toggle look like a failure.
     fn send_command(&self, command: MediaCommand) -> Result<(), UdaError>;
 
     /// The capabilities this platform's media backend can honour.
@@ -174,8 +161,7 @@ mod tests {
 
     #[test]
     fn playback_status_codes_are_stable() {
-        // These numbers are part of the C ABI (see include/uda.h), so a change
-        // here silently breaks every binding.
+        // These numbers are part of the C ABI (see include/uda.h).
         assert_eq!(PlaybackStatus::Playing.code(), 0);
         assert_eq!(PlaybackStatus::Paused.code(), 1);
         assert_eq!(PlaybackStatus::Stopped.code(), 2);
@@ -196,8 +182,7 @@ mod tests {
 
     #[test]
     fn an_unknown_status_code_degrades_to_unknown() {
-        // An older binding must be able to talk to a newer library that added a
-        // state; guessing one of the known states would be worse.
+        // An older binding must talk to a newer library that added a state.
         assert_eq!(PlaybackStatus::from_code(99), PlaybackStatus::Unknown);
         assert_eq!(PlaybackStatus::from_code(-1), PlaybackStatus::Unknown);
     }
@@ -228,16 +213,12 @@ mod tests {
 
     #[test]
     fn an_unknown_command_code_is_rejected_rather_than_guessed() {
-        // Sending a bogus instruction to the user's player is worse than
-        // refusing the call, so this must stay `None`.
         assert_eq!(MediaCommand::from_code(6), None);
         assert_eq!(MediaCommand::from_code(-1), None);
     }
 
     #[test]
     fn a_default_metadata_is_empty() {
-        // `is_empty` is what turns "the player said nothing" into the same
-        // `Ok(None)` a host with no player produces.
         assert!(MediaMetadata::default().is_empty());
     }
 
