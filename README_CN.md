@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/release-v0.2.0-brightgreen)](https://github.com/UniDesktop/SDK/releases)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20(GNOME%20%2F%20KDE%20%2F%20Wayland)-lightgrey.svg)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey.svg)
 
@@ -15,11 +16,6 @@
 </div>
 
 ---
-
-> [!IMPORTANT]
-> 📚 **完整文档 —— 安装指南、能力教程、API 参考与常见问题 —— 见 [UniDesktop.github.io/Website](https://unidesktop.github.io/Website/)。**
->
-> 本页是项目名片：UDA 是什么、覆盖哪些能力、各 crate 如何分工。
 
 ## 为什么需要 UDA？
 
@@ -44,7 +40,7 @@
 | **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
 | **通用 X11** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
 
-`✅` 已对真实后端验证 · `⚠️` 尽力而为的回退 —— 精确能力在运行时由 `capabilities()` 上报。
+`✅` 已对真实系统验证 · `⚠️` 尽力而为的回退 —— 精确能力在运行时由 `capabilities()` 上报。
 
 [^1]: Windows 通知有两处平台限制。在 **Microsoft Store 运行时**中，toast 来源显示为宿主的包系列名，因为 Package Identity 会覆盖 AppUserModelID。在**未打包的脚本宿主**中，交互式*操作按钮*降级为只读文本卡片，因为 toast 按钮需要 MSIX 包注册的 COM activator。详见 [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3。
 

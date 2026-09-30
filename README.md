@@ -7,6 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/release-v0.2.0-brightgreen)](https://github.com/UniDesktop/SDK/releases)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20(GNOME%20%2F%20KDE%20%2F%20Wayland)-lightgrey.svg)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey.svg)
 
@@ -15,11 +16,6 @@
 </div>
 
 ---
-
-> [!IMPORTANT]
-> 📚 **Complete documentation — installation, guides, API reference and FAQ — lives at [UniDesktop.github.io/Website](https://unidesktop.github.io/Website/).**
->
-> This page is the project card: what UDA is, what it covers, and how the crates fit together.
 
 ## Why UDA?
 
