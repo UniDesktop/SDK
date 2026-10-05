@@ -756,8 +756,9 @@ impl StatusNotifierItemInterface {
 
     /// Object path of the `com.canonical.dbusmenu` implementation.
     #[zbus(property)]
-    fn menu(&self) -> &'static str {
-        MENU_PATH
+    fn menu(&self) -> zvariant::ObjectPath<'static> {
+        // MENU_PATH is a fixed, valid object path, not application input.
+        zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH)
     }
 
     /// Emitted when the tooltip changed.
@@ -1642,6 +1643,13 @@ mod tests {
         server
             .object_server()
             .at(
+                SNI_PATH,
+                StatusNotifierItemInterface::new(Arc::clone(&shared)),
+            )
+            .await?;
+        server
+            .object_server()
+            .at(
                 MENU_PATH,
                 DBusMenuInterface::new(Arc::clone(&shared), Arc::new(Mutex::new(1))),
             )
@@ -1650,6 +1658,24 @@ mod tests {
             .unique_name()
             .ok_or("session connection has no unique name")?;
         let client = zbus::Connection::session().await?;
+
+        // Hosts discover the menu through SNI. A string with the same text
+        // is not an object path and makes Plasma fall back to ContextMenu().
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                SNI_PATH,
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.kde.StatusNotifierItem", "Menu"),
+            ),
+        )
+        .await??;
+        let value: zvariant::OwnedValue = reply.body().deserialize()?;
+        assert_eq!(value.value_signature().as_str(), "o");
+        let menu_path = zvariant::ObjectPath::try_from(value)?;
+        assert_eq!(menu_path.as_str(), MENU_PATH);
 
         for (menu, count) in [
             (None, 0),
@@ -1661,7 +1687,7 @@ mod tests {
                 Duration::from_secs(3),
                 client.call_method(
                     Some(destination.as_str()),
-                    MENU_PATH,
+                    menu_path.as_str(),
                     Some("com.canonical.dbusmenu"),
                     "GetLayout",
                     &(0i32, -1i32, Vec::<String>::new()),
@@ -1701,7 +1727,7 @@ mod tests {
             Duration::from_secs(3),
             client.call_method(
                 Some(destination.as_str()),
-                MENU_PATH,
+                menu_path.as_str(),
                 Some("com.canonical.dbusmenu"),
                 "Event",
                 &(1i32, "clicked", zvariant::Value::new(0i32), 0u32),
