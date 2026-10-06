@@ -319,11 +319,11 @@ impl MenuRow {
 /// An owned property map, as the dbusmenu replies need `'static` payloads.
 type OwnedProps = HashMap<String, zvariant::OwnedValue>;
 
-/// The encoded child list of a dbusmenu node: `a(ia{sv}v)`.
-type MenuChildren = Vec<(i32, OwnedProps, zvariant::OwnedValue)>;
+/// Children are variants containing complete `(ia{sv}av)` nodes.
+type MenuChildren = Vec<zvariant::OwnedValue>;
 
-/// One dbusmenu layout node: `(ia{sv}ia{sv}v)`.
-type MenuNode = (i32, OwnedProps, MenuChildren, zvariant::OwnedValue);
+/// The standard dbusmenu layout node: `(ia{sv}av)`.
+type MenuNode = (i32, OwnedProps, MenuChildren);
 
 /// The cheap in-memory property map a row exposes: `'static` keys and borrowed
 /// values. [`owned_props`] converts it for the wire.
@@ -345,24 +345,6 @@ fn owned_props(props: HashMap<&'static str, zvariant::Value<'_>>) -> OwnedProps 
                 .map(|owned| (key.to_string(), owned))
         })
         .collect()
-}
-
-/// An empty variant payload, filling dbusmenu's `v` "no icon" slots.
-///
-/// A zero-field structure is the canonical filler: it serialises to a valid
-/// variant body without asserting a concrete type on the receiving side, which a
-/// bare unit would not express.
-fn empty_variant() -> zvariant::OwnedValue {
-    let filler = zvariant::StructureBuilder::new().build();
-    match zvariant::Value::from(filler).try_to_owned() {
-        Ok(owned) => owned,
-        // Unreachable for a zero-field structure; routing through the same
-        // encoder used for children keeps the function total without an `expect`.
-        Err(error) => {
-            log::warn!("tray could not encode an empty variant: {error}");
-            empty_variant_with(Vec::new())
-        }
-    }
 }
 
 /// A snapshot of the menu attached to an icon, taken per request, with callbacks
@@ -390,19 +372,14 @@ impl MenuSnapshot {
         MenuRow::find(&self.rows, id)
     }
 
-    /// Encode the whole tree as the `GetLayout` root node: id 0, no properties,
-    /// and the top-level rows each wrapped in a variant so the wire signature
-    /// stays `(ia{sv}ia{sv}v)`.
-    fn root_node(&self, recurse: bool) -> MenuNode {
-        let children: MenuChildren = self
+    /// Encode the root with each child represented as a complete node variant.
+    fn root_node(&self, recurse: bool) -> Result<MenuNode, zvariant::Error> {
+        let children = self
             .rows
             .iter()
-            .map(|row| {
-                let node = layout_node(row, recurse);
-                (node.0, node.1, empty_variant_with(node.2))
-            })
-            .collect();
-        (0, OwnedProps::new(), children, empty_variant())
+            .map(|row| zvariant::Value::new(layout_node(row, recurse)?).try_to_owned())
+            .collect::<Result<MenuChildren, _>>()?;
+        Ok((0, OwnedProps::new(), children))
     }
 
     /// The owned id/property pairs for `GetGroupProperties`.
@@ -430,35 +407,16 @@ impl MenuSnapshot {
 }
 
 /// Encode a row into a layout node, recursing when asked.
-fn layout_node(row: &MenuRow, recurse: bool) -> MenuNode {
-    let children: MenuChildren = if recurse {
+fn layout_node(row: &MenuRow, recurse: bool) -> Result<MenuNode, zvariant::Error> {
+    let children = if recurse {
         row.children
             .iter()
-            .map(|child| {
-                let node = layout_node(child, true);
-                (node.0, node.1, empty_variant_with(node.2))
-            })
-            .collect()
+            .map(|child| zvariant::Value::new(layout_node(child, true)?).try_to_owned())
+            .collect::<Result<MenuChildren, _>>()?
     } else {
         Vec::new()
     };
-    (
-        row.id,
-        owned_props(row_properties(row)),
-        children,
-        empty_variant(),
-    )
-}
-
-/// Wrap an already-encoded child list in a variant.
-fn empty_variant_with(children: MenuChildren) -> zvariant::OwnedValue {
-    match zvariant::Value::new(children).try_to_owned() {
-        Ok(owned) => owned,
-        Err(error) => {
-            log::warn!("tray menu children could not be encoded: {error}");
-            empty_variant()
-        }
-    }
+    Ok((row.id, owned_props(row_properties(row)), children))
 }
 
 // ---------------------------------------------------------------------------
@@ -798,8 +756,9 @@ impl StatusNotifierItemInterface {
 
     /// Object path of the `com.canonical.dbusmenu` implementation.
     #[zbus(property)]
-    fn menu(&self) -> &'static str {
-        MENU_PATH
+    fn menu(&self) -> zvariant::ObjectPath<'static> {
+        // MENU_PATH is a fixed, valid object path, not application input.
+        zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH)
     }
 
     /// Emitted when the tooltip changed.
@@ -865,10 +824,12 @@ impl DBusMenuInterface {
     ) -> zbus::fdo::Result<(u32, MenuNode)> {
         let recurse = recursion_depth <= 0 || recursion_depth > 1;
         let root = match self.menu_snapshot() {
-            Some(snapshot) => snapshot.root_node(recurse),
+            Some(snapshot) => snapshot
+                .root_node(recurse)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
             // No menu attached: report an empty root so the shell renders
             // nothing instead of surfacing an error.
-            None => (0, HashMap::new(), Vec::new(), empty_variant()),
+            None => (0, HashMap::new(), Vec::new()),
         };
         Ok((self.revision(), root))
     }
@@ -1643,13 +1604,148 @@ mod tests {
     }
 
     #[test]
+    fn layout_matches_the_dbusmenu_wire_signature() {
+        use zvariant::Type;
+        assert_eq!(MenuNode::signature().as_str(), "(ia{sv}av)");
+        let menu = sample_menu();
+        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("menu");
+        let root = snapshot.root_node(true).expect("root");
+        for child in &root.2 {
+            assert_eq!(child.value_signature().as_str(), "(ia{sv}av)");
+        }
+        let request = zbus::Message::method("/MenuBar", "GetLayout")
+            .expect("method")
+            .build(&(0i32, -1i32, Vec::<String>::new()))
+            .expect("request");
+        let reply = zbus::Message::method_reply(&request)
+            .expect("reply")
+            .build(&(1u32, root))
+            .expect("valid D-Bus message");
+        let (_revision, decoded): (u32, MenuNode) = reply.body().deserialize().expect("decode");
+        assert_eq!(decoded.2.len(), 5);
+    }
+
+    /// Run inside `dbus-run-session`. A local message round trip alone does
+    /// not catch invalid payloads that the bus rejects by disconnecting us.
+    #[tokio::test]
+    async fn get_layout_survives_session_bus_transport() -> Result<(), Box<dyn std::error::Error>> {
+        // Use the protocol type independently of the implementation alias.
+        type WireNode = (
+            i32,
+            HashMap<String, zvariant::OwnedValue>,
+            Vec<zvariant::OwnedValue>,
+        );
+
+        let shared = Arc::new(Mutex::new(TrayShared::from_config(&TrayIconConfig::new(
+            "LayoutTransportTest",
+        ))));
+        let server = zbus::Connection::session().await?;
+        server
+            .object_server()
+            .at(
+                SNI_PATH,
+                StatusNotifierItemInterface::new(Arc::clone(&shared)),
+            )
+            .await?;
+        server
+            .object_server()
+            .at(
+                MENU_PATH,
+                DBusMenuInterface::new(Arc::clone(&shared), Arc::new(Mutex::new(1))),
+            )
+            .await?;
+        let destination = server
+            .unique_name()
+            .ok_or("session connection has no unique name")?;
+        let client = zbus::Connection::session().await?;
+
+        // Hosts discover the menu through SNI. A string with the same text
+        // is not an object path and makes Plasma fall back to ContextMenu().
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                SNI_PATH,
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.kde.StatusNotifierItem", "Menu"),
+            ),
+        )
+        .await??;
+        let value: zvariant::OwnedValue = reply.body().deserialize()?;
+        assert_eq!(value.value_signature().as_str(), "o");
+        let menu_path = zvariant::ObjectPath::try_from(value)?;
+        assert_eq!(menu_path.as_str(), MENU_PATH);
+
+        for (menu, count) in [
+            (None, 0),
+            (Some(Arc::new(uda_core::tray::TrayMenu::new())), 0),
+            (Some(sample_menu()), 5),
+        ] {
+            lock_or_recover(&shared, "test menu").menu = menu;
+            let reply = tokio::time::timeout(
+                Duration::from_secs(3),
+                client.call_method(
+                    Some(destination.as_str()),
+                    menu_path.as_str(),
+                    Some("com.canonical.dbusmenu"),
+                    "GetLayout",
+                    &(0i32, -1i32, Vec::<String>::new()),
+                ),
+            )
+            .await??;
+            assert_eq!(
+                reply
+                    .body()
+                    .signature()
+                    .ok_or("missing reply signature")?
+                    .as_str(),
+                "u(ia{sv}av)"
+            );
+            let (revision, root): (u32, WireNode) = reply.body().deserialize()?;
+            assert_eq!(revision, 1);
+            assert_eq!(root.0, 0);
+            assert_eq!(root.2.len(), count);
+            if count != 0 {
+                let submenu = WireNode::try_from(root.2[4].try_clone()?)?;
+                assert_eq!(submenu.2.len(), 1);
+                let leaf = WireNode::try_from(submenu.2[0].try_clone()?)?;
+                assert_eq!(<&str>::try_from(&leaf.1["label"])?, "inner");
+                assert!(leaf.2.is_empty());
+            }
+        }
+
+        // A menu event must still reach the application after layout reads.
+        let fired = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&fired);
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        menu.push(MenuItem::text_with_action("open", move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }))?;
+        lock_or_recover(&shared, "test menu").menu = Some(menu);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                menu_path.as_str(),
+                Some("com.canonical.dbusmenu"),
+                "Event",
+                &(1i32, "clicked", zvariant::Value::new(0i32), 0u32),
+            ),
+        )
+        .await??;
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
     fn the_layout_root_carries_id_zero() {
         let menu = sample_menu();
         let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
-        let root = snapshot.root_node(true);
+        let root = snapshot.root_node(true).expect("layout encoding");
         assert_eq!(root.0, 0, "dbusmenu's root id is 0");
         assert_eq!(root.2.len(), 5);
-        let child = snapshot.root_node(false);
+        let child = snapshot.root_node(false).expect("layout encoding");
         // A non-recursive request must still name the children, so the shell can
         // ask for a submenu on demand.
         assert_eq!(child.2.len(), 5);
@@ -1660,7 +1756,7 @@ mod tests {
         let snapshot = MenuSnapshot::from_menu(Some(&Arc::new(uda_core::tray::TrayMenu::new())))
             .expect("an empty menu is a valid menu");
         assert!(snapshot.rows.is_empty());
-        let root = snapshot.root_node(true);
+        let root = snapshot.root_node(true).expect("layout encoding");
         assert_eq!(root.2.len(), 0);
     }
 

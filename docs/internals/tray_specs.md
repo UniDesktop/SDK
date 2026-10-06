@@ -114,7 +114,7 @@ property, usually `/MenuBar`.
 
 | Member | Signature | Notes |
 |---|---|---|
-| **Methods** `GetLayout` | `(i parentId, i recursionDepth, as propertyNames) -> (u revision, (ia{sv}ia{sv}v))` | `recursionDepth` of 0 means "unlimited". Returns the item tree. |
+| **Methods** `GetLayout` | `(i parentId, i recursionDepth, as propertyNames) -> (u revision, (ia{sv}av))` | `recursionDepth` of 0 means "unlimited". Returns the item tree. |
 | `GetGroupProperties` | `(ai ids, as propertyNames) -> a(ia{sv})` | For incremental updates. |
 | `GetProperty` | `(i id, s name) -> v` | |
 | `Event` | `(i id, s eventId, v data, u timestamp)` | `eventId` is `"clicked"` or `"hovered"`. |
