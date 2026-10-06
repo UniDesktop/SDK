@@ -778,7 +778,7 @@ class Uda:
         示例::
 
             uda.notify("下载完成", "report.pdf 已保存到 ~/Downloads")
-            uda.notify("更新可用", "v0.2.0 已发布", actions={"open": "查看详情"},
+            uda.notify("更新可用", "v0.2.1 已发布", actions={"open": "查看详情"},
                        app_name="我的应用")
         """
         flat = ""

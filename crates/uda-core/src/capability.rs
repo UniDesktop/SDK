@@ -76,14 +76,28 @@ bitflags! {
 }
 
 /// Support level for a specific capability on the current platform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Partial` carries the reason it exists: a host that needs to explain a
+/// degraded behaviour to the user must not have to guess why.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportLevel {
     /// Capability is unavailable.
     None,
-    /// Capability is partially available (e.g., limited monitors, modes, or formats).
-    Partial,
+    /// Capability is available in a degraded form, with the reason attached.
+    Partial(String),
     /// Capability is fully supported.
     Full,
+}
+
+impl SupportLevel {
+    /// The reason a capability is degraded, when it is.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Partial(reason) => Some(reason.as_str()),
+            _ => None,
+        }
+    }
 }
 
 /// System desktop theme / appearance mode.
@@ -95,6 +109,13 @@ pub enum Theme {
     Dark,
     /// Follow system automatic switching.
     Auto,
+    /// No desktop publishes a colour scheme, so the preference is unknown.
+    ///
+    /// This is deliberately distinct from [`Theme::Auto`]: `Auto` means "the
+    /// system switches the theme itself", while `Unknown` means the question
+    /// could not be answered at all. Guessing `Light` would make a UI pretend
+    /// it knew the answer on a tiling window manager.
+    Unknown,
 }
 
 /// RGBA color with per-channel 0..=255 values.
@@ -104,4 +125,39 @@ pub struct RgbaColor {
     pub g: u8,
     pub b: u8,
     pub a: u8,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_carries_a_reason_that_can_be_read_back() {
+        let level = SupportLevel::Partial("double click is synthesised from two clicks".into());
+        assert_eq!(
+            level.reason(),
+            Some("double click is synthesised from two clicks")
+        );
+    }
+
+    #[test]
+    fn full_and_none_have_no_reason() {
+        assert_eq!(SupportLevel::Full.reason(), None);
+        assert_eq!(SupportLevel::None.reason(), None);
+    }
+
+    #[test]
+    fn partial_reasons_participate_in_equality() {
+        // Two degraded answers are only equal when their reasons match, so a
+        // host cannot accidentally treat a different degradation as the same one.
+        assert_eq!(
+            SupportLevel::Partial("a".into()),
+            SupportLevel::Partial("a".into())
+        );
+        assert_ne!(
+            SupportLevel::Partial("a".into()),
+            SupportLevel::Partial("b".into())
+        );
+        assert_ne!(SupportLevel::Partial("a".into()), SupportLevel::Full);
+    }
 }

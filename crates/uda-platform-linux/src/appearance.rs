@@ -17,7 +17,12 @@ use uda_core::error::UdaError;
 ///    - `kdeglobals` -> `General` -> `ColorScheme`
 /// 4. **XFCE** (`xfconf-query`):
 ///    - `xfce4-desktop` related theme settings
-/// 5. **Default**: `Theme::Light`
+/// 5. **Default**: `Theme::Unknown`
+///
+/// The fallback is `Unknown` rather than `Light`: on a tiling window manager no
+/// desktop component publishes a colour scheme, so the honest answer is "this
+/// could not be determined". Returning `Light` would tell a host application
+/// something the backend does not actually know.
 ///
 /// Accent color detection is GNOME-only in this phase and may return
 /// `UdaError::NotSupported` on other desktops or when parsing fails.
@@ -222,7 +227,7 @@ impl AppearanceManager for LinuxAppearanceManager {
             return Ok(theme);
         }
 
-        Ok(Theme::Light)
+        Ok(Theme::Unknown)
     }
 
     fn get_accent_color(&self) -> Result<RgbaColor, UdaError> {

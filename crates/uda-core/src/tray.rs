@@ -80,8 +80,9 @@ pub type TrayEventHandler = Box<dyn FnMut(&TrayEvent) + Send + 'static>;
 /// NUL terminator, so 127 is the safety cap used cross-platform.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
 
-/// Preferred tooltip length. Text longer than this triggers a
-/// [`SupportLevel::Partial`] report rather than silent clipping.
+/// Preferred tooltip length. Text longer than this is clamped, and the backend
+/// reports [`SupportLevel::Partial`] with the truncation stated as the reason
+/// rather than clipping silently.
 pub const TOOLTIP_TARGET_CHARS: usize = 80;
 
 /// Truncate `text` to at most `limit` `char`s without splitting a `char`,
@@ -954,7 +955,7 @@ impl TrayIconBuilder {
     }
 
     /// Tooltip text. Over-long values are clamped by the backend, which then
-    /// reports [`SupportLevel::Partial`].
+    /// reports [`SupportLevel::Partial`] carrying the truncation as its reason.
     #[must_use]
     pub fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
         self.config.tooltip = tooltip.into();
@@ -1285,7 +1286,7 @@ impl TrayIcon {
             other if capabilities.contains(feature_flag(other)) => SupportLevel::Full,
             // An absent flag is a plain `None`; `Partial` is reserved for a
             // backend that publishes a degraded answer explicitly (e.g. Linux
-            // double-click synthesis).
+            // double-click synthesis), together with the reason it is degraded.
             other => {
                 log::debug!(
                     "tray feature '{other}' is not reported by this backend; treating it as unavailable"

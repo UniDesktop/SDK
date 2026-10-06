@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/release-v0.2.0-brightgreen)](https://github.com/UniDesktop/SDK/releases)
+[![Version](https://img.shields.io/badge/release-v0.2.1-brightgreen)](https://github.com/UniDesktop/SDK/releases)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20(GNOME%20%2F%20KDE%20%2F%20Wayland)-lightgrey.svg)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey.svg)
 
@@ -23,26 +23,34 @@
 
 | 原则 | 含义 |
 | --- | --- |
-| **Portal 优先** | 每个 Linux 能力都先尝试 XDG Desktop Portal，再触碰发行版特有接口。 |
-| **级联回退** | Portal → 原生 DE IPC（`$XDG_CURRENT_DESKTOP`）→ CLI 工具（`swww`、`hyprpaper` …）→ 类型化 `UdaError::Unsupported`。全程不 panic。 |
-| **能力驱动** | 每个能力上报 `SupportLevel::Full` / `Restricted` / `Unsupported`，让你的应用*在出错之前*分流。 |
+| **级联回退** | XDG Desktop Portal → 原生 DE IPC（`$XDG_CURRENT_DESKTOP`）→ CLI 工具（`swww`、`hyprpaper` …）→ 类型化 `UdaError::NotSupported`。全程不 panic。并非所有模块都走第一级：壁纸与防休眠直接从第二级开始，目前只有外观检测通过 `org.freedesktop.portal.Settings` 使用 Portal。 |
+| **能力驱动** | 每个能力上报 `SupportLevel::Full` / `Partial(reason)` / `None`，让你的应用*在出错之前*分流。`Partial` 携带原因，降级可以被解释而不是被猜测。 |
 | **零重依赖** | Linux 用纯 Rust `zbus`，Windows 用 `windows-rs`。不引入 Qt、GTK 或任何打包工具链。 |
 
 ## 🖥️ 桌面环境与平台支持矩阵
 
-| 平台 / 桌面 | 主题 | 壁纸 | 通知 | 常亮锁 | 托盘 | 媒体 | 会话 |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Windows 10 / 11** | ✅ | ✅ | ✅ [^1] | ✅ | ✅ | ✅ | ✅ |
-| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **XFCE** | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
-| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
-| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
-| **通用 X11** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| 功能 | Windows 10/11 | GNOME 42+ | KDE Plasma 5/6 | XFCE | Hyprland | Sway | 通用 X11 |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 主题检测 | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| 强调色 | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ | ❌ |
+| 壁纸 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 通知 | ✅ [^1] | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| 通知图标 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 通知按钮 | ⚠️ [^2] | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 防休眠锁 | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| 系统托盘 | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
+| 媒体播控 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 会话 —— 锁屏 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 会话 —— 注销 | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| 会话 —— 睡眠 / 休眠 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 会话 —— 重启 / 关机 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-`✅` 已对真实系统验证 · `⚠️` 尽力而为的回退 —— 精确能力在运行时由 `capabilities()` 上报。
+`✅` 已对真实系统验证 · `⚠️` 尽力而为的回退或依赖额外组件 · `❌` 平台无此概念。精确能力始终由运行时的 `capabilities()` / `support_level()` 上报 —— 不要以本表作为假设依据。
 
-[^1]: Windows 通知有两处平台限制。在 **Microsoft Store 运行时**中，toast 来源显示为宿主的包系列名，因为 Package Identity 会覆盖 AppUserModelID。在**未打包的脚本宿主**中，交互式*操作按钮*降级为只读文本卡片，因为 toast 按钮需要 MSIX 包注册的 COM activator。详见 [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3。
+[^1]: 在 **Microsoft Store 运行时**中，toast 来源显示为宿主的包系列名，因为 Package Identity 会覆盖 AppUserModelID。详见 [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3.1。
+[^2]: 在**未打包的脚本宿主**中，交互式*操作按钮*降级为只读文本卡片，因为 toast 按钮需要 MSIX 包注册的 COM activator。详见同一文档 §3.2。
+
+每一格所用的后端、⚠️ 的实际行为与各环境的上报结果：**[平台支持矩阵](https://unidesktop.github.io/reference/platform-support/)**。
 
 ## 🚀 三种语言快速上手
 
@@ -89,10 +97,10 @@ uda/
 
 | 模块 | Linux 后端 | Windows 后端 |
 | --- | --- | --- |
-| 外观 | FreeDesktop portal `Settings` + GSettings | 注册表 `AppsUseLightTheme` |
-| 壁纸 | Portal background → GSettings → KDE D-Bus → `swww` / `hyprpaper` / `feh` | `SystemParametersInfoW` |
+| 外观 | FreeDesktop portal `Settings` → GSettings → `kreadconfig` → `xfconf-query`；全部无结果时返回 `Theme::Unknown` | 注册表 `AppsUseLightTheme` / `SystemUsesLightTheme` |
+| 壁纸 | GSettings → KDE `plasmashell` D-Bus → `hyprpaper` / `swww` → `feh` / `nitrogen`。不使用 Portal：`org.freedesktop.portal.Wallpaper` 存在但从未被调用 | `SystemParametersInfoW` |
 | 通知 | `org.freedesktop.Notifications` | WinRT `ToastNotificationManager` |
-| 常亮锁 | `org.freedesktop.ScreenSaver` → XDG Inhibit | `SetThreadExecutionState` |
+| 常亮锁 | `org.freedesktop.ScreenSaver` 的 `Inhibit` | `SetThreadExecutionState` |
 | 系统托盘 | `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu` | `Shell_NotifyIconW` + 工作线程消息泵 |
 | 媒体 | 会话总线上的 MPRIS v2 | WinRT SMTC |
 | 会话与电源 | `systemd-logind` + `org.freedesktop.ScreenSaver` | Win32 电源与关机 API |

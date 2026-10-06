@@ -7,7 +7,7 @@
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](https://www.rust-lang.org)
 [![CI](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/UniDesktop/SDK/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/release-v0.2.0-brightgreen)](https://github.com/UniDesktop/SDK/releases)
+[![Version](https://img.shields.io/badge/release-v0.2.1-brightgreen)](https://github.com/UniDesktop/SDK/releases)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux%20(GNOME%20%2F%20KDE%20%2F%20Wayland)-lightgrey.svg)
 ![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey.svg)
 
@@ -23,26 +23,34 @@ Building a cross-platform desktop application today means writing the same featu
 
 | Principle | What it means |
 |---|---|
-| **Portal-first** | Every Linux feature tries the XDG Desktop Portal before touching anything distro-specific. |
-| **Cascading fallback** | Portal → native DE IPC (`$XDG_CURRENT_DESKTOP`) → CLI tools (`swww`, `hyprpaper`, …) → a typed `UdaError::Unsupported`. Never a panic. |
-| **Capability-driven** | Features advertise `SupportLevel::Full` / `Restricted` / `Unsupported`, so your app branches *before* it breaks. |
+| **Cascading fallback** | XDG Desktop Portal → native DE IPC (`$XDG_CURRENT_DESKTOP`) → CLI tools (`swww`, `hyprpaper`, …) → a typed `UdaError::NotSupported`. Never a panic. Not every module uses Tier 1: wallpaper and wake locks start at Tier 2, and appearance detection is the only module that engages the portal, through `org.freedesktop.portal.Settings`. |
+| **Capability-driven** | Features advertise `SupportLevel::Full` / `Partial(reason)` / `None`, so your app branches *before* it breaks. `Partial` carries the reason, so a degradation can be explained rather than guessed at. |
 | **Zero heavy runtime dependencies** | Pure Rust `zbus` on Linux, `windows-rs` on Windows. No Qt, no GTK, no bundled toolkit. |
 
 ## 🖥️ Platform Support Matrix
 
-| Platform / DE | Theme | Wallpaper | Notification | WakeLock | Tray | Media | Session |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Windows 10 / 11** | ✅ | ✅ | ✅ [^1] | ✅ | ✅ | ✅ | ✅ |
-| **GNOME 42+** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **KDE Plasma 5 / 6** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **XFCE** | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ |
-| **Hyprland** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
-| **Sway** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
-| **Generic X11** | ⚠️ | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | ✅ |
+| Feature | Windows 10/11 | GNOME 42+ | KDE Plasma 5/6 | XFCE | Hyprland | Sway | Generic X11 |
+|------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Theme detection | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| Accent colour | ✅ | ✅ | ⚠️ | ⚠️ | ❌ | ❌ | ❌ |
+| Wallpaper | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Notification | ✅ [^1] | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| Notification icon | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Notification actions | ⚠️ [^2] | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Wake lock | ✅ | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ |
+| System tray | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ✅ |
+| Media control | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Session — lock | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Session — logout | ✅ | ✅ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
+| Session — suspend / hibernate | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Session — reboot / shutdown | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
-`✅` verified against the real backend · `⚠️` best-effort fallback — the exact capability is reported at runtime through `capabilities()`.
+`✅` verified against the real backend · `⚠️` best-effort fallback or an extra component · `❌` the platform has no such concept. The exact capability is always reported at runtime through `capabilities()` / `support_level()` — never assume from this table.
 
-[^1]: Windows notifications carry two platform restrictions. On a **Microsoft Store–installed runtime**, the toast source is shown as the host's package family name because Package Identity overrides the AppUserModelID. In an **unpackaged script host**, interactive *action buttons* degrade to a read-only text card, because toast buttons require a COM activator registered by an MSIX package. See [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3.
+[^1]: On a **Microsoft Store–installed runtime**, the toast source is shown as the host's package family name because Package Identity overrides the AppUserModelID. See [`docs/internals/notification_specs.md`](docs/internals/notification_specs.md) §3.1.
+[^2]: In an **unpackaged script host**, interactive *action buttons* degrade to a read-only text card, because toast buttons require a COM activator registered by an MSIX package. See the same document §3.2.
+
+The per-cell backend, the ⚠️ behaviour and what each environment reports: **[Platform support](https://unidesktop.github.io/en/reference/platform-support/)**.
 
 ## 🚀 Quickstart in 3 Languages
 
@@ -70,7 +78,7 @@ uda.notify('标题', '正文内容');
 uda.dispose();
 ```
 
-Full install steps, capability guides and the complete API reference: **[unidesktop.github.io](https://unidesktop.github.io/)**.
+Full install steps, capability guides and the complete API reference: **[unidesktop.github.io](https://unidesktop.github.io/en)**.
 
 ## 🏗️ Architecture & Project Layout
 
@@ -89,10 +97,10 @@ uda/
 
 | Module | Linux backend | Windows backend |
 |---|---|---|
-| Appearance | FreeDesktop portal `Settings` + GSettings | Registry `AppsUseLightTheme` |
-| Wallpaper | Portal background → GSettings → KDE D-Bus → `swww` / `hyprpaper` / `feh` | `SystemParametersInfoW` |
+| Appearance | FreeDesktop portal `Settings` → GSettings → `kreadconfig` → `xfconf-query`; `Theme::Unknown` when nothing answers | Registry `AppsUseLightTheme` / `SystemUsesLightTheme` |
+| Wallpaper | GSettings → KDE `plasmashell` D-Bus → `hyprpaper` / `swww` → `feh` / `nitrogen`. No portal: `org.freedesktop.portal.Wallpaper` exists but is never called | `SystemParametersInfoW` |
 | Notification | `org.freedesktop.Notifications` | WinRT `ToastNotificationManager` |
-| WakeLock | `org.freedesktop.ScreenSaver` → XDG Inhibit | `SetThreadExecutionState` |
+| WakeLock | `org.freedesktop.ScreenSaver` `Inhibit` | `SetThreadExecutionState` |
 | System tray | `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu` | `Shell_NotifyIconW` + worker-thread message pump |
 | Media | MPRIS v2 over the session bus | WinRT SMTC |
 | Session & power | `systemd-logind` + `org.freedesktop.ScreenSaver` | Win32 power & shutdown APIs |

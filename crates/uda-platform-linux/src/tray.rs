@@ -1313,7 +1313,7 @@ impl TrayManager for LinuxTrayManager {
         };
         // An unclaimed flag is a plain `None`: a backend either answers for a
         // feature or does not, and `Partial` stays reserved for a backend that
-        // publishes a degraded answer explicitly.
+        // publishes a degraded answer explicitly, stated with its reason.
         if capabilities.contains(flag) {
             SupportLevel::Full
         } else {

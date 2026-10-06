@@ -60,9 +60,9 @@ impl WakeLockHandle {
 
 /// Detect the system colour scheme and map it onto the C ABI's integer codes.
 ///
-/// Returns `0` (unknown), `1` (dark) or `2` (light). `Theme::Auto` is reported
-/// as unknown: the C ABI has no "follow the system" state, and reporting it as
-/// either dark or light would be a guess.
+/// Returns `0` (unknown), `1` (dark) or `2` (light). `Theme::Auto` and
+/// `Theme::Unknown` are both reported as unknown: the C ABI has no "follow the
+/// system" state, and reporting either as dark or light would be a guess.
 pub(crate) fn detect_theme_code() -> Result<i32, Failure> {
     let theme = appearance().detect_theme()?;
     Ok(theme_code(theme))
@@ -83,7 +83,9 @@ fn theme_code(theme: Theme) -> i32 {
     match theme {
         Theme::Dark => 1,
         Theme::Light => 2,
-        Theme::Auto => 0,
+        // Neither an "auto" preference nor an undeterminable one has a positive
+        // answer in the C ABI, so both report `UDA_THEME_UNKNOWN`.
+        Theme::Auto | Theme::Unknown => 0,
     }
 }
 
@@ -245,8 +247,9 @@ mod tests {
     fn theme_codes_match_the_c_header() {
         assert_eq!(theme_code(Theme::Dark), 1);
         assert_eq!(theme_code(Theme::Light), 2);
-        // "Auto" has no C representation, so it is reported as unknown.
+        // Neither "auto" nor "undeterminable" has a positive C representation.
         assert_eq!(theme_code(Theme::Auto), 0);
+        assert_eq!(theme_code(Theme::Unknown), 0);
     }
 
     #[test]

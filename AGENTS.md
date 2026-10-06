@@ -13,7 +13,7 @@ As an AI agent working on UDA, you MUST adhere to the following principles. Any 
 ### Principle 1: Capability-Driven Architecture (Never Panic)
 Linux desktop environments are highly fragmented. Wayland strictly restricts certain capabilities (e.g., getting global window coordinates).
 - **NEVER use `.unwrap()` or `.expect()`** on system calls, D-Bus invocations, or environment variables.
-- All high-level features must expose a **`Capability`** check returning `SupportLevel::Full`, `SupportLevel::Restricted(Reason)`, or `SupportLevel::Unsupported`.
+- All high-level features must expose a **`Capability`** check returning `SupportLevel::Full`, `SupportLevel::Partial(reason)` or `SupportLevel::None`. `Partial` must carry a human-readable reason, so a host can explain a degradation without guessing why.
 - Always degrade gracefully. If a modern feature fails, fall back to known alternatives before returning an error.
 
 ### Principle 2: The Cascading Fallback Engine
@@ -21,7 +21,9 @@ When executing an OS desktop action on Linux, strictly follow this fallback hier
 1. **Tier 1 (XDG Desktop Portal):** Check if `org.freedesktop.portal.*` is available.
 2. **Tier 2 (Native DE D-Bus/IPC):** Query `$XDG_CURRENT_DESKTOP` and invoke DE-specific D-Bus methods (GNOME, KDE Plasma) or Unix Domain Sockets (Hyprland, Sway).
 3. **Tier 3 (CLI Tool Fallback):** If D-Bus is unavailable, probe system `PATH` for standard utilities (`swww`, `hyprpaper`, `feh`, `xfconf-query`).
-4. **Tier 4 (Graceful Error):** Return a strongly typed `UdaError::FeatureUnsupported`.
+4. **Tier 4 (Graceful Error):** Return a strongly typed `UdaError::NotSupported`.
+
+   The tiers are a **general rule, not a universal one**: wallpaper uses no portal at all (`org.freedesktop.portal.Wallpaper` exists but is never called) and wake locks use `org.freedesktop.ScreenSaver.Inhibit` rather than `org.freedesktop.portal.Inhibit`. Appearance detection is currently the only module that engages Tier 1, through `org.freedesktop.portal.Settings`.
 
 ### Principle 3: Zero-Bloat Systems Philosophy
 - Core libraries MUST remain lightweight. **DO NOT** pull in Qt, GTK, or heavy GUI frameworks.
@@ -58,8 +60,9 @@ Before writing any platform-specific logic, consult the specifications stored in
   - KDE: D-Bus `org.kde.plasmashell` -> `/PlasmaShell` -> `evaluateScript`.
   - Hyprland: IPC socket via `hyprpaper` or `swww`.
   - Windows: Win32 `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`.
+  - Note: the wallpaper backend never uses `org.freedesktop.portal.Wallpaper`; it starts at Tier 2.
 - **System Appearance:** See `docs/internals/appearance_specs.md`
-  - Linux: `org.freedesktop.portal.Settings` -> `Read("org.freedesktop.appearance", "color-scheme")`.
+  - Linux: `org.freedesktop.portal.Settings` -> `Read("org.freedesktop.appearance", "color-scheme")`. This is the only module that engages Tier 1.
   - Windows: Registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.
 - **System Notifications:**
   - Linux: `org.freedesktop.Notifications` over Session D-Bus.
@@ -77,7 +80,7 @@ Before writing any platform-specific logic, consult the specifications stored in
 - [x] **Appearance Module:** Detect & listen to Dark/Light theme, Accent color (Portal + Registry).
 - [x] **Wallpaper Module:** Set & get wallpaper with FillMode (GNOME, KDE, Hyprland, Sway, X11, Win32).
 - [x] **Notification Module:** Native notifications with actions, urgency, and timeout.
-- [x] **WakeLock Module:** Prevent display/system sleep (Inhibit portal, ScreenSaver, Win32).
+- [x] **WakeLock Module:** Prevent display/system sleep (ScreenSaver `Inhibit`, Win32).
 - [x] **C-ABI & FFI:** `crates/uda-ffi` + Python & Node.js examples + CI/CD all green.
 
 ### Phase 2: Interactive Shell & System Integration (v0.2.0 RELEASED) [COMPLETED]
@@ -139,16 +142,20 @@ Every code change must pass:
 
 ## 6. Coding Conventions & Patterns
 
-1. **Error Handling:** Use `thiserror` for library-internal errors:
+1. **Error Handling:** Use `thiserror` for library-internal errors (see `crates/uda-core/src/error.rs`):
    ```rust
    #[derive(thiserror::Error, Debug)]
    pub enum UdaError {
-       #[error("Feature unsupported on this desktop: {0}")]
-       Unsupported(String),
-       #[error("D-Bus communication error: {0}")]
-       DBusError(#[from] zbus::Error),
-       #[error("Platform IO error: {0}")]
-       IoError(#[from] std::io::Error),
+       #[error("Feature not supported: {0}")]
+       NotSupported(String),
+       #[error("Detection failed: {0}")]
+       DetectionFailed(String),
+       #[error("Command failed: {0}")]
+       CommandFailed(String),
+       #[error("IO error: {0}")]
+       Io(#[from] std::io::Error),
+       #[error("Internal error: {0}")]
+       Internal(String),
    }
    ```
 2. **Asynchronous Runtime:** When async is required (e.g., listening to D-Bus signals or registry events), use `tokio`. Provide synchronous wrapper methods where practical.
