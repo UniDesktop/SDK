@@ -61,10 +61,13 @@ where
         .spawn(move || {
             // A send failure only means the caller stopped waiting; the value is
             // dropped and the caller below reports the closed channel, so
-            // neither side may panic.
+            // neither side may panic. A runtime that cannot be built is reported
+            // as `Internal`, the same answer (and wording) the inline branch
+            // gives for the same failure.
             let outcome = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
+                .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))
                 .map(|runtime| runtime.block_on(future));
             let _ = sender.send(outcome);
         })
@@ -72,7 +75,7 @@ where
 
     let result = receiver.recv().map_err(|_| {
         UdaError::Internal("the async runner thread ended without a result".to_string())
-    })??;
+    })?;
 
     // The worker has already answered, so joining only reaps the thread that is
     // on its way out - the same reaping discipline as `crate::notify::run_sync`
@@ -83,7 +86,9 @@ where
         log::debug!("the async runner thread panicked after delivering its result");
     }
 
-    Ok(result)
+    // The worker's own failure (it could not build its runtime) is reported only
+    // after the join, so that path reaps its thread as well.
+    result
 }
 
 #[cfg(test)]

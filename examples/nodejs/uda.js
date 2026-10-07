@@ -190,8 +190,10 @@ function loadUda(libraryPath) {
   }
 
   // 出参槽位：koffi 3.x 需要用 `alloc` 分配一块可写内存，调用后再 `decode` 读回。
+  // 省略 `length` 时按类型自身的宽度解码；长度为 -1 表示读一个 NUL 结尾的 `char`
+  // 序列（解码裸字符串地址用，见 _lastErrorMessage）。
   const outSlot = (type) => koffi.alloc(type, 1);
-  const readSlot = (type, address) => koffi.decode(address, type);
+  const readSlot = (type, address, length) => koffi.decode(address, type, length);
 
   // 回调函数指针原型。koffi.proto() 注册的是全局命名类型，因此名字必须唯一。
   const TEXT_CALLBACK_TYPE = koffi.pointer(
@@ -213,8 +215,9 @@ function loadUda(libraryPath) {
         slot
       ),
     wakelockRelease: library.func('uda_wakelock_release', 'int32', ['uint64']),
-    // 返回 `void *` 而不是 `char *`：koffi 按 `char *` 解码会拿走指针所有权的
-    // 主动权，我们既要读字符串也要释放同一块分配（见 _lastErrorMessage）。
+    // 返回 `void *` 而不是 `char *`：koffi 会把 `char *` 返回值直接解成 JS 字符串，
+    // 地址随之丢失，这次调用新分配的字符串就再也无法交给 uda_free_string 归还
+    // （见 _lastErrorMessage）。
     lastErrorMessage: library.func('uda_last_error_message', 'void *', []),
     statusMessage: library.func('uda_status_message', 'const char *', ['int32']),
     // `uda_notify(app_name, title, body, icon, actions, out_id)`：app_name 是
@@ -589,12 +592,14 @@ class Uda {
 
   /** @returns {string} 线程本地的最新失败原因的诊断消息。 */
   _lastErrorMessage(action) {
-    // `uda_last_error_message` 返回的字符串归调用方所有：单次调用拿原始指针、
-    // 原地解码后立即 `uda_free_string` 释放（NULL 是空操作）。不能像壁纸读取
-    // 那样调两次——第一次调用已消费消息，第二次只会拿到 NULL。
+    // 该导出返回调用方所有的字符串，且调用本身会消费消息，所以只能调一次：
+    // `pointer` 已是字符数据的地址，按 `char` + 长度 -1（读到 NUL 为止）原地解码
+    // 后立刻 `uda_free_string` 归还。不能照搬壁纸出参的两次解码（那解的是
+    // `char **` 槽位）——把 `pointer` 再按 `char *` 解一次等于把首字符当指针读，
+    // 会直接崩溃；也不能调两次导出，第二次只会拿到 NULL（消息已被消费）。
     const pointer = this._lib.lastErrorMessage();
     if (pointer) {
-      const message = String(this._lib.readSlot('char *', pointer));
+      const message = String(this._lib.readSlot('char', pointer, -1));
       this._lib.freeString(pointer);
       if (message) {
         return message;

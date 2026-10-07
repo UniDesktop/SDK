@@ -199,12 +199,13 @@ mod tests {
     use crate::error::{UDA_ERR_INVALID_ARGUMENT, UDA_ERR_NOT_SUPPORTED, UDA_OK};
     use std::ffi::CString;
 
-    /// Read a library-owned C string the way a C caller would.
+    /// Read a NUL-terminated C string the way a C caller would.
     ///
     /// # Safety
     ///
-    /// `pointer` must come from [`c_string_from`] or [`last_error_pointer`].
-    fn borrowed_text(pointer: *const c_char) -> String {
+    /// `pointer` must come from [`c_string_from`] or [`last_error_pointer`]. The
+    /// helper only reads the string; the pointer keeps its owner.
+    fn read_c_string(pointer: *const c_char) -> String {
         // SAFETY: the caller guarantees a readable, null-terminated buffer.
         unsafe { std::ffi::CStr::from_ptr(pointer) }
             .to_str()
@@ -264,7 +265,7 @@ mod tests {
         set_last_message("the backend refused the request");
         let pointer = last_error_pointer();
         assert!(!pointer.is_null());
-        assert_eq!(borrowed_text(pointer), "the backend refused the request");
+        assert_eq!(read_c_string(pointer), "the backend refused the request");
 
         // Every render allocates its own storage and hands the ownership to the
         // caller, so the pointer stays valid across any number of subsequent
@@ -274,7 +275,13 @@ mod tests {
         set_last_message("a newer failure");
         let next = last_error_pointer();
         assert!(!next.is_null());
-        assert_eq!(borrowed_text(next), "a newer failure");
+        assert_eq!(read_c_string(next), "a newer failure");
+        assert_ne!(pointer, next, "each render must allocate fresh storage");
+        assert_eq!(
+            read_c_string(pointer),
+            "the backend refused the request",
+            "an earlier render must stay readable past later ones"
+        );
 
         // Both pointers are independent live allocations at this point; the
         // caller releases each one with the same `uda_free_string` used for
@@ -292,7 +299,7 @@ mod tests {
         set_last_message("recovered");
         let pointer = last_error_pointer();
         assert!(!pointer.is_null());
-        assert_eq!(borrowed_text(pointer), "recovered");
+        assert_eq!(read_c_string(pointer), "recovered");
         unsafe { free_c_string(pointer.cast_mut()) };
     }
 

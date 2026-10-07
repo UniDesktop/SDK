@@ -460,7 +460,10 @@ class Uda:
         self._lib.uda_get_wallpaper.argtypes = [c_char_p_p]
         self._lib.uda_get_wallpaper.restype = ctypes.c_int32
 
-        self._lib.uda_free_string.argtypes = [ctypes.c_char_p]
+        # 形参用 c_void_p 而不是 c_char_p：调用方既传 `c_char_p` 出参槽位（壁纸、
+        # 媒体元数据），也传 `uda_last_error_message` 返回的裸地址整数；c_void_p
+        # 两者都收，c_char_p 遇到整数地址会直接抛 ArgumentError。
+        self._lib.uda_free_string.argtypes = [ctypes.c_void_p]
         self._lib.uda_free_string.restype = None
 
         self._lib.uda_wakelock_acquire.argtypes = [
@@ -615,13 +618,17 @@ class Uda:
 
     def _last_error_message(self, status: int, action: str) -> str:
         """读取库记录的失败原因，读取失败时退回状态码描述。"""
-        # 返回值是本次调用新分配的字符串，所有权归调用方：无论解码成功与否都
-        # 必须释放（uda_free_string(NULL) 是空操作），不能像 c_char_p 那样靠
-        # 自动转换拿副本——那会丢失指针、永远无法归还这块内存。
+        # 返回值是本次调用新分配的字符串，所有权归调用方；且库侧记录的失败消息
+        # 已被本次调用消费，所以只能调用一次，第二次只会拿到 NULL。读取用
+        # ``string_at`` 把 NUL 之前的字节复制成 ``bytes``，随后按壁纸读取同样的
+        # try/finally 范式释放；uda_free_string(NULL) 是空操作。
         pointer = self._lib.uda_last_error_message()
         if pointer:
-            raw = ctypes.string_at(pointer)
-            self._lib.uda_free_string(pointer)
+            try:
+                raw = ctypes.string_at(pointer)
+            finally:
+                # 无论解码成功与否都必须释放。
+                self._lib.uda_free_string(pointer)
             if raw:
                 return raw.decode("utf-8", errors="replace")
         # 库未记录消息（或记录失败）时，用静态描述兜底。必须透传真实失败状态码：

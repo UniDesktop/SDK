@@ -99,11 +99,13 @@ const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_POPUP;
 
 /// Extended style for the worker window: tool window + no activation.
 ///
-/// Even at 0x0 without `WS_VISIBLE`, a plain top-level window still shows up in
-/// the Alt+Tab list, in Task Manager's window view, and in `EnumWindows` - a
-/// "ghost window". `WS_EX_TOOLWINDOW` removes it from all three, and
-/// `WS_EX_NOACTIVATE` keeps a stray click from ever bringing a hidden window to
-/// the foreground while leaving its message intake untouched.
+/// Even at 0x0 without `WS_VISIBLE`, a plain top-level window can still show up
+/// in the Alt+Tab list - a "ghost window". `WS_EX_TOOLWINDOW` is the documented
+/// way to keep it out, and `WS_EX_NOACTIVATE` keeps a stray click from ever
+/// bringing a hidden window to the foreground while leaving its message intake
+/// untouched. Note that `EnumWindows` enumerates hidden top-level windows
+/// regardless of style, so a window list that mirrors the Alt+Tab set has to
+/// drop tool windows on its own.
 const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE =
     WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0);
 
@@ -1842,10 +1844,15 @@ unsafe extern "system" fn tray_window_proc(
     // `PostQuitMessage` gives the message loop a second, standard exit path -
     // the loop normally ends through the worker's tick flag, but a window
     // destroyed out from under the worker (EndTask, a debugger, a future
-    // teardown ordering) still has to end the thread.
+    // teardown ordering) still has to end the thread. `GetMessageW` returns
+    // `WM_QUIT` even with the window filter `run` passes, and `run`'s `<= 0`
+    // test reads it as exit.
     if message == WM_NCDESTROY {
-        // SAFETY: clearing a `GWLP_USERDATA` slot on a live window is valid for
-        // any window, whether or not a pointer was ever stored.
+        // SAFETY: `WM_NCDESTROY` is the last message the window receives, and
+        // the handle stays valid until this procedure returns, so the slot can
+        // be written for any window - whether or not a pointer was ever stored
+        // and whether the message came from `teardown` or from an external
+        // destroy.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
         // SAFETY: posting a quit flag to the current thread's queue is always
         // valid.

@@ -1257,6 +1257,7 @@ mod tests {
             !pointer.is_null(),
             "a failure must leave a readable message"
         );
+
         // SAFETY: the pointer is a live library allocation owned by this test
         // until it is released below.
         let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
@@ -1264,8 +1265,10 @@ mod tests {
             .expect("the message is valid UTF-8");
         assert!(text.contains("out_theme"), "got: {text}");
 
-        // Ownership moved to the caller: released through the same export that
-        // frees every other returned string.
-        unsafe { util::free_c_string(pointer.cast_mut()) };
+        // Ownership moved to the caller: released through the export that frees
+        // every other returned string.
+        // SAFETY: the pointer came from `uda_last_error_message` above and has
+        // not been released yet.
+        unsafe { uda_free_string(pointer.cast_mut()) };
     }
 }
