@@ -2214,7 +2214,12 @@ mod tests {
         }
         // One entry per row that carries a command id: the sample has five
         // (the separator is id-less in the HMENU and has no entry).
-        assert_eq!(seen.len(), 5, "one entry per id-bearing row: {}", seen.len());
+        assert_eq!(
+            seen.len(),
+            5,
+            "one entry per id-bearing row: {}",
+            seen.len()
+        );
 
         // A further allocation must not reuse an id.
         let extra = table.allocate("x".to_string(), None);
@@ -2328,8 +2333,7 @@ mod tests {
         // can send and the table's lookups stay in one-to-one correspondence.
         // SAFETY: `popup` is a live menu built above; these calls only read
         // its structure.
-        let top_rows =
-            unsafe { windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount(popup) };
+        let top_rows = unsafe { windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount(popup) };
         // SAFETY: same live menu; the submenu is the third top-level row.
         let child_menu = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSubMenu(popup, 2) };
         assert!(!child_menu.is_invalid(), "the submenu must be attached");

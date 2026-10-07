@@ -2274,6 +2274,10 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         }))?;
         lock_or_recover(&shared, "test menu").menu = Some(menu);
+
+        // The swapped-in menu has never been seen by the stable id map, so the
+        // id from the *previous* layout stays retired and must not fire: a
+        // click on the stale id 1 lands on no row at all.
         tokio::time::timeout(
             Duration::from_secs(3),
             client.call_method(
@@ -2282,6 +2286,37 @@ mod tests {
                 Some("com.canonical.dbusmenu"),
                 "Event",
                 &(1i32, "clicked", zvariant::Value::new(0i32), 0u32),
+            ),
+        )
+        .await??;
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        // A shell re-reads the layout after the change and clicks the id that
+        // read hands out - reading is also what re-keys the id map to the new
+        // menu, so this is exactly the id a real client would use.
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                menu_path.as_str(),
+                Some("com.canonical.dbusmenu"),
+                "GetLayout",
+                &(0i32, 1i32, Vec::<String>::new()),
+            ),
+        )
+        .await??;
+        let (_revision, root): (u32, WireNode) = reply.body().deserialize()?;
+        assert_eq!(root.2.len(), 1);
+        let open_id = WireNode::try_from(root.2[0].try_clone()?)?.0;
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                menu_path.as_str(),
+                Some("com.canonical.dbusmenu"),
+                "Event",
+                &(open_id, "clicked", zvariant::Value::new(0i32), 0u32),
             ),
         )
         .await??;
@@ -2298,8 +2333,8 @@ mod tests {
     /// the `(icon name, icon pixmap, title, description)` struct - must reach
     /// the bus with an empty body.
     #[tokio::test]
-    async fn the_tool_tip_announcement_reaches_the_bus_as_new_tool_tip() -> Result<(), Box<dyn std::error::Error>>
-    {
+    async fn the_tool_tip_announcement_reaches_the_bus_as_new_tool_tip(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // Same skip rule as `get_layout_survives_session_bus_transport` above:
         // a missing bus is an environment fact, not a regression, and the
         // assertions only run once a connection actually exists.

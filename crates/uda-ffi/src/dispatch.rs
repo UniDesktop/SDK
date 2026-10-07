@@ -168,8 +168,7 @@ fn cli_wallpaper_path() -> Option<String> {
 /// An unset or unreadable variable means "not GNOME": the probe is a GNOME-only
 /// affordance, so absence of evidence defaults to refusing it.
 fn session_is_gnome_family() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .is_ok_and(|value| is_gnome_family_desktop(&value))
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| is_gnome_family_desktop(&value))
 }
 
 /// [`session_is_gnome_family`] with the environment value injected, so tests
