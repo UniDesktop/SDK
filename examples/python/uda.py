@@ -481,6 +481,8 @@ class Uda:
         self._lib.uda_last_error_message.argtypes = []
         self._lib.uda_last_error_message.restype = ctypes.c_void_p
 
+        # 对照：status_message 返回库内静态字符串（头文件明示绝不可 free），
+        # c_char_p 自动转 bytes 丢失指针正合适——我们本来就不该释放它。
         self._lib.uda_status_message.argtypes = [ctypes.c_int32]
         self._lib.uda_status_message.restype = ctypes.c_char_p
 

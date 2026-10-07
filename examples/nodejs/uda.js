@@ -189,9 +189,9 @@ function loadUda(libraryPath) {
     }
   }
 
-  // 出参槽位：koffi 3.x 需要用 `alloc` 分配一块可写内存，调用后再 `decode` 读回。
-  // 省略 `length` 时按类型自身的宽度解码；长度为 -1 表示读一个 NUL 结尾的 `char`
-  // 序列（解码裸字符串地址用，见 _lastErrorMessage）。
+  // 出参槽位：koffi（本仓库锁定 2.x，实测 2.16.3）需要用 `alloc` 分配一块可写
+  // 内存，调用后再 `decode` 读回。省略 `length` 时按类型自身的宽度解码；长度为
+  // -1 表示读一个 NUL 结尾的 `char` 序列（解码裸字符串地址用，见 _lastErrorMessage）。
   const outSlot = (type) => koffi.alloc(type, 1);
   const readSlot = (type, address, length) => koffi.decode(address, type, length);
 
@@ -597,12 +597,16 @@ class Uda {
     // 后立刻 `uda_free_string` 归还。不能照搬壁纸出参的两次解码（那解的是
     // `char **` 槽位）——把 `pointer` 再按 `char *` 解一次等于把首字符当指针读，
     // 会直接崩溃；也不能调两次导出，第二次只会拿到 NULL（消息已被消费）。
+    // 解码失败也必须归还，因此 free 放进 finally（与 Python 侧同一纪律）。
     const pointer = this._lib.lastErrorMessage();
     if (pointer) {
-      const message = String(this._lib.readSlot('char', pointer, -1));
-      this._lib.freeString(pointer);
-      if (message) {
-        return message;
+      try {
+        const message = String(this._lib.readSlot('char', pointer, -1));
+        if (message) {
+          return message;
+        }
+      } finally {
+        this._lib.freeString(pointer);
       }
     }
     return `${action} 失败`;
