@@ -28,16 +28,6 @@ thread_local! {
     /// Thread-local (rather than global) so concurrent callers in different
     /// languages never read each other's diagnostics.
     static LAST_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
-
-    /// Persistent buffer backing the pointer returned by
-    /// `uda_last_error_message()`.
-    ///
-    /// The `CString` is owned by the library, so the pointer handed out is a
-    /// *borrow*: callers must never pass it to `uda_free_string()`. Its contents
-    /// are replaced whenever a new failure is queried on the same thread, which
-    /// is what makes the documented lifetime - "valid until the next UDA call on
-    /// this thread" - true without leaking one allocation per failure.
-    static LAST_ERROR_BUFFER: RefCell<CString> = RefCell::new(CString::default());
 }
 
 /// Remember `message` so `uda_last_error_message()` can hand it back.
@@ -57,37 +47,26 @@ pub(crate) fn take_last_message() -> Option<String> {
         .flatten()
 }
 
-/// Render the recorded failure message into the persistent thread-local buffer
-/// and return a borrowed pointer to it.
+/// Turn the recorded failure message into a fresh, caller-owned C allocation.
 ///
-/// The returned pointer stays valid until the buffer is refilled, which can only
-/// happen through a later `uda_last_error_message()` call on the same thread -
-/// i.e. never across a call the host did not make itself. The caller must not
-/// free it. `null` is returned when no failure is recorded, or when the message
-/// cannot be represented as a C string (an interior null byte, which real
-/// diagnostics do not produce).
+/// The returned pointer is heap-allocated by this call and the caller becomes
+/// its owner: it must be released with `uda_free_string()` and stays valid
+/// until then, no matter how many other UDA calls run in between. `null` is
+/// returned when no failure is recorded, or when the message cannot be
+/// represented as a C string (an interior null byte, which real diagnostics do
+/// not produce).
 pub(crate) fn last_error_pointer() -> *const c_char {
     let Some(message) = take_last_message() else {
         return std::ptr::null();
     };
 
-    LAST_ERROR_BUFFER
-        .try_with(|buffer| {
-            let mut buffer = buffer.borrow_mut();
-            // An interior null byte has no C representation. Real diagnostics
-            // never contain one, so that case leaves the buffer empty and the
-            // caller sees "no message" rather than a truncated string.
-            match CString::new(message) {
-                Ok(rendered) => *buffer = rendered,
-                Err(_) => *buffer = CString::default(),
-            }
-            if buffer.as_bytes().is_empty() {
-                std::ptr::null()
-            } else {
-                buffer.as_ptr()
-            }
-        })
-        .unwrap_or(std::ptr::null())
+    // An interior null byte has no C representation. Real diagnostics never
+    // contain one, so that case reports "no message" rather than a truncated
+    // string.
+    match CString::new(message) {
+        Ok(rendered) => rendered.into_raw().cast_const(),
+        Err(_) => std::ptr::null(),
+    }
 }
 
 /// Borrow a C string as an owned Rust `String`.
@@ -278,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn the_last_error_pointer_is_a_library_owned_borrow() {
+    fn each_last_error_pointer_is_a_fresh_caller_owned_allocation() {
         let _ = take_last_message();
         assert!(last_error_pointer().is_null(), "no failure recorded yet");
 
@@ -287,26 +266,34 @@ mod tests {
         assert!(!pointer.is_null());
         assert_eq!(borrowed_text(pointer), "the backend refused the request");
 
-        // The pointer is a borrow of library storage, so a second render (the
-        // "next UDA call" of the documented lifetime) may replace it - but the
-        // first pointer itself was never handed to the caller for freeing, and
-        // the message slot was consumed exactly once.
+        // Every render allocates its own storage and hands the ownership to the
+        // caller, so the pointer stays valid across any number of subsequent
+        // calls, including further renders. The message slot is consumed
+        // exactly once.
         assert_eq!(take_last_message(), None);
         set_last_message("a newer failure");
         let next = last_error_pointer();
         assert!(!next.is_null());
         assert_eq!(borrowed_text(next), "a newer failure");
+
+        // Both pointers are independent live allocations at this point; the
+        // caller releases each one with the same `uda_free_string` used for
+        // every other returned string.
+        unsafe {
+            free_c_string(pointer.cast_mut());
+            free_c_string(next.cast_mut());
+        }
     }
 
     #[test]
-    fn an_unrenderable_error_message_yields_null_without_wrecking_the_buffer() {
+    fn an_unrenderable_error_message_yields_null_and_the_next_one_still_works() {
         set_last_message("broken\0message");
         assert!(last_error_pointer().is_null());
-        // The buffer must survive: the next renderable message still works.
         set_last_message("recovered");
         let pointer = last_error_pointer();
         assert!(!pointer.is_null());
         assert_eq!(borrowed_text(pointer), "recovered");
+        unsafe { free_c_string(pointer.cast_mut()) };
     }
 
     #[test]

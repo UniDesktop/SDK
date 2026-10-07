@@ -14,10 +14,8 @@
  * ----------------
  *   - Strings RETURNED by UDA are allocated by the library and must be released
  *     with `uda_free_string()`. Passing null to `uda_free_string()` is a no-op,
- *     so callers may free unconditionally. The two exceptions are
- *     `uda_last_error_message()` (a borrow of library-owned thread-local
- *     storage) and `uda_status_message()` (a static string): both must NOT be
- *     freed.
+ *     so callers may free unconditionally. The one exception is
+ *     `uda_status_message()` (a static string), which must NOT be freed.
  *   - Strings PASSED IN are borrowed for the duration of the call only; the
  *     caller keeps ownership and must keep them alive until the call returns.
  *   - Wake-lock handles are plain `uint64_t` values owned by this process.
@@ -504,13 +502,13 @@ int32_t uda_session_shutdown(void);
 /**
  * Return the message describing the most recent failure on the calling thread.
  *
- * The returned pointer borrows library-owned storage: it stays valid until the
- * next UDA call on the same thread replaces the message, and it must NOT be
- * passed to `uda_free_string()` (freeing it is undefined behaviour). Copy the
- * text if it must outlive that. Returns NULL when no failure has been recorded
- * on this thread yet.
+ * The returned string is heap-allocated by this call and its ownership moves to
+ * the caller: release it with `uda_free_string()` (freeing NULL is a no-op) and
+ * it stays valid until then, no matter how many other UDA calls run in between.
+ * Returns NULL when no failure has been recorded on this thread yet.
  *
- * @return A borrowed, null-terminated C string owned by the library, or NULL.
+ * @return A newly allocated, null-terminated C string owned by the caller, or
+ *         NULL.
  */
 const char *uda_last_error_message(void);
 

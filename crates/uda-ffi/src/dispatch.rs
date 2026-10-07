@@ -87,6 +87,9 @@ fn theme_code(theme: Theme) -> i32 {
         // Neither an "auto" preference nor an undeterminable one has a positive
         // answer in the C ABI, so both report `UDA_THEME_UNKNOWN`.
         Theme::Auto | Theme::Unknown => 0,
+        // `Theme` is `#[non_exhaustive]`: a future appearance maps to the
+        // same "no positive answer" code instead of breaking this crate.
+        _ => 0,
     }
 }
 

@@ -9,6 +9,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 > 完整文档见 [unidesktop.github.io](https://unidesktop.github.io/)。
 > Full documentation lives at [unidesktop.github.io](https://unidesktop.github.io/).
 
+## [Unreleased] - Cross-Review Hardening · 未发布
+
+> 对应 PR：交叉审查清单（issue #4，50 项）中 v0.2.1 未覆盖的 48 项全部在本节落地。
+> Corresponds to the cross-review checklist (issue #4): the 48 findings not already
+> shipped in v0.2.1 all land in this section.
+
+### ✨ Added
+
+- ✨ **`uda_tray_capabilities` C 导出**：托盘能力位首次对 C / Python / Node 宿主可见，新增 8 个 `UDA_TRAY_CAP_*` 常量（append-only，位与核心 `Capability` 一一对应），宿主可以按 AGENTS.md 的要求"先查能力再降级"。
+- ✨ **A `uda_tray_capabilities` C export**: tray capability bits become visible to C / Python / Node hosts for the first time, with eight new `UDA_TRAY_CAP_*` constants (append-only, mapping 1:1 onto the core `Capability` bits), so hosts can follow "query capabilities, then degrade".
+
+### 🛠️ Changed
+
+- 🛠️ **`UdaError` 新增 `InvalidArgument` 变体并映射 `UDA_ERR_INVALID_ARGUMENT`（`-1`）**：空标签、非法图标等调用方输入错误不再伪装成"平台不支持"（`-2`），`include/uda.h` 与绑定文档同步。
+- 🛠️ **`UdaError` gains an `InvalidArgument` variant mapped to `UDA_ERR_INVALID_ARGUMENT` (`-1`)**: caller mistakes such as an empty label or an invalid icon no longer masquerade as "platform not supported" (`-2`); `include/uda.h` and the binding docs say the same.
+- 🛠️ **`Theme`、`SupportLevel`、`UdaError` 标记 `#[non_exhaustive]`**：这三个枚举在补丁版本中就可能新增变体（`Unknown`、`Partial(reason)`、`InvalidArgument` 均是先例）；下游的穷尽 `match` 需要通配臂，新增变体不再构成编译期破坏。crate 内所有跨包 `match` 已补通配兜底。
+- 🛠️ **`Theme`, `SupportLevel` and `UdaError` are now `#[non_exhaustive]`**: these enums gain variants in patch releases (`Unknown`, `Partial(reason)` and `InvalidArgument` are all precedents); downstream exhaustive `match`es need a wildcard arm, so future additions stop being compile-time breaks. Every cross-crate `match` in this workspace carries the wildcard now.
+- 🛠️ **关于 FFI 导出的 `unsafe extern "C"`（兼容性说明）**：导出函数的 Rust 定义侧自 v0.2.1 起为 `unsafe extern "C"`，本节延续该状态（新增的 `uda_tray_capabilities` 同样如此）。对 C 调用方与声明 `extern "C" { ... }` 的 Rust 宿主（2021 及更早 edition）没有影响；edition 2024 的 Rust 宿主需用 `unsafe extern` 块声明。
+- 🛠️ **On the `unsafe extern "C"` FFI exports (compatibility note)**: the Rust definition side has been `unsafe extern "C"` since v0.2.1 and this release keeps that state (the new `uda_tray_capabilities` included). C callers and Rust hosts declaring `extern "C" { ... }` blocks (edition 2021 and earlier) are unaffected; edition-2024 Rust hosts must declare with `unsafe extern` blocks.
+- 🛠️ **同步 API 桥的构建顺序**：`uda-platform-linux` 的 `run_async` 与 `uda-ffi` 的 `run_sync` 现在都是"先判定运行时上下文、后构建"，环境运行时分支不再把runtime 搬去工作线程。
+- 🛠️ **Sync-bridge build order**: `run_async` (`uda-platform-linux`) and `run_sync` (`uda-ffi`) both branch on the ambient runtime *before* building anything, so the nested branch no longer ships a runtime across threads.
+
+### 🧰 Fixed
+
+- 🧰 **Windows 托盘七项**：`hide()`→`show()` 往返失效（`dwStateMask=0`）；GDI 位图全路径不释放（含 `CreateIconIndirect` 前后、mask 失败早退）；模态菜单泵重入窗口过程造成同一 `Worker` 两个 `&mut`（别名 UB，菜单流程拆为两段并改为 per-worker 重入守卫）；`NIM_MODIFY` 失败泄漏新 HICON；更新失败被记为已应用后永不重试；`AppendMenuW` 结果一律丢弃（子菜单失败泄漏 HMENU）；explorer 重启后图标永久消失（改隐藏顶层窗口 + `TaskbarCreated` 重加）。
+- 🧰 **Seven Windows tray fixes**: `hide()`→`show()` never restoring (`dwStateMask=0`); GDI bitmaps leaked on every path (around `CreateIconIndirect` and the mask-failure early exit); the modal menu pump re-entering the window proc with a second `&mut Worker` (aliasing UB — the menu flow is now two-phase with a per-worker reentrancy guard); a leaked HICON when `NIM_MODIFY` fails; updates recorded as applied without being so and never retried; `AppendMenuW` results discarded wholesale (leaking the submenu HMENU); and the icon gone forever after an explorer restart (now a hidden top-level window that re-registers on `TaskbarCreated`).
+- 🧰 **Windows 托盘窗口不再幽灵化**：工作窗口改 `WS_POPUP` + `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`，不再出现在 Alt+Tab、任务管理器与 `EnumWindows` 中；`WM_NCDESTROY` 现在清 `GWLP_USERDATA` 并 `PostQuitMessage`，外部销毁路径不再悬空解引用。
+- 🧰 **The Windows worker window stops being a ghost**: it is now `WS_POPUP` with `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, invisible to Alt+Tab, Task Manager and `EnumWindows`; `WM_NCDESTROY` clears `GWLP_USERDATA` and posts a quit message, so an externally destroyed window can no longer leave a dangling pointer behind.
+- 🧰 **Windows AUMID 两项**：提前返回泄漏 `CoTaskMem`；`availability()` 用空 app_name 抢注进程身份导致通知归属分叉。
+- 🧰 **Two Windows AUMID fixes**: the early-return path leaked `CoTaskMem`, and `availability()` claimed the process identity with an empty app_name, splitting notification ownership.
+- 🧰 **Windows 通知补齐**：`NIF_SHOWTIP`（v4 下标准 tooltip 被抑制）、`NIN_SELECT`/`NIN_KEYSELECT` 键盘激活、`WM_CONTEXTMENU` 锚点语义、`SetTimer` / `SetForegroundWindow` 结果检查。
+- 🧰 **Windows notifications completed**: `NIF_SHOWTIP` (v4 suppressed the standard tooltip), `NIN_SELECT`/`NIN_KEYSELECT` keyboard activation, `WM_CONTEXTMENU` anchor semantics, and `SetTimer` / `SetForegroundWindow` result checks.
+- 🧰 **Linux 托盘六项**：dbusmenu 信号从不发射 + `Arc::as_ptr` 变更检测失效（现按内容指纹发射真实 `LayoutUpdated`，并补规范要求的 `NewToolTip`）；`GetLayout` 忽略 `parent_id` 且曲解 `recursionDepth`；dbusmenu id 按遍历位置重排（现持久稳定映射，退役 id 不复用）；worker 初始化失败仍宣称全套能力（现就绪握手，失败返回错误）；未注册双击回调时第二次点击被吞（现回退 `on_click`）；200ms 每 tick 无条件重转码图标。
+- 🧰 **Six Linux tray fixes**: dbusmenu signals never emitted plus a blind `Arc::as_ptr` change detector (now a content fingerprint with a real `LayoutUpdated`, plus the spec-mandated `NewToolTip`); `GetLayout` ignoring `parent_id` and misreading `recursionDepth`; dbusmenu ids re-shuffled per snapshot (now a persistent stable map whose retired ids are never reused); a failed worker init still advertising full capabilities (now a readiness handshake that fails `create()`); the second click swallowed when no double-click handler exists (now falls back to `on_click`); and an unconditional per-tick icon transcode.
+- 🧰 **Linux 平台四项**：Hyprland 壁纸链路不可用（hyprpaper 改走 `hyprctl`、swww 守护进程探测/拉起、全程超时、失败上报）；同步 API 内联 `block_on` 在 tokio 上下文 panic（现统一 `try_current` 分流桥）；logout Tier-3 回退服务名/参数签名错误；GNOME 47+ 强调色枚举解析恒失败（映射 HIG 调色板）。
+- 🧰 **Four Linux platform fixes**: an unusable Hyprland wallpaper chain (hyprpaper now driven via `hyprctl`, swww daemon probed/spawned, everything under timeouts, failures reported); sync APIs panicking under an ambient tokio runtime (now one `try_current`-based bridge); logout Tier-3 fallback with wrong service names and argument signatures; and GNOME 47+ accent-colour enums never parsing (now mapped onto the HIG palette).
+- 🧰 **FFI 契约四项**：`uda_tray_menu_destroy` 后点击触发已释放回调（先从所有存活图标解挂再删记录，`set_menu` 单锁线性化）；`set_action` 失败仍返回 `UDA_OK`；复选框蹦床 `Arc` 自引用环（改 `Weak`）；菜单行 id 用 `entries().last()` 反推（现直接使用 `push` 返回值）。
+- 🧰 **Four FFI contract fixes**: clicks reaching freed callbacks after `uda_tray_menu_destroy` (the menu is detached from every live icon before the record goes, with `set_menu` linearised under one lock); `set_action` failures still reporting `UDA_OK`; the checkbox trampoline's `Arc` self-reference cycle (now `Weak`); and menu row ids reverse-engineered from `entries().last()` (now taken straight from `push`).
+- 🧰 **杂项**：空壁纸路径未被拒绝；空字符串字段返回非 NULL 空串；Tier-3 壁纸探测不区分桌面环境；dbusmenu 根节点 `GetProperty(0)` 恒 `InvalidArgs` 且缺标准属性；点击回调 panic 后 `on_click` 永久失效；wakelock `expires_at` 死状态无回收；D-Bus 调用无超时上限（5 个模块）；`GET_WALLPAPER` 能力位与实现错位；`uda-cli` 裸 unwrap / 硬编码路径 / 破坏性副作用；Node `new Uda(path)` 参数被丢弃、`_readWallpaper` 双调用、行添加失败泄漏 koffi 槽位；Python 兜底诊断写死状态码 0、非 NULL 空串跳过释放。
+- 🧰 **Assorted**: empty wallpaper paths not rejected; empty string fields returning non-NULL pointers; the Tier-3 wallpaper probe ignoring the desktop environment; `GetProperty(0)` always `InvalidArgs` with standard root properties missing; `on_click` gone for good after a panicking handler; the dead `expires_at` with no reaper; missing D-Bus timeouts across five modules; the `GET_WALLPAPER` capability/implementation mismatch; `uda-cli`'s bare unwraps, hardcoded path and destructive side effects; Node dropping the `new Uda(path)` argument, double-reading the wallpaper and leaking koffi slots on failed row adds; Python reporting status code 0 in fallback diagnostics and skipping the release of non-NULL empty strings.
+
+---
+
 ## [v0.2.1] - Honest Theme Reporting & Reasoned Degradation · 2026-10-06
 
 ### ✨ Added
@@ -45,8 +88,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - 📦 **Crate versions brought in line**: the five crates and `Cargo.lock` move from the stale `0.1.0` to `0.2.1` — the step missed when v0.2.0 shipped.
 - 📦 **示例包版本号同步跟进**：`examples/nodejs` 的 `package.json` 与 `package-lock.json` 更新为 `0.2.1`。
 - 📦 **Example packages follow the release**: `examples/nodejs` `package.json` and `package-lock.json` move to 0.2.1.
-- 📦 **示例代码无需调整**：本次为修复性补丁，未新增或改动任何 API，现有示例已覆盖 SDK 全部功能。
-- 📦 **No example changes needed**: this is a patch release with no API additions or changes, and the existing examples already cover every capability.
+- 📦 **示例代码无需调整（仅就 v0.2.1 自身而言）**：v0.2.1 为修复性补丁，未新增或改动任何 API；后续版本对 API 的变更见各自条目。
+- 📦 **No example changes needed (scoped to v0.2.1 itself)**: v0.2.1 is a patch release with no API additions or changes; API changes made by later releases are recorded under their own entries.
 
 ---
 

@@ -4,7 +4,7 @@
 //!
 //! MPRIS has no "current player" registry. The convention is to scan the session
 //! bus for names starting with `org.mpris.MediaPlayer2.` and pick one, which is
-//! what [`LinuxMediaManager::active_player`] does: a player that reports
+//! what `LinuxMediaManager::active_player` does: a player that reports
 //! `Playing` wins, otherwise the first that answers is kept so a paused track is
 //! still visible.
 //!
@@ -22,10 +22,10 @@
 //! surface (a minimal `playerctld` clone, a browser that answers `Get` but not
 //! `GetAll`); `PropertiesProxy` issues a plain `org.freedesktop.DBus.Properties`
 //! call and the timeout bounds the wait, so an incomplete peer can only cost
-//! [`DBUS_TIMEOUT`] and never the caller's thread.
+//! `DBUS_TIMEOUT` and never the caller's thread.
 //!
 //! The connection is created *inside* the async block that uses it and is owned
-//! by the future driven for that one call through [`crate::sync::run_async`],
+//! by the future driven for that one call through `crate::sync::run_async`,
 //! which is safe to call from inside a tokio runtime as well (P1-15): no
 //! connection, proxy or runtime outlives the call that created it.
 //!
@@ -114,7 +114,7 @@ impl LinuxMediaManager {
     /// A `Playing` player always wins; otherwise the first player that answers a
     /// property read is kept, so a paused track is still reported. Every probe is
     /// failure-tolerant and time-bounded: an unreachable or silent candidate is
-    /// skipped after at most [`DBUS_TIMEOUT`], and the call ends with `None`
+    /// skipped after at most `DBUS_TIMEOUT`, and the call ends with `None`
     /// rather than an error when nothing answers.
     async fn active_player(connection: &Connection) -> Option<String> {
         let mut fallback: Option<String> = None;
@@ -222,7 +222,7 @@ async fn list_names(connection: &Connection) -> Result<Vec<String>, UdaError> {
 /// timed out": at this layer the three are indistinguishable to the caller, which
 /// only wants to know whether there is a usable value. The timeout is what makes
 /// the distinction survivable - a peer that never answers costs
-/// [`DBUS_TIMEOUT`] and nothing more.
+/// `DBUS_TIMEOUT` and nothing more.
 async fn read_optional_string(
     properties: &PropertiesProxy<'_>,
     interface: zbus::names::InterfaceName<'_>,
@@ -487,7 +487,7 @@ async fn read_position(properties: &PropertiesProxy<'_>) -> Option<u64> {
 ///
 /// MPRIS transport methods take no arguments and return nothing, so the reply is
 /// not inspected: an MPRIS player acknowledges by returning at all. The call is
-/// bounded by [`DBUS_TIMEOUT`] because a hung player must not pin the caller.
+/// bounded by `DBUS_TIMEOUT` because a hung player must not pin the caller.
 async fn call_method(connection: &Connection, name: &str, method: &str) -> Result<(), UdaError> {
     // The builder chain returns `zbus::Error`; mapping it to `UdaError` inside
     // the async block keeps the outer `match` arms symmetric.
@@ -544,7 +544,7 @@ pub(crate) fn player_refused(method: &str, error: &str) -> UdaError {
 impl MediaManager for LinuxMediaManager {
     fn active_metadata(&self) -> Result<Option<MediaMetadata>, UdaError> {
         // The future owns the connection and every proxy, so nothing outlives
-        // the call; [`crate::sync::run_async`] keeps the bridge safe when the
+        // the call; `crate::sync::run_async` keeps the bridge safe when the
         // host itself runs inside a tokio runtime.
         crate::sync::run_async(async {
             let connection = Self::connection().await?;

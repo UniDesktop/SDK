@@ -41,7 +41,7 @@
 //!
 //! # Timeouts
 //!
-//! Every D-Bus await is wrapped in [`DBUS_TIMEOUT`], so a logind that is
+//! Every D-Bus await is wrapped in `DBUS_TIMEOUT`, so a logind that is
 //! installing an update (and therefore not answering) costs a bounded wait
 //! instead of a hung caller.
 //!
@@ -116,7 +116,7 @@ impl LinuxSessionManager {
     /// Call a no-argument `login1.Manager` power method with `interactive: false`.
     ///
     /// Synchronous on the outside (the trait is synchronous), asynchronous on
-    /// the inside: the future is driven by [`crate::sync::run_async`], which is
+    /// the inside: the future is driven by `crate::sync::run_async`, which is
     /// safe to call from inside a tokio runtime as well (P1-15).
     fn login1_power(&self, method: &str) -> Result<(), UdaError> {
         let method = method.to_string();
@@ -287,7 +287,7 @@ impl LinuxSessionManager {
 /// uniform `(0u32,)` body always came back as `InvalidArgs`).
 ///
 /// `Copy`, and every field is `'static`, so a candidate can travel into the
-/// future [`logout_via_desktop`] hands to [`crate::sync::run_async`].
+/// future [`logout_via_desktop`] hands to `crate::sync::run_async`.
 #[derive(Clone, Copy)]
 struct LogoutCandidate {
     service: &'static str,

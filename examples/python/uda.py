@@ -473,8 +473,10 @@ class Uda:
         self._lib.uda_wakelock_release.argtypes = [ctypes.c_uint64]
         self._lib.uda_wakelock_release.restype = ctypes.c_int32
 
+        # restype 用 c_void_p 而不是 c_char_p：c_char_p 会自动转 bytes 并丢失
+        # 指针，无法释放这次调用新分配的内存（见 _last_error_message）。
         self._lib.uda_last_error_message.argtypes = []
-        self._lib.uda_last_error_message.restype = ctypes.c_char_p
+        self._lib.uda_last_error_message.restype = ctypes.c_void_p
 
         self._lib.uda_status_message.argtypes = [ctypes.c_int32]
         self._lib.uda_status_message.restype = ctypes.c_char_p
@@ -613,9 +615,15 @@ class Uda:
 
     def _last_error_message(self, status: int, action: str) -> str:
         """读取库记录的失败原因，读取失败时退回状态码描述。"""
-        raw = self._lib.uda_last_error_message()
-        if raw:
-            return raw.decode("utf-8", errors="replace")
+        # 返回值是本次调用新分配的字符串，所有权归调用方：无论解码成功与否都
+        # 必须释放（uda_free_string(NULL) 是空操作），不能像 c_char_p 那样靠
+        # 自动转换拿副本——那会丢失指针、永远无法归还这块内存。
+        pointer = self._lib.uda_last_error_message()
+        if pointer:
+            raw = ctypes.string_at(pointer)
+            self._lib.uda_free_string(pointer)
+            if raw:
+                return raw.decode("utf-8", errors="replace")
         # 库未记录消息（或记录失败）时，用静态描述兜底。必须透传真实失败状态码：
         # 写死 0（success）会把错误文本渲染成"…失败（success）"，毫无诊断价值。
         raw = self._lib.uda_status_message(status)

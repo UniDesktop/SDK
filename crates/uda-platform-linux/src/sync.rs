@@ -38,23 +38,23 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    // Built on the calling thread so a construction failure is reported as an
-    // error instead of stranding the channel below.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-    // The normal case for a synchronous host: no runtime is running, so the
-    // inline current-thread runtime drives the future directly.
+    // The normal case for a synchronous host: no runtime is running, so an
+    // inline current-thread runtime drives the future directly. Built here (not
+    // before the branch) so the ambient branch below never pays for a runtime
+    // it would only ship to another thread.
     if tokio::runtime::Handle::try_current().is_err() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
         return Ok(runtime.block_on(future));
     }
 
     // A host inside tokio: `block_on` on the ambient handle would panic, so the
-    // future is moved to a worker thread with its own runtime and the result is
-    // carried back over a channel. The thread is named and its construction is
-    // fallible: `std::thread::spawn` would panic if the OS refused.
+    // future is moved to a worker thread that builds its own runtime there and
+    // carries the result back over a channel. The thread is named and its
+    // construction is fallible: `std::thread::spawn` would panic if the OS
+    // refused.
     let (sender, receiver) = std::sync::mpsc::channel();
     let worker = std::thread::Builder::new()
         .name("uda-async-runner".to_string())
@@ -62,13 +62,17 @@ where
             // A send failure only means the caller stopped waiting; the value is
             // dropped and the caller below reports the closed channel, so
             // neither side may panic.
-            let _ = sender.send(runtime.block_on(future));
+            let outcome = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map(|runtime| runtime.block_on(future));
+            let _ = sender.send(outcome);
         })
         .map_err(|e| UdaError::Internal(format!("could not start the async runner thread: {e}")))?;
 
     let result = receiver.recv().map_err(|_| {
         UdaError::Internal("the async runner thread ended without a result".to_string())
-    })?;
+    })??;
 
     // The worker has already answered, so joining only reaps the thread that is
     // on its way out - the same reaping discipline as `crate::notify::run_sync`

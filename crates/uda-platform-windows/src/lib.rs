@@ -1,6 +1,6 @@
 //! Windows platform backend for UniDesktop API (UDA).
 //!
-//! Every public item in this crate is gated behind [`cfg(windows)`], so the
+//! Every public item in this crate is gated behind `cfg(windows)`, so the
 //! workspace still type-checks on Linux/macOS hosts (see `AGENTS.md`,
 //! Principle 3: Cross-Compilation Hygiene). The gate is declared **before** the
 //! module list so that a stray module declaration can never be compiled on a
@@ -8,12 +8,12 @@
 //!
 //! # Modules
 //!
-//! - [`appearance`]: dark/light detection via the `AppsUseLightTheme` registry value.
-//! - [`wallpaper`]: static wallpaper via `SystemParametersInfoW` + registry style keys.
-//! - [`wakelock`]: display/system sleep inhibition via `SetThreadExecutionState`.
-//! - [`detection`]: OS release detection via `RtlGetVersion`.
-//! - [`notification`]: native toasts via the WinRT `ToastNotificationManager`.
-//! - [`tray`]: system tray icons via `Shell_NotifyIconW` on a hidden top-level
+//! - `appearance`: dark/light detection via the `AppsUseLightTheme` registry value.
+//! - `wallpaper`: static wallpaper via `SystemParametersInfoW` + registry style keys.
+//! - `wakelock`: display/system sleep inhibition via `SetThreadExecutionState`.
+//! - `detection`: OS release detection via `RtlGetVersion`.
+//! - `notification`: native toasts via the WinRT `ToastNotificationManager`.
+//! - `tray`: system tray icons via `Shell_NotifyIconW` on a hidden top-level
 //!   window driven by a dedicated worker thread (a normal window rather than a
 //!   message-only one, so the worker sees the shell's `TaskbarCreated`
 //!   broadcast and the icon survives an explorer restart).

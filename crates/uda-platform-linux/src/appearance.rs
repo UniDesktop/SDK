@@ -33,7 +33,7 @@ use crate::COMMAND_TIMEOUT;
 /// `UdaError::NotSupported` on other desktops or when parsing fails. GNOME 42
 /// through 46 store an `rgb()`/`rgba()` string in the key; GNOME 47 and newer
 /// store one of the fixed enum names, which are mapped onto the default HIG
-/// palette ([`accent_color_from_name`]).
+/// palette (`accent_color_from_name`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxAppearanceManager;
 
@@ -49,7 +49,7 @@ impl LinuxAppearanceManager {
         Self
     }
 
-    /// Run `program` under [`COMMAND_TIMEOUT`] and collect what it printed.
+    /// Run `program` under `COMMAND_TIMEOUT` and collect what it printed.
     ///
     /// Every failure mode - the tool missing, no stdout pipe, unreadable output,
     /// a timeout - collapses to `None`, and a run that is abandoned is killed so

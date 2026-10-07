@@ -92,6 +92,9 @@ fn status_of_uda_error(error: &UdaError) -> UdaStatus {
         UdaError::CommandFailed(_) => UDA_ERR_INTERNAL,
         UdaError::Io(_) => UDA_ERR_IO,
         UdaError::Internal(_) => UDA_ERR_INTERNAL,
+        // `UdaError` is `#[non_exhaustive]`: an unknown future variant is an
+        // internal failure, never a masqueraded "not supported".
+        _ => UDA_ERR_INTERNAL,
     }
 }
 

@@ -116,7 +116,7 @@ pub fn has_uri_scheme(value: &str) -> bool {
 /// relative ones keep what the caller supplied, because UDA has no working
 /// directory to resolve them against.
 ///
-/// Absolute-ness comes from [`is_absolute_path`], which is host-independent.
+/// Absolute-ness comes from `is_absolute_path`, which is host-independent.
 pub fn file_uri(path: &str) -> String {
     let forward = path.replace('\\', "/");
 

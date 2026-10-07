@@ -15,9 +15,8 @@
 //! # Memory ownership
 //!
 //! - Strings **returned** by UDA are allocated by Rust and must be freed with
-//!   [`uda_free_string`]. The two exceptions are [`uda_last_error_message`]
-//!   (a borrow of library-owned thread-local storage) and [`uda_status_message`]
-//!   (a static string): neither must ever be freed.
+//!   [`uda_free_string`]. The one exception is [`uda_status_message`] (a static
+//!   string), which must never be freed.
 //! - Strings **passed in** are borrowed for the duration of the call only.
 //! - Wake-lock handles are `uint64_t` values owned by this process; release each
 //!   exactly once with [`uda_wakelock_release`].
@@ -257,9 +256,9 @@ pub unsafe extern "C" fn uda_media_get_status(out_status: *mut c_int) -> c_int {
 /// `command` is one of [`UDA_MEDIA_CMD_PLAY`], [`UDA_MEDIA_CMD_PAUSE`],
 /// [`UDA_MEDIA_CMD_TOGGLE`], [`UDA_MEDIA_CMD_NEXT`],
 /// [`UDA_MEDIA_CMD_PREVIOUS`] or [`UDA_MEDIA_CMD_STOP`]. An unknown code returns
-/// [`UDA_ERR_INVALID_ARGUMENT`] and nothing is sent.
+/// `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
 ///
-/// [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) is returned
+/// `UDA_ERR_NOT_SUPPORTED` is returned
 /// when the player refuses the command and when no player is running.
 ///
 /// # Safety
@@ -275,7 +274,7 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 
 /// Report which session and power actions this platform can perform.
 ///
-/// Writes a bitmask made of the [`UDA_SESSION_CAP_*`] constants to
+/// Writes a bitmask made of the `UDA_SESSION_CAP_*` constants to
 /// `*out_capabilities`; `0` means "no session backend exists on this target".
 /// The query is side-effect-free, so a UI may call it freely to decide which
 /// menu entries to draw.
@@ -306,7 +305,7 @@ pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) ->
 /// nothing. The other five exports must be gated behind an explicit user
 /// confirmation.
 ///
-/// Returns [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) when
+/// Returns `UDA_ERR_NOT_SUPPORTED` when
 /// the platform advertises no lock capability at all.
 ///
 /// # Safety
@@ -363,7 +362,7 @@ pub unsafe extern "C" fn uda_session_hibernate() -> c_int {
 ///
 /// On Windows this needs an elevated process or a local administrator account
 /// for `SeShutdownPrivilege`; without it the call fails with
-/// [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED).
+/// `UDA_ERR_NOT_SUPPORTED`.
 ///
 /// **This action restarts the machine.** Unsaved work is lost. Never call it
 /// without an explicit user confirmation.
@@ -482,7 +481,7 @@ pub unsafe extern "C" fn uda_wakelock_acquire(
 
 /// Release a wake lock previously obtained from [`uda_wakelock_acquire`].
 ///
-/// Returns [`UDA_ERR_INVALID_ARGUMENT`] when the handle is not a live lock in
+/// Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live lock in
 /// this process (already released, never issued here, or a fallback lock
 /// retired after its bounded lifetime elapsed).
 #[no_mangle]
@@ -578,11 +577,10 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> c_int {
 
 /// Return the message describing the most recent failure on this thread.
 ///
-/// The returned pointer borrows library-owned storage: it stays valid until the
-/// next UDA call on the same thread replaces the message, and it must **not**
-/// be passed to [`uda_free_string`] (freeing it is undefined behaviour). Copy
-/// the text if it must outlive that. Returns null when no failure has been
-/// recorded on this thread yet.
+/// The returned string is heap-allocated by this call and its ownership moves
+/// to the caller: release it with [`uda_free_string`] and it stays valid until
+/// then, no matter how many other UDA calls run in between. Returns null when
+/// no failure has been recorded on this thread yet.
 #[no_mangle]
 pub extern "C" fn uda_last_error_message() -> *const c_char {
     util::last_error_pointer()
@@ -625,7 +623,7 @@ pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
 
 /// Report which tray features the active platform backend advertises.
 ///
-/// Writes a bitmask made of the [`UDA_TRAY_CAP_*`] constants to
+/// Writes a bitmask made of the `UDA_TRAY_CAP_*` constants to
 /// `*out_capabilities`; `0` means "no tray backend exists on this target", and
 /// a feature the backend cannot deliver has its bit cleared. The query is
 /// side-effect-free - it never registers anything with the shell - so a host
@@ -813,7 +811,7 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_in
 ///
 /// `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
 /// must be a readable, null-terminated UTF-8 string; a blank label is rejected
-/// with [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT)
+/// with `UDA_ERR_INVALID_ARGUMENT`
 /// because it would render an invisible row.
 #[no_mangle]
 pub unsafe extern "C" fn uda_tray_menu_add_text(
@@ -1248,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn last_error_message_returns_a_readable_library_owned_string() {
+    fn last_error_message_returns_a_caller_owned_allocation() {
         let _ = util::take_last_message();
         // SAFETY: passing null is exactly the case under test.
         let status = unsafe { uda_detect_theme(std::ptr::null_mut()) };
@@ -1259,11 +1257,15 @@ mod tests {
             !pointer.is_null(),
             "a failure must leave a readable message"
         );
-        // SAFETY: the pointer borrows the library's thread-local buffer, which
-        // outlives this read; the test must not (and does not) free it.
+        // SAFETY: the pointer is a live library allocation owned by this test
+        // until it is released below.
         let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
             .to_str()
             .expect("the message is valid UTF-8");
         assert!(text.contains("out_theme"), "got: {text}");
+
+        // Ownership moved to the caller: released through the same export that
+        // frees every other returned string.
+        unsafe { util::free_c_string(pointer.cast_mut()) };
     }
 }

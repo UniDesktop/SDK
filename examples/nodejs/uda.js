@@ -213,7 +213,9 @@ function loadUda(libraryPath) {
         slot
       ),
     wakelockRelease: library.func('uda_wakelock_release', 'int32', ['uint64']),
-    lastErrorMessage: library.func('uda_last_error_message', 'char *', []),
+    // 返回 `void *` 而不是 `char *`：koffi 按 `char *` 解码会拿走指针所有权的
+    // 主动权，我们既要读字符串也要释放同一块分配（见 _lastErrorMessage）。
+    lastErrorMessage: library.func('uda_last_error_message', 'void *', []),
     statusMessage: library.func('uda_status_message', 'const char *', ['int32']),
     // `uda_notify(app_name, title, body, icon, actions, out_id)`：app_name 是
     // Windows 的 toast 身份（AppUserModelID），未打包进程靠它才能弹 toast。
@@ -587,9 +589,16 @@ class Uda {
 
   /** @returns {string} 线程本地的最新失败原因的诊断消息。 */
   _lastErrorMessage(action) {
-    const message = this._lib.lastErrorMessage();
-    if (message) {
-      return String(message);
+    // `uda_last_error_message` 返回的字符串归调用方所有：单次调用拿原始指针、
+    // 原地解码后立即 `uda_free_string` 释放（NULL 是空操作）。不能像壁纸读取
+    // 那样调两次——第一次调用已消费消息，第二次只会拿到 NULL。
+    const pointer = this._lib.lastErrorMessage();
+    if (pointer) {
+      const message = String(this._lib.readSlot('char *', pointer));
+      this._lib.freeString(pointer);
+      if (message) {
+        return message;
+      }
     }
     return `${action} 失败`;
   }

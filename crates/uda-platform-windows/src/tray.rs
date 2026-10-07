@@ -56,13 +56,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    KillTimer, LoadImageW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    KillTimer, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage,
     UnregisterClassW, GWLP_USERDATA, HCURSOR, HICON, HMENU, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE,
     LR_LOADFROMFILE, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
-    WNDCLASS_STYLES, WS_OVERLAPPEDWINDOW,
+    WM_COMMAND, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCDESTROY, WM_NULL,
+    WM_RBUTTONUP, WNDCLASSW, WNDCLASS_STYLES, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use uda_core::capability::{Capability, SupportLevel};
@@ -86,17 +86,26 @@ const CALLBACK_MESSAGE: u32 = 0x8000;
 /// borrow, and no reference to the worker survives the modal loop at all.
 const MENU_COMMAND_MESSAGE: u32 = 0x8001;
 
-/// Window style for the worker window: a full top-level window style *without*
-/// the `WS_VISIBLE` bit. Nothing ever appears (the window is never shown and has
-/// a zero size), but it must be a *normal* top-level window rather than a
-/// message-only one: a message-only window does not receive broadcast messages,
-/// so it would never see the `TaskbarCreated` broadcast that announces a shell
-/// restart and the icon could not survive an explorer restart.
-const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+/// Window style for the worker window: `WS_POPUP`, *without* the `WS_VISIBLE`
+/// bit. Nothing ever appears (the window is never shown and has a zero size),
+/// but it must be a *normal* top-level window rather than a message-only one: a
+/// message-only window does not receive broadcast messages, so it would never
+/// see the `TaskbarCreated` broadcast that announces a shell restart and the
+/// icon could not survive an explorer restart. `WS_POPUP` already receives
+/// every broadcast; the caption / menu / sizing / minimize / maximize bits of
+/// `WS_OVERLAPPEDWINDOW` would be dead surface on a window that is never
+/// visible, so they stay off.
+const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_POPUP;
 
-/// Extended style for the worker window: none; invisibility comes from the
-/// missing `WS_VISIBLE` bit and the zero size, not from an extended style.
-const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE = WINDOW_EX_STYLE(0);
+/// Extended style for the worker window: tool window + no activation.
+///
+/// Even at 0x0 without `WS_VISIBLE`, a plain top-level window still shows up in
+/// the Alt+Tab list, in Task Manager's window view, and in `EnumWindows` - a
+/// "ghost window". `WS_EX_TOOLWINDOW` removes it from all three, and
+/// `WS_EX_NOACTIVATE` keeps a stray click from ever bringing a hidden window to
+/// the foreground while leaving its message intake untouched.
+const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE =
+    WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0);
 
 /// Version-4 keyboard activation notification.
 ///
@@ -1827,6 +1836,23 @@ unsafe extern "system" fn tray_window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // A window that is destroyed must stop pointing at its worker: after this
+    // returns, any message routed here finds a null `GWLP_USERDATA` and falls
+    // through to `DefWindowProcW` instead of dereferencing a dangling pointer.
+    // `PostQuitMessage` gives the message loop a second, standard exit path -
+    // the loop normally ends through the worker's tick flag, but a window
+    // destroyed out from under the worker (EndTask, a debugger, a future
+    // teardown ordering) still has to end the thread.
+    if message == WM_NCDESTROY {
+        // SAFETY: clearing a `GWLP_USERDATA` slot on a live window is valid for
+        // any window, whether or not a pointer was ever stored.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+        // SAFETY: posting a quit flag to the current thread's queue is always
+        // valid.
+        unsafe { PostQuitMessage(0) };
+        return LRESULT(0);
+    }
+
     // SAFETY: `GWLP_USERDATA` was written by the thread that owns this window,
     // with a pointer to the worker, which is alive for the window's lifetime.
     let worker = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Worker;

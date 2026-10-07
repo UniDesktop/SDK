@@ -27,7 +27,7 @@ const SWWW_POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///   daemon), then `swww`; both are Tier-3 CLI tools.
 /// - **X11 fallback**: `feh` / `nitrogen` CLI tools.
 ///
-/// Every external tool runs under [`COMMAND_TIMEOUT`], and a tool that had to be
+/// Every external tool runs under `COMMAND_TIMEOUT`, and a tool that had to be
 /// killed is reported rather than treated as a soft miss.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxWallpaperManager;
@@ -68,7 +68,7 @@ impl LinuxWallpaperManager {
     }
 
     /// Start a tool with quiet standard streams and wait for it under
-    /// [`COMMAND_TIMEOUT`].
+    /// `COMMAND_TIMEOUT`.
     ///
     /// Shared by [`Self::run_command`], [`Self::command_output`] and
     /// [`Self::command_exists`] so the spawn flags and the kill-on-timeout rule
@@ -141,7 +141,7 @@ impl LinuxWallpaperManager {
     ///
     /// Existence is "the process ran", not "it exited cleanly": some of the
     /// probed tools do not implement `--version` and would otherwise look
-    /// missing. A tool that never answers within [`COMMAND_TIMEOUT`] does not
+    /// missing. A tool that never answers within `COMMAND_TIMEOUT` does not
     /// count as available.
     async fn command_exists(program: &str) -> bool {
         Self::quiet_command(program, ["--version"], Stdio::null())
@@ -254,7 +254,7 @@ impl LinuxWallpaperManager {
 
     /// Set the wallpaper on KDE Plasma via `evaluateScript`.
     ///
-    /// Every D-Bus round trip is bounded by [`DBUS_TIMEOUT`] so a wedged
+    /// Every D-Bus round trip is bounded by `DBUS_TIMEOUT` so a wedged
     /// `plasmashell` costs a bounded wait instead of a hung caller (P2-39). A
     /// failure is reported as [`UdaError::DetectionFailed`], the variant that
     /// lets [`WallpaperManager::set_wallpaper`] fall through to the CLI chain.
