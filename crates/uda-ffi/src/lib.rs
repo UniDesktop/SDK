@@ -1245,6 +1245,72 @@ mod tests {
         }
     }
 
+    /// The FFI exports whose signatures accept no raw pointer. Every argument
+    /// they take is a value (a numeric handle, a status code) that the library
+    /// handles as data - a garbage value produces an error, never undefined
+    /// behaviour - so Rust callers may use them without an `unsafe` block. Every
+    /// other export dereferences caller memory and must stay `unsafe extern
+    /// "C"`.
+    const VALUE_ONLY_EXPORTS: &[&str] = &[
+        "uda_last_error_message",
+        "uda_status_message",
+        "uda_tray_destroy",
+        "uda_tray_menu_add_separator",
+        "uda_tray_menu_destroy",
+        "uda_tray_set_menu",
+        "uda_tray_set_visible",
+        "uda_wakelock_release",
+    ];
+
+    #[test]
+    fn export_safety_classification_is_pinned() {
+        // The safe/unsafe split of the C ABI surface is a compatibility
+        // contract: Rust hosts that link the dylib see it, and a silent
+        // reclassification (an export drifting between `extern "C"` and
+        // `unsafe extern "C"`) is exactly the kind of surprise change a
+        // downstream build cannot absorb. This pins the split; reclassifying an
+        // export is a deliberate decision that must update this list and the
+        // changelog together.
+        let source = include_str!("lib.rs");
+        let mut plain: Vec<&str> = Vec::new();
+        let mut unsafe_exports: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            let (bucket, signature) =
+                if let Some(rest) = line.strip_prefix("pub unsafe extern \"C\" fn ") {
+                    (&mut unsafe_exports, rest)
+                } else if let Some(rest) = line.strip_prefix("pub extern \"C\" fn ") {
+                    (&mut plain, rest)
+                } else {
+                    continue;
+                };
+            let name = signature.split('(').next().unwrap_or_default();
+            if !name.is_empty() {
+                bucket.push(name);
+            }
+        }
+
+        plain.sort_unstable();
+        let mut expected = VALUE_ONLY_EXPORTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            plain, expected,
+            "the value-only export set drifted; update VALUE_ONLY_EXPORTS and the changelog together"
+        );
+
+        unsafe_exports.sort_unstable();
+        // No export may appear in both sets, and every export not listed as
+        // value-only must be `unsafe`: a pointer-taking export classified safe
+        // would let a Rust caller pass a dangling pointer without any unsafe
+        // block, which is unsound.
+        assert!(unsafe_exports.iter().all(|name| !plain.contains(name)));
+        assert_eq!(
+            unsafe_exports.len() + plain.len(),
+            33,
+            "the export count changed; the classification list must follow"
+        );
+    }
+
     #[test]
     fn last_error_message_returns_a_caller_owned_allocation() {
         let _ = util::take_last_message();
