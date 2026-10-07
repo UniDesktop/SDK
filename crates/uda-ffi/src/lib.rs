@@ -1245,13 +1245,20 @@ mod tests {
         }
     }
 
-    /// The FFI exports whose signatures accept no raw pointer. Every argument
-    /// they take is a value (a numeric handle, a status code) that the library
-    /// handles as data - a garbage value produces an error, never undefined
-    /// behaviour - so Rust callers may use them without an `unsafe` block. Every
-    /// other export dereferences caller memory and must stay `unsafe extern
-    /// "C"`.
-    const VALUE_ONLY_EXPORTS: &[&str] = &[
+    /// The exports the C ABI presents as plain `extern "C"` (no `unsafe`).
+    /// Every argument they take is a value - a numeric handle, a status code -
+    /// that the library handles as data: a garbage value produces an error,
+    /// never undefined behaviour, so a Rust caller may call them without an
+    /// `unsafe` block.
+    ///
+    /// The list pins the classification rather than deriving it: the media
+    /// command and session control exports also take only values, yet they are
+    /// `unsafe`, as they have been since v0.2.0. Conversely every export that
+    /// takes a raw pointer is `unsafe`, because a dangling non-null pointer is
+    /// UB that a safe signature cannot accept. Reclassifying an export either
+    /// way is a compatibility decision: update this list and the changelog
+    /// together.
+    const PLAIN_EXTERN_C_EXPORTS: &[&str] = &[
         "uda_last_error_message",
         "uda_status_message",
         "uda_tray_destroy",
@@ -1284,25 +1291,25 @@ mod tests {
                 } else {
                     continue;
                 };
-            let name = signature.split('(').next().unwrap_or_default();
-            if !name.is_empty() {
-                bucket.push(name);
-            }
+            // rustfmt keeps `fn NAME(` on one line even when it wraps the
+            // parameter list, so the name ends at the first `(`.
+            let end = signature.find('(').unwrap_or(signature.len());
+            bucket.push(&signature[..end]);
         }
 
         plain.sort_unstable();
-        let mut expected = VALUE_ONLY_EXPORTS.to_vec();
+        let mut expected = PLAIN_EXTERN_C_EXPORTS.to_vec();
         expected.sort_unstable();
         assert_eq!(
             plain, expected,
-            "the value-only export set drifted; update VALUE_ONLY_EXPORTS and the changelog together"
+            "the plain export set drifted; update PLAIN_EXTERN_C_EXPORTS and the changelog together"
         );
 
         unsafe_exports.sort_unstable();
         // No export may appear in both sets, and every export not listed as
-        // value-only must be `unsafe`: a pointer-taking export classified safe
-        // would let a Rust caller pass a dangling pointer without any unsafe
-        // block, which is unsound.
+        // plain must be `unsafe`: a pointer-taking export classified safe would
+        // let a Rust caller pass a dangling pointer without any unsafe block,
+        // which is unsound.
         assert!(unsafe_exports.iter().all(|name| !plain.contains(name)));
         assert_eq!(
             unsafe_exports.len() + plain.len(),
