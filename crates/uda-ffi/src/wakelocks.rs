@@ -9,6 +9,10 @@
 //! the handle up, removes it, and drops the guard, which runs the platform
 //! release closure exactly once.
 //!
+//! The table is a `Mutex<HashMap>` guarded by a process-wide lock. Entries are
+//! removed *before* their release closure runs so a slow D-Bus call can never
+//! hold the lock that another thread needs.
+//!
 //! # Release strategy per tier
 //!
 //! - **Tier 1/2 (native IPC):** the guard owns a D-Bus `UnInhibit` cookie or a
@@ -18,9 +22,16 @@
 //!   and releasing means killing it. A child that already exited on its own is
 //!   not an error: the lock was already gone.
 //!
-//! The table is a `Mutex<HashMap>` guarded by a process-wide lock. Entries are
-//! removed *before* their release closure runs so a slow D-Bus call can never
-//! hold the lock that another thread needs.
+//! # Lazy reaping
+//!
+//! A CLI-tier lock lives no longer than its `sleep` child, and nothing observes
+//! that child unless someone comes back for the handle. Every access to the
+//! table (insertion, release, and the diagnostic count) therefore sweeps it
+//! first: entries whose child already exited are reaped and removed, and an
+//! entry at or past its `expires_at` deadline is retired outright - the
+//! documented lifetime of the lock is over, so the child is killed if it still
+//! runs and then reaped. Exited children thus never linger as zombies, and the
+//! table stays honest about which locks are actually live.
 
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -56,10 +67,34 @@ fn registry() -> &'static Mutex<HashMap<u64, LockEntry>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lock the table, recovering from a poisoned lock.
+///
+/// A panic while holding the table must not make every later call fail: the
+/// remaining entries are still valid and removable, which is strictly better
+/// for a host that is shutting down.
+fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<u64, LockEntry>> {
+    match registry().lock() {
+        Ok(table) => table,
+        Err(poisoned) => {
+            log::debug!("wake-lock registry lock was poisoned; recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Source of handle values. Starts at 1 so `0` can mean "no lock" in C.
 fn next_handle() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Allocate the next handle, rejecting the `0` the counter could wrap to.
+///
+/// The counter starts at 1, so the rejection only fires after 2^64 acquires;
+/// it is kept because a handle of `0` would read as "no lock" in C.
+fn next_valid_handle() -> Result<WakeLockHandle, Failure> {
+    WakeLockHandle::from_raw(next_handle())
+        .ok_or_else(|| Failure::InvalidArgument("handle counter produced 0".to_string()))
 }
 
 /// Acquire a wake lock of `lock_type` and return its handle.
@@ -69,14 +104,7 @@ fn next_handle() -> u64 {
 /// with neither a ScreenSaver service nor an XDG portal.
 pub(crate) fn acquire(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
     match acquire_native(lock_type, reason) {
-        Ok(guard) => {
-            // `next_handle` starts at 1, so `from_raw` cannot fail; mapping the
-            // `None` case to an error keeps the registry free of a handle-0
-            // entry that C would read as "no lock".
-            let handle = WakeLockHandle::from_raw(next_handle())
-                .ok_or_else(|| Failure::InvalidArgument("handle counter produced 0".to_string()))?;
-            register(handle, LockEntry::Native(guard))
-        }
+        Ok(guard) => register(next_valid_handle()?, LockEntry::Native(guard)),
         Err(error) => {
             log::debug!("native wake lock unavailable ({error}); trying the CLI tier");
             acquire_cli(lock_type, reason)
@@ -85,30 +113,34 @@ pub(crate) fn acquire(lock_type: WakeLockType, reason: &str) -> Result<WakeLockH
 }
 
 /// Try to acquire the lock through the platform's native IPC.
+///
+/// `new()` and `acquire()` are async but the FFI surface is synchronous, so the
+/// futures run through the shared blocking bridge `crate::notify::run_sync`,
+/// which is safe to call both with and without an ambient tokio runtime.
 fn acquire_native(lock_type: WakeLockType, reason: &str) -> Result<WakeLockGuard, UdaError> {
-    // `new()` and `acquire()` are async but the FFI surface is synchronous, so a
-    // private current-thread runtime is built per call and immediately dropped.
-    // The trait must be in scope for `acquire` to resolve.
+    // `acquire` is a trait method, so the trait must be in scope wherever a
+    // future below is built.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use uda_core::wakelock::WakeLockManager as _;
 
+    // Each block hands the bridge one already-`'static` future; the acquired
+    // guard is the block's value.
     #[cfg(target_os = "linux")]
     {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("tokio runtime: {e}")))?;
-        let manager = runtime.block_on(uda_platform_linux::wakelock::LinuxWakeLockManager::new())?;
-        runtime.block_on(manager.acquire(lock_type, reason))
+        let reason = reason.to_string();
+        crate::notify::run_sync(async move {
+            let manager = uda_platform_linux::wakelock::LinuxWakeLockManager::new().await?;
+            manager.acquire(lock_type, &reason).await
+        })?
     }
 
     #[cfg(target_os = "windows")]
     {
-        let manager = uda_platform_windows::wakelock::WindowsWakeLockManager::new();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("tokio runtime: {e}")))?;
-        runtime.block_on(manager.acquire(lock_type, reason))
+        let reason = reason.to_string();
+        crate::notify::run_sync(async move {
+            let manager = uda_platform_windows::wakelock::WindowsWakeLockManager::new();
+            manager.acquire(lock_type, &reason).await
+        })?
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -120,26 +152,32 @@ fn acquire_native(lock_type: WakeLockType, reason: &str) -> Result<WakeLockGuard
     }
 }
 
-/// Acquire the lock through the CLI tier (`systemd-inhibit`).
-fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
-    let what = match lock_type {
+/// The `--what=` value the CLI tier passes for `lock_type`.
+///
+/// The flag is the only difference the CLI tier can express between the two
+/// lock types.
+fn cli_what_flag(lock_type: WakeLockType) -> &'static str {
+    match lock_type {
         WakeLockType::PreventDisplaySleep => "idle",
         WakeLockType::PreventSystemIdle => "idle:sleep",
-    };
+    }
+}
 
+/// Acquire the lock through the CLI tier (`systemd-inhibit`).
+fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
     let child = Command::new("systemd-inhibit")
         .arg("--who=UDA")
         .arg(format!("--why={reason}"))
-        .arg(format!("--what={what}"))
+        .arg(format!("--what={}", cli_what_flag(lock_type)))
         .arg("--mode=block")
         .arg("sleep")
         .arg(CLI_LOCK_SECONDS.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map_err(|e| {
+        .map_err(|error| {
             Failure::Uda(UdaError::NotSupported(format!(
-                "no native wake lock and the systemd-inhibit CLI fallback is unavailable: {e}"
+                "no native wake lock and the systemd-inhibit CLI fallback is unavailable: {error}"
             )))
         })?;
 
@@ -151,41 +189,110 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
         child,
         expires_at: Instant::now() + Duration::from_secs(CLI_LOCK_SECONDS),
     };
-    let handle = WakeLockHandle::from_raw(next_handle())
-        .ok_or_else(|| Failure::InvalidArgument("handle counter produced 0".to_string()))?;
-    register(handle, entry)
+    register(next_valid_handle()?, entry)
+}
+
+/// Kill and reap a CLI child so it never lingers as a zombie.
+///
+/// Both callers of this - an early release and an expiry sweep - must end with
+/// the child reaped, so the kill and the wait are kept together rather than
+/// repeated at each site. `cause` names why the child is being ended and
+/// travels into the log: an expiry retirement is the one way a host's handle
+/// dies without the host asking for it, so the kill that ends it is logged at
+/// `info`, where the host (or the operator reading the log) can see it,
+/// instead of in the `debug` stream the rest of the tier talks in.
+fn kill_and_reap(handle: u64, child: &mut Child, cause: &str) {
+    match child.try_wait() {
+        // Still running: the lock is only released by ending the child.
+        Ok(None) => {
+            if let Err(error) = child.kill() {
+                log::debug!("failed to kill CLI wake lock {handle}: {error}");
+            } else {
+                log::info!("CLI wake lock {handle} terminated ({cause})");
+            }
+        }
+        Ok(Some(_)) => log::debug!("CLI wake lock {handle} had already exited ({cause})"),
+        Err(error) => log::debug!("try_wait failed for CLI wake lock {handle}: {error}"),
+    }
+
+    if let Err(error) = child.wait() {
+        log::debug!("failed to reap CLI wake lock {handle}: {error}");
+    }
+}
+
+/// Sweep the table: reap CLI children that exited and retire locks past their
+/// deadline.
+///
+/// Called on every access path (insertion, release, the diagnostic count) so
+/// the table never advertises a lock whose backing process is already gone and
+/// exited children are reaped instead of lingering as zombies. An entry at or
+/// past `expires_at` is retired even while its child still runs: the deadline is
+/// the documented lifetime of the lock, and letting it quietly continue would
+/// turn the CLI tier's bounded-lock contract into a lie.
+///
+/// Retiring an expired entry holds the table lock while reaping, but the child
+/// has been `SIGKILL`ed first, so the wait returns within milliseconds.
+fn reap_retired(table: &mut HashMap<u64, LockEntry>) {
+    let now = Instant::now();
+    table.retain(|handle, entry| match entry {
+        LockEntry::Native(_) => true,
+        LockEntry::Cli { child, expires_at } => {
+            if now >= *expires_at {
+                // The lock is over whether or not the child noticed. The
+                // retirement itself is announced here, before the reap, so the
+                // one change a host can only observe as "my handle suddenly
+                // stopped working" is traceable in the log to its cause.
+                log::info!(
+                    "CLI wake lock {handle} retired: its bounded {CLI_LOCK_SECONDS}s lifetime \
+                     expired; a later release of the handle reports UDA_ERR_INVALID_ARGUMENT"
+                );
+                kill_and_reap(*handle, child, "retired at its expiry deadline");
+                return false;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    log::debug!("reaped exited CLI wake lock {handle} ({status})");
+                    false
+                }
+                // Still running and not yet due: the lock is live.
+                Ok(None) => true,
+                Err(error) => {
+                    // A failed probe says nothing about the lock itself, so the
+                    // entry stays rather than dropping a live lock.
+                    log::debug!("try_wait failed for CLI wake lock {handle}: {error}");
+                    true
+                }
+            }
+        }
+    });
 }
 
 /// Insert an entry under `handle`, reusing the handle on registry failure.
 fn register(handle: WakeLockHandle, entry: LockEntry) -> Result<WakeLockHandle, Failure> {
     let raw = handle.raw();
-    let mut table = match registry().lock() {
-        Ok(table) => table,
-        Err(poisoned) => {
-            // A panic while holding the table must not make every later call
-            // fail; the remaining entries are still valid and removable.
-            log::debug!("wake-lock registry lock was poisoned; recovering");
-            poisoned.into_inner()
-        }
-    };
+    let mut table = lock_registry();
+    // Insertion is an access path, so stale entries are reaped here too: a host
+    // that acquires repeatedly never accumulates zombie children.
+    reap_retired(&mut table);
     table.insert(raw, entry);
     Ok(handle)
 }
 
 /// Release the lock behind `handle`.
 ///
-/// The entry is removed first so the release path never holds the table lock.
-/// Releasing an unknown or already-released handle is reported as
+/// The entry is removed first so the release path never holds the table lock
+/// while releasing; the remaining entries are then swept, which makes every
+/// release also reap CLI children that exited in the meantime. Releasing an
+/// unknown or already-released handle is reported as
 /// [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT): the
 /// caller passed a handle this process does not own.
 pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
     let raw = handle.raw();
     let entry = {
-        let mut table = match registry().lock() {
-            Ok(table) => table,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        table.remove(&raw)
+        let mut table = lock_registry();
+        let entry = table.remove(&raw);
+        reap_retired(&mut table);
+        entry
     };
 
     let Some(entry) = entry else {
@@ -200,23 +307,9 @@ pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
             guard.release();
             log::debug!("released native wake lock {raw}");
         }
-        LockEntry::Cli {
-            mut child,
-            expires_at,
-        } => {
-            let still_running = matches!(child.try_wait(), Ok(None));
-            if still_running {
-                if let Err(e) = child.kill() {
-                    log::debug!("failed to kill systemd-inhibit child for {raw}: {e}");
-                }
-            } else {
-                log::debug!("CLI wake lock {raw} had already expired or exited");
-            }
-            // Reap the child so no zombie is left behind.
-            if let Err(e) = child.wait() {
-                log::debug!("failed to reap systemd-inhibit child for {raw}: {e}");
-            }
-            let _ = expires_at;
+        LockEntry::Cli { mut child, .. } => {
+            kill_and_reap(raw, &mut child, "released by the host");
+            log::debug!("released CLI wake lock {raw}");
         }
     }
 
@@ -224,12 +317,14 @@ pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
 }
 
 /// Number of live locks. Exposed for tests and diagnostics.
+///
+/// Sweeps the table first, so the count reflects entries whose backing process
+/// is still alive rather than entries that merely were never released.
 #[cfg(test)]
 fn live_count() -> usize {
-    match registry().lock() {
-        Ok(table) => table.len(),
-        Err(poisoned) => poisoned.into_inner().len(),
-    }
+    let mut table = lock_registry();
+    reap_retired(&mut table);
+    table.len()
 }
 
 #[cfg(test)]
@@ -257,6 +352,38 @@ mod tests {
         }
     }
 
+    /// Acquire a lock through whatever tier this host offers.
+    ///
+    /// Returns `None` when no tier exists at all - the C ABI reports that as
+    /// `UDA_ERR_NOT_SUPPORTED`, and the exported-function tests early-return
+    /// the same way. The registry mechanics are additionally covered by the
+    /// synthetic-entry tests below, which depend on no tier whatsoever.
+    fn acquire_any_tier(reason: &str) -> Option<WakeLockHandle> {
+        acquire(WakeLockType::PreventDisplaySleep, reason).ok()
+    }
+
+    /// Whether `handle` is still in the registry, sweeping stale entries first
+    /// exactly like a real access path would.
+    fn registry_contains(handle: u64) -> bool {
+        let mut table = lock_registry();
+        reap_retired(&mut table);
+        table.contains_key(&handle)
+    }
+
+    /// Spawn a `sleep` child standing in for a CLI-tier lock holder.
+    ///
+    /// The reaper can only be exercised against a real process, so these tests
+    /// use the plainest one available.
+    #[cfg(unix)]
+    fn spawn_sleeper(seconds: &str) -> Child {
+        Command::new("sleep")
+            .arg(seconds)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("`sleep` exists on the unix hosts this crate is tested on")
+    }
+
     #[test]
     fn handles_are_unique_and_non_zero() {
         let first = next_handle();
@@ -282,34 +409,30 @@ mod tests {
         let _guard = registry_guard();
         // On this host the session bus has no ScreenSaver service, so this
         // exercises the CLI tier end to end; on a full desktop it exercises the
-        // native tier. Either way the table must return to its starting size.
-        //
-        // The CLI tier spawns `systemd-inhibit`, whose exit is observed
-        // asynchronously by the registry's reaper. Asserting on the *delta*
-        // rather than an absolute count keeps this test correct even when a
-        // reaper tick from an earlier test lands mid-assertion.
-        let before = live_count();
-        let handle = acquire(WakeLockType::PreventDisplaySleep, "uda-ffi test")
-            .expect("a wake lock is available through some tier");
-        assert!(
-            live_count() > before,
-            "acquiring a lock must add an entry (before={before}, after={})",
-            live_count()
-        );
+        // native tier. A host with neither tier legitimately refuses, and the
+        // synthetic-entry tests below still cover the registry mechanics there.
+        let Some(handle) = acquire_any_tier("uda-ffi test") else {
+            return;
+        };
+        let after_acquire = live_count();
+        assert!(after_acquire >= 1, "acquiring a lock must add an entry");
 
         release(handle).expect("releasing a live lock succeeds");
-        assert!(
-            live_count() < before + 2,
-            "the entry must be removed on release (before={before}, after={})",
-            live_count()
+        // This test holds the serialising lock, so nothing else can add or
+        // remove entries between the two counts.
+        assert_eq!(
+            live_count(),
+            after_acquire - 1,
+            "the entry must be removed on release"
         );
     }
 
     #[test]
     fn double_release_is_reported_not_silently_ignored() {
         let _guard = registry_guard();
-        let handle = acquire(WakeLockType::PreventSystemIdle, "uda-ffi double release")
-            .expect("a wake lock is available");
+        let Some(handle) = acquire_any_tier("uda-ffi double release") else {
+            return;
+        };
         release(handle).expect("first release succeeds");
         let second = release(handle);
         assert!(
@@ -321,37 +444,108 @@ mod tests {
     #[test]
     fn many_locks_can_be_held_and_released_independently() {
         let _guard = registry_guard();
-        let before = live_count();
         let mut handles = Vec::new();
         for index in 0..4 {
-            let handle = acquire(
-                WakeLockType::PreventDisplaySleep,
-                &format!("uda-ffi batch {index}"),
-            )
-            .expect("lock acquired");
+            let Some(handle) = acquire_any_tier(&format!("uda-ffi batch {index}")) else {
+                // No tier on this host; nothing to exercise here.
+                return;
+            };
             handles.push(handle);
         }
-        assert_eq!(live_count(), before + 4, "all four locks are live");
+        let with_all_four = live_count();
+        assert!(with_all_four >= 4, "all four locks are live");
 
         for handle in handles {
             release(handle).expect("each lock releases");
         }
-        assert_eq!(live_count(), before, "every lock was removed");
+        assert_eq!(live_count(), with_all_four - 4, "every lock was removed");
+    }
+
+    #[test]
+    fn the_reaper_never_touches_native_entries() {
+        let _guard = registry_guard();
+
+        let handle = WakeLockHandle::from_raw(next_handle()).expect("non-zero handle");
+        register(
+            handle,
+            LockEntry::Native(WakeLockGuard::new(Box::new(|| {}))),
+        )
+        .expect("the entry registers");
+
+        // Sweeping is what every access path does, and a native entry must
+        // survive it: its lifetime is caller-controlled rather than bound to a
+        // child process.
+        assert!(
+            registry_contains(handle.raw()),
+            "a native entry must survive a reaping sweep"
+        );
+
+        release(handle).expect("the synthetic entry releases like a real one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_reaper_removes_a_cli_entry_whose_child_already_exited() {
+        let _guard = registry_guard();
+
+        let handle = WakeLockHandle::from_raw(next_handle()).expect("non-zero handle");
+        register(
+            handle,
+            LockEntry::Cli {
+                child: spawn_sleeper("0"),
+                expires_at: Instant::now() + Duration::from_secs(CLI_LOCK_SECONDS),
+            },
+        )
+        .expect("the entry registers");
+
+        // `sleep 0` exits almost immediately; poll the registry so the test
+        // does not race the child's exit. Every probe below is a real access
+        // path, so it is the sweep - not the polling - that reaps the entry.
+        let mut reaped = false;
+        for _ in 0..500 {
+            if !registry_contains(handle.raw()) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            reaped,
+            "an entry whose child exited must be reaped and removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_reaper_retires_a_cli_entry_past_its_expiry() {
+        let _guard = registry_guard();
+
+        // A child that would keep running far past the test, paired with a
+        // deadline that is already due: the lock's documented lifetime is over,
+        // so the entry must be retired (child killed and reaped) even though
+        // the caller never released the handle.
+        let child = spawn_sleeper("30");
+        let handle = WakeLockHandle::from_raw(next_handle()).expect("non-zero handle");
+        register(
+            handle,
+            LockEntry::Cli {
+                child,
+                expires_at: Instant::now(),
+            },
+        )
+        .expect("the entry registers");
+
+        assert!(
+            !registry_contains(handle.raw()),
+            "an entry past expires_at must be retired by the reaper"
+        );
     }
 
     #[test]
     fn cli_lock_arguments_cover_the_requested_flags() {
         // The `--what` flag must widen for system-idle locks; this is the only
         // difference the CLI tier can express.
-        let display = match WakeLockType::PreventDisplaySleep {
-            WakeLockType::PreventDisplaySleep => "idle",
-            WakeLockType::PreventSystemIdle => "idle:sleep",
-        };
-        let system = match WakeLockType::PreventSystemIdle {
-            WakeLockType::PreventDisplaySleep => "idle",
-            WakeLockType::PreventSystemIdle => "idle:sleep",
-        };
-        assert_eq!(display, "idle");
-        assert_eq!(system, "idle:sleep");
+        assert_eq!(cli_what_flag(WakeLockType::PreventDisplaySleep), "idle");
+        assert_eq!(cli_what_flag(WakeLockType::PreventSystemIdle), "idle:sleep");
     }
 }

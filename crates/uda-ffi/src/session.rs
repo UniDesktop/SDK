@@ -95,7 +95,7 @@ pub(crate) fn perform(action: SessionAction) -> Result<(), Failure> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = action;
-        Err(Failure::Uda(UdaError::NotSupported(
+        Err(Failure::Uda(uda_core::error::UdaError::NotSupported(
             "no session backend for this target".to_string(),
         )))
     }
@@ -103,9 +103,14 @@ pub(crate) fn perform(action: SessionAction) -> Result<(), Failure> {
 
 /// Check the capability, then dispatch to the matching backend method.
 ///
-/// Kept separate from [`perform`] for two reasons: the tests drive it with a
-/// mock manager (no D-Bus session, no Windows host), and it is where a typed
-/// [`UdaError`] becomes the ABI-level [`Failure`].
+/// Kept separate from [`perform`] so the tests can drive it with a mock manager
+/// (no D-Bus session, no Windows host). On targets without a backend the
+/// non-test build has no caller for it; the tests still exercise it there, hence
+/// the lint waiver rather than a `cfg` that would remove it from those tests.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    allow(dead_code)
+)]
 fn run<M: SessionManager>(manager: &M, action: SessionAction) -> Result<(), Failure> {
     uda_core::session::perform(manager, action).map_err(Failure::from)
 }

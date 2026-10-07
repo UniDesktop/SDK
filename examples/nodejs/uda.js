@@ -19,8 +19,8 @@
  *
  * 依赖仅 `koffi`（零编译 C-ABI 绑定库）；PNG 解码用 Node 内置 `zlib`。
  *
- * 动态库定位顺序：`UDA_LIBRARY` 环境变量 > `cargo metadata` 报告的 target 目录 >
- * 仓库内常见构建目录 > 系统动态库搜索路径。
+ * 动态库定位顺序：`new Uda(libraryPath)` 的显式路径 > `UDA_LIBRARY` 环境变量 >
+ * `cargo metadata` 报告的 target 目录 > 仓库内常见构建目录 > 系统动态库搜索路径。
  */
 
 'use strict';
@@ -143,9 +143,10 @@ function candidateLibraries() {
 /**
  * 加载 UDA 动态库并声明全部函数原型。
  *
- * @throws {Error} 当 koffi 未安装或找不到动态库时。
+ * @param {string} [libraryPath] 显式指定的动态库路径；省略时按默认候选顺序查找。
+ * @throws {Error} 当 koffi 未安装、指定路径加载失败或所有候选都不可用时。
  */
-function loadUda() {
+function loadUda(libraryPath) {
   let koffi;
   try {
     koffi = require('koffi');
@@ -154,28 +155,38 @@ function loadUda() {
   }
 
   let library = null;
-  const failures = [];
 
-  for (const candidate of candidateLibraries()) {
-    // 带路径分隔符的候选必须真实存在；裸库名交给 koffi 自行搜索。
-    const hasSeparator = candidate.includes('/') || candidate.includes('\\');
-    if (hasSeparator && !fs.existsSync(candidate)) {
-      failures.push(`${candidate}: 文件不存在`);
-      continue;
-    }
+  if (libraryPath) {
+    // 显式路径必须一次成功：失败时直接报错而不是静默回落到候选搜索，
+    // 避免加载到与调用方意图不符的另一个动态库副本。
     try {
-      library = koffi.load(candidate);
-      break;
+      library = koffi.load(libraryPath);
     } catch (error) {
-      failures.push(`${candidate}: ${error.message}`);
+      throw new Error(`无法加载指定的动态库 ${libraryPath}: ${error.message}`);
     }
-  }
+  } else {
+    const failures = [];
+    for (const candidate of candidateLibraries()) {
+      // 带路径分隔符的候选必须真实存在；裸库名交给 koffi 自行搜索。
+      const hasSeparator = candidate.includes('/') || candidate.includes('\\');
+      if (hasSeparator && !fs.existsSync(candidate)) {
+        failures.push(`${candidate}: 文件不存在`);
+        continue;
+      }
+      try {
+        library = koffi.load(candidate);
+        break;
+      } catch (error) {
+        failures.push(`${candidate}: ${error.message}`);
+      }
+    }
 
-  if (!library) {
-    throw new Error(
-      '无法加载 libuda_ffi；请先在仓库根目录执行 `cargo build -p uda-ffi`，' +
-        `或设置 UDA_LIBRARY 指向动态库。已尝试：${failures.join('; ')}`
-    );
+    if (!library) {
+      throw new Error(
+        '无法加载 libuda_ffi；请先在仓库根目录执行 `cargo build -p uda-ffi`，' +
+          `或设置 UDA_LIBRARY 指向动态库。已尝试：${failures.join('; ')}`
+      );
+    }
   }
 
   // 出参槽位：koffi 3.x 需要用 `alloc` 分配一块可写内存，调用后再 `decode` 读回。
@@ -553,9 +564,9 @@ function loadIconRgba(filePath, maxExtent) {
 class Uda {
   /** @param {string} [libraryPath] 显式指定动态库路径；省略时按默认顺序查找。 */
   constructor(libraryPath) {
-    const loaded = libraryPath
-      ? loadUda(require('koffi').load(libraryPath))
-      : loadUda();
+    // 显式路径由 loadUda 优先尝试；koffi 依赖缺失等加载错误也统一在那里抛出，
+    // 这里不再直接 require('koffi')（裸 MODULE_NOT_FOUND 对调用方没有诊断价值）。
+    const loaded = loadUda(libraryPath);
 
     this._koffi = loaded.koffi;
     this._lib = loaded.lib;
@@ -652,31 +663,27 @@ class Uda {
   /**
    * 读取壁纸路径，并释放在 C 侧分配的缓冲区。
    *
-   * koffi 读 `char **out` 需要分两次调用：一次按 `char *` 解出字符串，一次按
-   * `void *` 拿原始地址交给 `uda_free_string` 释放。只按 `void *` 读再手动
-   * `decode` 会直接让进程崩溃（实测结论）。
+   * `uda_get_wallpaper` 只调用**一次**；koffi 读 `char **out` 需要把同一个出参
+   * 槽位按两种类型各解一次：一次按 `char *` 解出字符串，一次按 `void *` 拿原始
+   * 地址交给 `uda_free_string` 释放（与 now_playing 的 readAndFree 同一范式）。
+   * 只按 `void *` 读再手动 `decode` 会直接让进程崩溃（实测结论）；若按两种类型
+   * 各调一次导出，平台查询会执行两遍，且第一次的 CString 永远泄漏。
    *
    * @returns {string | null}
    * @private
    */
   _readWallpaper() {
     const charSlotType = 'char *';
-    const charSlot = this._lib.outSlot(charSlotType);
-    this._check(this._lib.getWallpaper(charSlot), 'get_wallpaper');
-    const text = this._lib.readSlot(charSlotType, charSlot);
-    if (!text) {
-      return null;
-    }
-
     const voidSlotType = 'void *';
-    const voidSlot = this._lib.outSlot(voidSlotType);
-    this._check(this._lib.getWallpaper(voidSlot), 'get_wallpaper (释放用)');
-    const pointer = this._lib.readSlot(voidSlotType, voidSlot);
+    const slot = this._lib.outSlot(charSlotType);
+    this._check(this._lib.getWallpaper(slot), 'get_wallpaper');
+
+    const text = this._lib.readSlot(charSlotType, slot);
+    const pointer = this._lib.readSlot(voidSlotType, slot);
     if (pointer) {
       this._lib.freeString(pointer);
     }
-
-    return String(text);
+    return text ? String(text) : null;
   }
 
   /**
@@ -710,6 +717,10 @@ class Uda {
 
   /**
    * 申请防休眠常亮锁。
+   *
+   * Linux 上若原生 IPC 不可用而走了 CLI 兜底（`systemd-inhibit`），该锁约有
+   * 1 小时的上界：到期由库回收退役，此后 `release()` 会以
+   * UDA_ERR_INVALID_ARGUMENT（-1）失败；需要更久的锁请在到期后重新申请。
    *
    * @returns {WakeLock} 调用 `release()` 释放；退出 `with` 块时自动释放。
    */
@@ -1184,20 +1195,9 @@ class TrayMenu {
     const trampoline = callback ? this.uda._registerTextCallback(callback) : null;
     const slot = this.uda._lib.outSlot(this.uda._types.uint64);
 
-    let status;
-    try {
-      status = this.uda._lib.trayMenuAddText(this.handle, label, trampoline, null, slot);
-    } catch (error) {
-      if (trampoline) {
-        this.uda._unregisterCallback(trampoline);
-      }
-      throw error;
-    }
-    this.uda._check(status, `uda_tray_menu_add_text(${label})`);
-
-    if (trampoline) {
-      this.keepalives.push(trampoline);
-    }
+    this._createRow(`uda_tray_menu_add_text(${label})`, trampoline, () =>
+      this.uda._lib.trayMenuAddText(this.handle, label, trampoline, null, slot)
+    );
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
@@ -1219,33 +1219,58 @@ class TrayMenu {
     const trampoline = callback ? this.uda._registerCheckboxCallback(callback) : null;
     const slot = this.uda._lib.outSlot(this.uda._types.uint64);
 
-    let status;
-    try {
-      status = this.uda._lib.trayMenuAddCheckbox(
+    this._createRow(`uda_tray_menu_add_checkbox(${label})`, trampoline, () =>
+      this.uda._lib.trayMenuAddCheckbox(
         this.handle,
         label,
         checked ? 1 : 0,
         trampoline,
         null,
         slot
-      );
-    } catch (error) {
-      if (trampoline) {
-        this.uda._unregisterCallback(trampoline);
-      }
-      throw error;
-    }
-    this.uda._check(status, `uda_tray_menu_add_checkbox(${label})`);
-
-    if (trampoline) {
-      this.keepalives.push(trampoline);
-    }
+      )
+    );
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
       throw new Error('uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
     }
     return itemId;
+  }
+
+  /**
+   * 调用一个创建行的导出，并按结果决定蹦床的归属。
+   *
+   * 文本行与复选框行的所有权规则完全一致，因此集中在一处：
+   * - 导出返回非零（如空标签）或 koffi 抛异常 ⇒ 行未创建，蹦床必须立即反注册，
+   *   否则 koffi 回调槽位（上限 8192）永久占用；
+   * - 成功 ⇒ 行已创建、回调已被 C 侧持有，蹦床进保活列表，此后任何失败都不得
+   *   反注册（菜单还握着这个指针）。
+   *
+   * 状态码校验必须与调用同处一个 try，否则失败的蹦床会走上"没有异常"的路径。
+   *
+   * @param {string} action 用于错误消息的导出名。
+   * @param {object | null} trampoline 本次为行注册的蹦床；无回调时为 null。
+   * @param {() => number} createRow 实际调用导出的闭包。
+   * @private
+   */
+  _createRow(action, trampoline, createRow) {
+    try {
+      this.uda._check(createRow(), action);
+      if (trampoline) {
+        this.keepalives.push(trampoline);
+      }
+    } catch (error) {
+      // 失败路径（koffi 抛异常或导出返回非零）：行未创建，指针必须立即归还。
+      if (trampoline) {
+        try {
+          this.uda._unregisterCallback(trampoline);
+        } catch (cleanupError) {
+          // 清理失败不应掩盖原始错误。
+          console.error(`[UDA tray] 反注册菜单回调失败: ${cleanupError.message}`);
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1263,14 +1288,30 @@ class TrayMenu {
 
   /**
    * 销毁菜单句柄。重复调用是安全的（第二次为空操作）。
+   *
+   * **destroy 之后菜单不可再被图标引用由 FFI 保证解除**：`uda_tray_menu_destroy`
+   * 会先把菜单从所有仍持有它的托盘图标上摘除、释放携带 C 函数指针的行闭包，
+   * 然后本方法才反注册 koffi 蹦床。顺序不能颠倒——koffi 的 unregister 会立即
+   * 释放回调槽位（总量上限 8192，释放后可能被后续注册复用），若图标仍持有菜单，
+   * 下一次点击就会调用已释放的槽位（use-after-free，表现为崩溃或误触发另一个
+   * JS 回调）。
+   *
+   * 手工验证"建菜单 → setMenu → destroy → 点击"场景（修复前必崩/误触发）：
+   * 1. `cargo build -p uda-ffi` 后运行一段脚本：`uda.createTrayMenu()` →
+   *    `menu.addText(...)` 挂回调 → `icon.setMenu(menu)` → 立刻 `menu.destroy()`；
+   * 2. 图标保留在托盘上，右键点开菜单并点击原先添加的行；
+   * 3. 预期：菜单已被解除（不再显示旧行），进程不崩溃、JS 回调不被触发。
    */
   destroy() {
     if (this.destroyed) {
       return;
     }
     this.destroyed = true;
-    // 先反注册蹦床，再销毁句柄：反注册只是丢弃我们自己持有的 C 函数指针，
-    // 而销毁句柄才会移除注册表记录。顺序反了会让悬空指针短暂留在菜单里。
+    // 先销毁句柄：FFI 侧把菜单从所有仍引用它的图标上解除，并释放持有 C 函数
+    // 指针的行闭包；此后不再有任何 C 代码能触达这些回调槽位。
+    this.uda._check(this.uda._lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
+    // 再反注册蹦床：槽位已无人可达，释放是安全的。destroy 失败时在此抛出、
+    // keepalives 原样保留——宁可泄漏槽位，也不把可能仍被引用的指针释放掉。
     for (const trampoline of this.keepalives) {
       try {
         this.uda._unregisterCallback(trampoline);
@@ -1279,7 +1320,6 @@ class TrayMenu {
       }
     }
     this.keepalives = [];
-    this.uda._check(this.uda._lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
   }
 
   /** @returns {void} */
@@ -1386,8 +1426,9 @@ class TrayIcon {
   /**
    * 挂载菜单，替换此前的菜单。
    *
-   * 菜单句柄在本调用之后依然有效：图标持有自己的引用，因此 `destroy()` 菜单是
-   * 可选的，且不会清空托盘已渲染的行。
+   * 图标持有自己的菜单引用，因此不 `destroy()` 也能一直用；反过来，`destroy()`
+   * 菜单时 FFI 会自动把它从所有仍引用它的图标上解除（托盘恢复为无菜单状态），
+   * 不会留下悬空的回调指针。
    *
    * @param {TrayMenu} menu 菜单。
    */

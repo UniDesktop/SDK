@@ -609,15 +609,16 @@ class Uda:
         """状态码非 0 时读取诊断消息并抛出 :class:`UdaError`。"""
         if status == OK:
             return
-        raise UdaError(status, self._last_error_message(action))
+        raise UdaError(status, self._last_error_message(status, action))
 
-    def _last_error_message(self, action: str) -> str:
+    def _last_error_message(self, status: int, action: str) -> str:
         """读取库记录的失败原因，读取失败时退回状态码描述。"""
         raw = self._lib.uda_last_error_message()
         if raw:
             return raw.decode("utf-8", errors="replace")
-        # 库未记录消息（或记录失败）时，用静态描述兜底。
-        raw = self._lib.uda_status_message(0)
+        # 库未记录消息（或记录失败）时，用静态描述兜底。必须透传真实失败状态码：
+        # 写死 0（success）会把错误文本渲染成"…失败（success）"，毫无诊断价值。
+        raw = self._lib.uda_status_message(status)
         if raw:
             return f"{action} 失败（{raw.decode('utf-8', errors='replace')}）"
         return f"{action} 失败"
@@ -706,12 +707,17 @@ class Uda:
         self._check(
             self._lib.uda_get_wallpaper(ctypes.byref(out)), "get_wallpaper"
         )
-        if not out.value:
-            return None
         try:
-            return out.value.decode("utf-8", errors="replace")
+            # 判空必须用 ``is None``：ctypes 对 NULL 返回 None，对非 NULL 空串
+            # 返回 b""（假值）。用 ``not out.value`` 会把非 NULL 空串当成
+            # "未设置"，既漏返回也漏释放（泄漏 CString）。
+            raw = out.value
+            if raw is None:
+                return None
+            return raw.decode("utf-8", errors="replace")
         finally:
-            # 无论解码是否成功都必须释放，避免泄漏。
+            # 无论是否提前返回、解码是否成功都必须释放；uda_free_string(NULL)
+            # 是空操作。
             self._lib.uda_free_string(out)
 
     @wallpaper.setter
@@ -812,6 +818,11 @@ class Uda:
 
             with uda.wakelock() as lock:
                 ...          # 这三秒屏幕不会休眠
+
+        Linux 上若原生 IPC 不可用而走了 CLI 兜底（``systemd-inhibit``），该锁
+        约有 1 小时的上界：到期由库回收退役，此后调用
+        :meth:`WakeLock.release` 会以 ``UDA_ERR_INVALID_ARGUMENT``（-1）失败；
+        需要更久的锁请在到期后重新申请。
 
         Args:
             lock_type: ``"display"`` 或 ``"system"``。

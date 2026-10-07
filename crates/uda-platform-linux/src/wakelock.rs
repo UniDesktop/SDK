@@ -1,7 +1,15 @@
-use crate::error::UdaError;
 use std::sync::Arc;
+
 use uda_core::wakelock::{WakeLockGuard, WakeLockManager, WakeLockType};
 use zbus::Connection;
+
+use crate::error::UdaError;
+use crate::internal_dbus;
+
+/// `org.freedesktop.ScreenSaver` on the session bus, where a wake lock lives.
+const SCREEN_SAVER_SERVICE: &str = "org.freedesktop.ScreenSaver";
+const SCREEN_SAVER_PATH: &str = "/org/freedesktop/ScreenSaver";
+const SCREEN_SAVER_INTERFACE: &str = "org.freedesktop.ScreenSaver";
 
 pub struct LinuxWakeLockManager {
     connection: Arc<Connection>,
@@ -9,9 +17,8 @@ pub struct LinuxWakeLockManager {
 
 impl LinuxWakeLockManager {
     pub async fn new() -> Result<Self, UdaError> {
-        let connection = Connection::session()
-            .await
-            .map_err(|e| UdaError::Internal(format!("Failed to connect to session bus: {e}")))?;
+        let connection =
+            internal_dbus("connecting to the session bus", Connection::session()).await?;
         Ok(Self {
             connection: Arc::new(connection),
         })
@@ -25,42 +32,64 @@ impl WakeLockManager for LinuxWakeLockManager {
         lock_type: WakeLockType,
         reason: &str,
     ) -> Result<WakeLockGuard, UdaError> {
-        let proxy = zbus::Proxy::new(
-            &self.connection,
-            "org.freedesktop.ScreenSaver",
-            "/org/freedesktop/ScreenSaver",
-            "org.freedesktop.ScreenSaver",
+        let proxy = internal_dbus(
+            "building the ScreenSaver proxy",
+            zbus::Proxy::new(
+                &self.connection,
+                SCREEN_SAVER_SERVICE,
+                SCREEN_SAVER_PATH,
+                SCREEN_SAVER_INTERFACE,
+            ),
         )
-        .await
-        .map_err(|e| UdaError::Internal(format!("Failed to create ScreenSaver proxy: {e}")))?;
+        .await?;
 
         let flags = lock_type.to_screen_saver_flags();
-        let cookie: u32 = proxy
-            .call("Inhibit", &(env!("CARGO_PKG_NAME"), reason, flags))
-            .await
-            .map_err(|e| UdaError::Internal(format!("Inhibit call failed: {e}")))?;
+        let cookie: u32 = internal_dbus(
+            "the Inhibit call",
+            proxy.call("Inhibit", &(env!("CARGO_PKG_NAME"), reason, flags)),
+        )
+        .await?;
 
         let connection = Arc::clone(&self.connection);
-        let cookie_for_release = cookie;
 
         Ok(WakeLockGuard::new(Box::new(move || {
             let connection = Arc::clone(&connection);
-            let cookie = cookie_for_release;
             std::thread::spawn(move || {
-                let rt = match tokio::runtime::Runtime::new() {
-                    Ok(rt) => rt,
-                    Err(_) => return,
+                let runtime = match tokio::runtime::Runtime::new() {
+                    Ok(runtime) => runtime,
+                    Err(e) => {
+                        log::warn!("could not start a runtime to release the wake lock: {e}");
+                        return;
+                    }
                 };
-                rt.block_on(async move {
-                    if let Ok(proxy) = zbus::Proxy::new(
-                        &connection,
-                        "org.freedesktop.ScreenSaver",
-                        "/org/freedesktop/ScreenSaver",
-                        "org.freedesktop.ScreenSaver",
+                runtime.block_on(async move {
+                    // Releasing is best effort: the guard has already been
+                    // consumed, so a failure can only be logged.
+                    let proxy = match internal_dbus(
+                        "building the ScreenSaver proxy to release the wake lock",
+                        zbus::Proxy::new(
+                            &connection,
+                            SCREEN_SAVER_SERVICE,
+                            SCREEN_SAVER_PATH,
+                            SCREEN_SAVER_INTERFACE,
+                        ),
                     )
                     .await
                     {
-                        let _response: Result<(), _> = proxy.call("UnInhibit", &cookie).await;
+                        Ok(proxy) => proxy,
+                        Err(e) => {
+                            log::warn!("{e}");
+                            return;
+                        }
+                    };
+
+                    let release = internal_dbus(
+                        "releasing the wake lock",
+                        proxy.call::<&str, (u32,), ()>("UnInhibit", &(cookie,)),
+                    )
+                    .await;
+                    if let Err(e) = release {
+                        log::warn!("{e}");
                     }
                 });
             })

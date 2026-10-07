@@ -3,6 +3,9 @@ use thiserror::Error;
 /// Unified error type for all UDA operations.
 #[derive(Error, Debug)]
 pub enum UdaError {
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("Feature not supported: {0}")]
     NotSupported(String),
 

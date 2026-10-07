@@ -14,7 +14,10 @@
  * ----------------
  *   - Strings RETURNED by UDA are allocated by the library and must be released
  *     with `uda_free_string()`. Passing null to `uda_free_string()` is a no-op,
- *     so callers may free unconditionally.
+ *     so callers may free unconditionally. The two exceptions are
+ *     `uda_last_error_message()` (a borrow of library-owned thread-local
+ *     storage) and `uda_status_message()` (a static string): both must NOT be
+ *     freed.
  *   - Strings PASSED IN are borrowed for the duration of the call only; the
  *     caller keeps ownership and must keep them alive until the call returns.
  *   - Wake-lock handles are plain `uint64_t` values owned by this process.
@@ -51,13 +54,15 @@ extern "C" {
  * @section ownership Ownership in one paragraph
  *
  * String handles returned by this library are allocated by Rust and must be
- * released with uda_free_string(). Every string passed *into* a call is
- * borrowed for the duration of that call only: the caller keeps ownership and
- * may free it immediately afterwards. Tray icons and menus are opaque handles
- * into process-local tables; the caller owns the *handle* and must destroy it
- * exactly once with uda_tray_destroy() / uda_tray_menu_destroy(). Callback
- * pointers registered on a menu row are retained by UDA for the lifetime of
- * that row, and the menu (not the callback) is the unit of destruction.
+ * released with uda_free_string(); the exceptions (uda_last_error_message()
+ * and uda_status_message()) are documented on their own declarations. Every
+ * string passed *into* a call is borrowed for the duration of that call only:
+ * the caller keeps ownership and may free it immediately afterwards. Tray
+ * icons and menus are opaque handles into process-local tables; the caller
+ * owns the *handle* and must destroy it exactly once with uda_tray_destroy() /
+ * uda_tray_menu_destroy(). Callback pointers registered on a menu row are
+ * retained by UDA for the lifetime of that row, and the menu (not the
+ * callback) is the unit of destruction.
  */
 
 /* ------------------------------------------------------------------------- */
@@ -158,6 +163,31 @@ extern "C" {
 /** The machine can be powered off. */
 #define UDA_SESSION_CAP_SHUTDOWN 0x00400000u
 
+/**
+ * A tray backend exists on this platform.
+ *
+ * This bit says nothing by itself: test the feature bits below before relying
+ * on a specific tray behaviour.
+ */
+#define UDA_TRAY_CAP_SYSTEM_TRAY 0x00000080u
+/** The tray icon can be shown, hidden, and swapped at runtime. */
+#define UDA_TRAY_CAP_ICON 0x00000100u
+/** The tray exposes hover text. */
+#define UDA_TRAY_CAP_TOOLTIP 0x00000200u
+/** The tray reports a single primary click. */
+#define UDA_TRAY_CAP_CLICK 0x00000400u
+/**
+ * The tray reports a native double click. Never set on Linux (SNI has no
+ * double-click signal); a host there synthesises it from two clicks.
+ */
+#define UDA_TRAY_CAP_DOUBLE_CLICK 0x00000800u
+/** The tray exposes a context menu. */
+#define UDA_TRAY_CAP_CONTEXT_MENU 0x00001000u
+/** Menu rows can render a checkbox state. */
+#define UDA_TRAY_CAP_CHECKBOX 0x00002000u
+/** Menu rows can be added, removed, or relabelled at runtime. */
+#define UDA_TRAY_CAP_DYNAMIC_MENU 0x00004000u
+
 /* ------------------------------------------------------------------------- */
 /* Functions                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -174,6 +204,10 @@ int32_t uda_detect_theme(int32_t *out_theme);
 /**
  * Set the desktop wallpaper.
  *
+ * Accepts both a plain filesystem path and a `file://` URI. An empty (or
+ * whitespace-only) path is rejected with UDA_ERR_INVALID_ARGUMENT before any
+ * backend is consulted, on every platform.
+ *
  * @param path       Null-terminated UTF-8 filesystem path. Must not be null.
  * @param fill_mode  One of the UDA_FILL_* codes.
  * @return UDA_OK on success, otherwise a negative status code.
@@ -186,7 +220,8 @@ int32_t uda_set_wallpaper(const char *path, int32_t fill_mode);
  * On success *out_path receives a heap C string the caller must release with
  * `uda_free_string()`. When no wallpaper is configured (or the platform cannot
  * report one), *out_path is set to NULL while the call still returns UDA_OK, so
- * check the pointer rather than the status to detect "no wallpaper".
+ * check the pointer rather than the status to detect "no wallpaper". An empty
+ * value is never returned as a zero-length string; it is reported as NULL too.
  *
  * @param out_path  Receives the newly allocated string, or NULL. Must not be
  *                  null itself.
@@ -206,6 +241,10 @@ void uda_free_string(char *s);
 /**
  * Acquire a wake lock.
  *
+ * A lock acquired through the CLI fallback (no native IPC available) is bounded
+ * to roughly one hour: past that deadline the lock is retired and its handle
+ * stops being live, so a host that needs a longer lock must re-acquire it.
+ *
  * @param lock_type   UDA_WAKELOCK_DISPLAY or UDA_WAKELOCK_SYSTEM.
  * @param reason      Null-terminated UTF-8 description used for diagnostics.
  *                    Must not be null.
@@ -219,7 +258,8 @@ int32_t uda_wakelock_acquire(int32_t lock_type, const char *reason, uint64_t *ou
  * Release a wake lock obtained from `uda_wakelock_acquire()`.
  *
  * Returns UDA_ERR_INVALID_ARGUMENT when the handle is not a live lock in this
- * process (already released, or never issued here).
+ * process (already released, never issued here, or a fallback lock retired
+ * after its bounded lifetime elapsed).
  *
  * @param handle  A non-zero handle from `uda_wakelock_acquire()`.
  * @return UDA_OK on success, otherwise a negative status code.
@@ -299,7 +339,9 @@ int32_t uda_get_accent_color(uint8_t *out_rgba);
  * The three strings are allocated by the library and must each be released with
  * uda_free_string(). Freeing NULL is a no-op, so callers may free
  * unconditionally. A field the player does not publish (a radio stream with no
- * album, say) is NULL rather than an empty string, which lets a binding skip it.
+ * album, say) is NULL rather than an empty string - as is a field the player
+ * publishes as the empty string, so a binding's `if (ptr)` check always sees
+ * "no value" the same way.
  *
  * @param out_title         Receives the track title, or NULL. Must not be null.
  * @param out_artist        Receives the artist(s), already joined with ", " when
@@ -462,12 +504,13 @@ int32_t uda_session_shutdown(void);
 /**
  * Return the message describing the most recent failure on the calling thread.
  *
- * The returned string is owned by the library and stays valid until the next
- * UDA call on the same thread; copy it if it must outlive that. Returns NULL
- * when no failure has been recorded yet. Release the copy with
- * `uda_free_string()`.
+ * The returned pointer borrows library-owned storage: it stays valid until the
+ * next UDA call on the same thread replaces the message, and it must NOT be
+ * passed to `uda_free_string()` (freeing it is undefined behaviour). Copy the
+ * text if it must outlive that. Returns NULL when no failure has been recorded
+ * on this thread yet.
  *
- * @return A newly allocated C string, or NULL.
+ * @return A borrowed, null-terminated C string owned by the library, or NULL.
  */
 const char *uda_last_error_message(void);
 
@@ -500,8 +543,10 @@ const char *uda_status_message(int32_t status);
  *   - Handle 0 is never a live resource. A zeroed out-parameter therefore
  *     unambiguously means "the call failed".
  *   - A menu handle stays valid after uda_tray_set_menu(): the icon holds its
- *     own reference, so destroying the menu afterwards leaves the tray working.
- *     Destroy the menu explicitly only when the icon will never need it again.
+ *     own reference, so the menu keeps working whether or not the handle is
+ *     destroyed later. Destroying the menu handle (uda_tray_menu_destroy())
+ *     detaches the menu from every icon still showing it, so its callbacks
+ *     stop firing immediately; the icons themselves stay alive.
  *
  * CALLBACK THREADING MODEL (read before writing a handler)
  *
@@ -638,13 +683,15 @@ typedef void (*UdaTrayCheckboxCallback)(uint64_t item_id, int32_t checked, void 
  *
  * @param menu_handle  A handle from uda_tray_menu_create().
  * @param label        Row text; a blank label is rejected with
- *                     UDA_ERR_NOT_SUPPORTED because it would render invisibly.
+ *                     UDA_ERR_INVALID_ARGUMENT because it would render
+ *                     invisibly.
  * @param callback     Invoked on the tray worker thread when the row is
  *                     activated, or NULL for a silent row.
  * @param user_data    Handed back to `callback` untouched.
  * @param out_item_id  Receives the row's stable, non-zero id on success. The
  *                     callback receives the same value. Must not be null.
- * @return UDA_OK on success, otherwise a negative status code.
+ * @return UDA_OK on success; UDA_ERR_INVALID_ARGUMENT for a blank label or a
+ *         handle that is not a live menu; otherwise a negative status code.
  */
 int32_t uda_tray_menu_add_text(uint64_t menu_handle,
                                const char *label,
@@ -665,19 +712,23 @@ int32_t uda_tray_menu_add_separator(uint64_t menu_handle);
 /**
  * Append a checkbox row to a menu.
  *
- * The row's stored value is inverted *before* `callback` runs, so the `checked`
- * argument is the new state and the menu cannot drift out of sync with the shell.
+ * When a callback is supplied, the row's stored value is inverted *before* it
+ * runs, so the `checked` argument is the new state and the menu cannot drift
+ * out of sync with the shell. A NULL callback installs no handler at all: the
+ * row renders with its initial state and never toggles, which is what a host
+ * that drives the checkbox through its own UI wants.
  *
  * @param menu_handle  A handle from uda_tray_menu_create().
  * @param label        Row text; a blank label is rejected with
- *                     UDA_ERR_NOT_SUPPORTED.
+ *                     UDA_ERR_INVALID_ARGUMENT.
  * @param checked      0 starts unchecked, any other value starts checked.
  * @param callback     Invoked on the tray worker thread when the row is toggled,
- *                     or NULL for a silent row.
+ *                     or NULL for a row that never toggles.
  * @param user_data    Handed back to `callback` untouched.
  * @param out_item_id  Receives the row's stable, non-zero id on success. Must
  *                     not be null.
- * @return UDA_OK on success, otherwise a negative status code.
+ * @return UDA_OK on success; UDA_ERR_INVALID_ARGUMENT for a blank label or a
+ *         handle that is not a live menu; otherwise a negative status code.
  */
 int32_t uda_tray_menu_add_checkbox(uint64_t menu_handle,
                                    const char *label,
@@ -689,8 +740,10 @@ int32_t uda_tray_menu_add_checkbox(uint64_t menu_handle,
 /**
  * Attach a menu to a tray icon, replacing any menu set earlier.
  *
- * The menu handle stays valid after this call: the icon holds its own reference,
- * so destroying the menu afterwards is optional and does not clear the rows.
+ * The menu handle stays valid after this call: the icon holds its own
+ * reference, so the menu keeps working whether or not the handle is destroyed
+ * later. Destroying the handle (see uda_tray_menu_destroy()) detaches the menu
+ * from every icon still showing it.
  *
  * @param tray_handle  A handle from uda_tray_create().
  * @param menu_handle  A handle from uda_tray_menu_create().
@@ -701,14 +754,31 @@ int32_t uda_tray_set_menu(uint64_t tray_handle, uint64_t menu_handle);
 /**
  * Destroy a menu handle.
  *
- * Safe to call after uda_tray_set_menu(), as documented there. Terminal: the
- * handle cannot be reused afterwards.
+ * The menu is detached from EVERY tray icon that still shows it, so its rows
+ * and callbacks stop firing immediately; the icons themselves stay alive and
+ * simply have no menu afterwards. This makes destroying a menu handle safe even
+ * when the host has already attached it and torn down its callback trampolines.
+ * Terminal: the handle cannot be reused afterwards.
  *
  * @param menu_handle  A handle from uda_tray_menu_create().
  * @return UDA_OK on success, UDA_ERR_INVALID_ARGUMENT when the handle is not a
  *         live menu in this process.
  */
 int32_t uda_tray_menu_destroy(uint64_t menu_handle);
+
+/**
+ * Report which tray features the active platform backend advertises.
+ *
+ * Writes a bitmask made of the UDA_TRAY_CAP_* flags to `*out_capabilities`;
+ * 0 means "no tray backend exists on this target", and a feature the backend
+ * cannot deliver has its bit cleared. The query is static and side-effect-free
+ * - it never registers anything with the shell - so a host may call it freely
+ * to decide whether to build tray UI at all, and what to degrade gracefully.
+ *
+ * @param out_capabilities  Receives the bitmask. Must not be null.
+ * @return UDA_OK on success, otherwise a negative status code.
+ */
+int32_t uda_tray_capabilities(uint32_t *out_capabilities);
 
 #ifdef __cplusplus
 }

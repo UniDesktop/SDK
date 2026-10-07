@@ -106,7 +106,7 @@ Hyprland/Sway 的 `swayidle`/`hypridle` 也导出它。Tier 3 回退是
 |---|---|---|---|---|
 | GNOME | `org.gnome.SessionManager` | `/org/gnome/SessionManager` | `org.gnome.SessionManager` | `Logout(0)` |
 | KDE | `org.kde.Shutdown` | `/Shutdown` | `org.kde.Shutdown` | `logout` |
-| XFCE | `org.xfce.Session` | `/org/xfce/Session/Manager` | `org.xfce.Session.Manager` | `Logout` |
+| XFCE | `org.xfce.SessionManager` | `/org/xfce/SessionManager` | `org.xfce.Session.Manager` | `Logout(true, false)` |
 
 每次尝试都带超时；全部失败则返回最后一次的语义错误，绝不静默成功。
 

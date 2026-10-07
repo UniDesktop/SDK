@@ -185,7 +185,12 @@ impl WindowsWallpaperManager {
 
     /// Read the current wallpaper path via `SPI_GETDESKWALLPAPER`.
     ///
-    /// Returns `Ok(None)` when no wallpaper is configured.
+    /// Returns `Ok(None)` when no wallpaper is configured — the API then reports
+    /// success with an empty path — or when the call itself fails, so both shapes
+    /// of "nothing to report" reach the caller the same way. Normalising the
+    /// empty string here also keeps the FFI contract intact: unset fields are
+    /// published as NULL, and a non-null empty string would slip past every
+    /// `if (!ptr)` check in the bindings.
     fn read_wallpaper_path() -> Result<Option<String>, UdaError> {
         let mut buffer = vec![0u16; MAX_PATH_CODE_UNITS];
 
@@ -203,7 +208,7 @@ impl WindowsWallpaperManager {
         };
 
         match result {
-            Ok(()) => Ok(Some(from_wide(&buffer))),
+            Ok(()) => Ok(wallpaper_from_buffer(&buffer)),
             Err(e) => {
                 // `GetLastError` is only meaningful here because
                 // `SystemParametersInfoW` returns a `HRESULT` failure rather than
@@ -259,6 +264,21 @@ impl WindowsWallpaperManager {
 fn from_wide(buffer: &[u16]) -> String {
     let len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..len])
+}
+
+/// Decode a `SPI_GETDESKWALLPAPER` buffer, collapsing an empty path to `None`.
+///
+/// Windows reports "no wallpaper configured" as a successful call that fills the
+/// buffer with an empty string; the FFI layer publishes unset fields as NULL, so
+/// the empty string is normalised away here rather than handed to the caller as
+/// a non-null empty value. Pure, so the rule stays testable without a desktop.
+fn wallpaper_from_buffer(buffer: &[u16]) -> Option<String> {
+    let path = from_wide(buffer);
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 /// Convert a UTF-8 Rust string into a null-terminated UTF-16 buffer.
@@ -468,6 +488,21 @@ mod tests {
     fn from_wide_handles_empty_buffer() {
         assert_eq!(from_wide(&[0]), "");
         assert_eq!(from_wide(&[]), "");
+    }
+
+    #[test]
+    fn an_empty_wallpaper_path_is_normalised_to_none() {
+        // "No wallpaper configured" arrives as a successful call with an empty
+        // string; the FFI contract publishes unset fields as NULL, so the empty
+        // value must be collapsed to `None` here rather than escaped as a
+        // non-null empty string.
+        assert_eq!(wallpaper_from_buffer(&[0]), None);
+        assert_eq!(wallpaper_from_buffer(&[]), None);
+        let path: Vec<u16> = "C:\\wall.jpg".encode_utf16().chain([0]).collect();
+        assert_eq!(
+            wallpaper_from_buffer(&path),
+            Some("C:\\wall.jpg".to_string())
+        );
     }
 
     #[test]

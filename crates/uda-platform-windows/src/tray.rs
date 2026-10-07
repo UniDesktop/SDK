@@ -1,9 +1,9 @@
-//! Windows system tray backend: `Shell_NotifyIconW` + a hidden message-only window.
+//! Windows system tray backend: `Shell_NotifyIconW` + a hidden worker window.
 //!
 //! ```text
 //!  host thread                     tray worker thread
 //!  ───────────                     ──────────────────
-//!  TrayIcon ── Arc<TrayIconInner>   HWND_MESSAGE window
+//!  TrayIcon ── Arc<TrayIconInner>   hidden top-level window
 //!    ├ tooltip / icon / menu         ├ message pump: GetMessageW / Translate /
 //!    └ visible / capabilities        │   DispatchMessageW
 //!                                    └ window proc: WM_xxx -> TrayEvent
@@ -11,9 +11,14 @@
 //!
 //! A tray icon on Windows is a window, not an object: the shell posts callback
 //! messages to the `hWnd` recorded in `NOTIFYICONDATAW`, so that window must
-//! belong to a thread running a message loop. UDA creates a message-only window
-//! (`HWND_MESSAGE` parent) on a dedicated worker thread and never touches the
-//! host's message queue, so the host is never asked to pump messages itself.
+//! belong to a thread running a message loop. UDA creates a hidden top-level
+//! window on a dedicated worker thread and never touches the host's message
+//! queue, so the host is never asked to pump messages itself. The window is a
+//! *normal* top-level window that is never shown rather than a message-only
+//! window on purpose: only a normal window receives broadcast messages, and the
+//! `TaskbarCreated` broadcast (sent whenever explorer.exe starts or restarts) is
+//! the worker's cue to re-register an icon the new shell process knows nothing
+//! about.
 //!
 //! Unlike the Linux backend there is no shared-state mirror, because Win32 calls
 //! such as `Shell_NotifyIconW`, `CreatePopupMenu` and `TrackPopupMenuEx` must be
@@ -34,29 +39,30 @@ use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC,
+    CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::HWND_MESSAGE;
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
 // `Shell_NotifyIconW`, `NOTIFYICONDATAW` and the `NIM_*`/`NIF_*` constants live in
 // `Win32::UI::Shell`; the icon-creation and window APIs (`CreateIcon`,
 // `CreateIconIndirect`, `ICONINFO`, `RegisterClassW`, ...) are exported from
 // `Win32::UI::WindowsAndMessaging`.
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_STATE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_STATE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NIS_HIDDEN, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NOTIFY_ICON_DATA_FLAGS, NOTIFY_ICON_STATE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    KillTimer, LoadImageW, PostMessageW, RegisterClassW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage, UnregisterClassW, GWLP_USERDATA,
-    HCURSOR, HICON, HMENU, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_CHECKED,
-    MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WNDCLASS_STYLES,
-    WS_OVERLAPPED,
+    KillTimer, LoadImageW, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TrackPopupMenuEx, TranslateMessage,
+    UnregisterClassW, GWLP_USERDATA, HCURSOR, HICON, HMENU, ICONINFO, IMAGE_ICON, LR_DEFAULTSIZE,
+    LR_LOADFROMFILE, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    WNDCLASS_STYLES, WS_OVERLAPPEDWINDOW,
 };
 
 use uda_core::capability::{Capability, SupportLevel};
@@ -71,13 +77,43 @@ use uda_core::tray::{
 /// `WM_USER` range free for a host application that ever shares the window.
 const CALLBACK_MESSAGE: u32 = 0x8000;
 
-/// Window style for the hidden window: `WS_OVERLAPPED` is the harmless default,
-/// and a message-only window shows nothing and has no Z-order.
-const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_OVERLAPPED;
+/// Private message that resolves a command chosen in the modal menu loop.
+///
+/// `TrackPopupMenuEx` returns the chosen id, but resolving it needs the worker,
+/// and the frame that called the modal loop must not keep touching the worker
+/// once it returns. Posting the id back through the queue turns the invocation
+/// into an ordinary message: it is dispatched with a fresh, exclusive worker
+/// borrow, and no reference to the worker survives the modal loop at all.
+const MENU_COMMAND_MESSAGE: u32 = 0x8001;
 
-/// Extended style for the hidden window: none, since it is invisible by virtue
-/// of its `HWND_MESSAGE` parent.
+/// Window style for the worker window: a full top-level window style *without*
+/// the `WS_VISIBLE` bit. Nothing ever appears (the window is never shown and has
+/// a zero size), but it must be a *normal* top-level window rather than a
+/// message-only one: a message-only window does not receive broadcast messages,
+/// so it would never see the `TaskbarCreated` broadcast that announces a shell
+/// restart and the icon could not survive an explorer restart.
+const WINDOW_STYLE_BITS: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+
+/// Extended style for the worker window: none; invisibility comes from the
+/// missing `WS_VISIBLE` bit and the zero size, not from an extended style.
 const WINDOW_EX_STYLE_BITS: WINDOW_EX_STYLE = WINDOW_EX_STYLE(0);
+
+/// Version-4 keyboard activation notification.
+///
+/// `shellapi.h` defines `NIN_SELECT` as `WM_USER + 0` and `NIN_KEYSELECT` as
+/// `WM_USER + 1`; the `windows` crate exports the former but not the latter, so
+/// the documented value is spelled out here and asserted in a test.
+const NIN_KEYSELECT: u32 = 0x0401;
+
+/// The `uFlags` bits every registration and update must carry.
+///
+/// `NIF_SHOWTIP` is mandatory alongside `NIF_TIP` under
+/// `NOTIFYICON_VERSION_4`: without it the shell suppresses the standard tooltip
+/// entirely (`tray_specs.md` §2.2), so `set_tooltip` would never become visible.
+/// One constant so the two call sites (`add_icon`, `apply_refresh`) can never
+/// diverge on a flag whose omission is silent.
+const BASE_ICON_FLAGS: NOTIFY_ICON_DATA_FLAGS =
+    NOTIFY_ICON_DATA_FLAGS(NIF_MESSAGE.0 | NIF_TIP.0 | NIF_SHOWTIP.0);
 
 /// Window class name registered once per process. A per-process unique suffix is
 /// appended by `register_window_class`, which owns the counter, so two UDA tray
@@ -170,6 +206,71 @@ fn unpack_callback(wparam: WPARAM, lparam: LPARAM) -> CallbackPayload {
             x: (coordinates & 0xFFFF) as i16 as i32,
             y: ((coordinates >> 16) & 0xFFFF) as i16 as i32,
         },
+    }
+}
+
+/// What the window procedure should do with one shell notification event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallbackAction {
+    /// The icon was activated (mouse click or keyboard selection).
+    Click,
+    /// The icon was double-clicked.
+    DoubleClick,
+    /// A context menu was requested, anchored as described by [`MenuAnchor`].
+    Menu(MenuAnchor),
+    /// Nothing UDA consumes; hand the message to `DefWindowProcW`.
+    Unhandled,
+}
+
+/// Map one version-4 notification event onto a [`CallbackAction`].
+///
+/// Pure so the mapping table stays unit-testable without a shell: v4 reports
+/// mouse activations as `WM_LBUTTONUP` / `WM_LBUTTONDBLCLK`, keyboard
+/// activations as `NIN_SELECT` / `NIN_KEYSELECT`, and context-menu requests as
+/// `WM_RBUTTONUP` (mouse) or `WM_CONTEXTMENU`. `WM_RBUTTONDOWN` is deliberately
+/// *not* a trigger: exactly one of DOWN/UP may open the menu, or a single
+/// right-click would hand itself a second tracking loop re-entrantly.
+fn classify_callback_event(event: u32, cursor: POINT) -> CallbackAction {
+    match event {
+        WM_LBUTTONUP => CallbackAction::Click,
+        // `NIN_SELECT` (mouse selection) and `NIN_KEYSELECT` (keyboard Enter or
+        // Space) are the version-4 activation notifications; both are the click
+        // a host expects, and leaving them unhandled loses keyboard access.
+        NIN_SELECT | NIN_KEYSELECT => CallbackAction::Click,
+        WM_LBUTTONDBLCLK => CallbackAction::DoubleClick,
+        WM_RBUTTONUP => CallbackAction::Menu(MenuAnchor::Reported(cursor)),
+        // `WM_CONTEXTMENU`'s `wParam` has no consistently documented meaning
+        // (keyboard invocations report (-1, -1) or the icon rectangle depending
+        // on the shell), so the menu anchors at the live cursor instead of
+        // trusting a value that may be garbage.
+        WM_CONTEXTMENU => CallbackAction::Menu(MenuAnchor::AtCursor),
+        _ => CallbackAction::Unhandled,
+    }
+}
+
+/// Where a context menu should open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuAnchor {
+    /// The coordinates the shell reported in the callback's `wParam`; trusted
+    /// for mouse notifications only.
+    Reported(POINT),
+    /// No trustworthy position: query the live cursor instead.
+    AtCursor,
+}
+
+/// Resolve a [`MenuAnchor`] into a screen point for `TrackPopupMenuEx`.
+///
+/// A reported `(0, 0)` counts as "no position was supplied" (the keyboard
+/// `Shift+F10` path) and falls back to `live_cursor`, as does
+/// [`MenuAnchor::AtCursor`]; a failed cursor query degrades to the screen
+/// origin, which the alignment flags still place on screen. Pure so the anchor
+/// policy stays unit-testable without a display.
+fn resolve_menu_anchor(anchor: MenuAnchor, live_cursor: Option<POINT>) -> POINT {
+    match anchor {
+        // A non-zero report is a real mouse position; use it verbatim.
+        MenuAnchor::Reported(point) if point.x != 0 || point.y != 0 => point,
+        // A zero report (or no report at all) falls back to the live cursor.
+        _ => live_cursor.unwrap_or(POINT { x: 0, y: 0 }),
     }
 }
 
@@ -298,17 +399,23 @@ fn icon_from_source(source: &TrayIconSource) -> Option<HICON> {
     unsafe {
         let _ = ReleaseDC(HWND::default(), dc);
     }
-    let bitmap = match bitmap {
-        Some(bitmap) => bitmap,
-        None => {
-            log::warn!("could not build a tray icon bitmap");
-            return None;
-        }
+    let Some(bitmap) = bitmap else {
+        log::warn!("could not build a tray icon bitmap");
+        return None;
     };
 
     // An opaque 1bpp mask keeps the shell from treating transparent pixels as
     // "cut out"; the alpha channel in the colour bitmap carries the shape.
-    let mask = create_mask_bitmap(width, height);
+    let mask = match create_mask_bitmap(width, height) {
+        Some(mask) => mask,
+        None => {
+            log::warn!("could not build the tray icon mask bitmap");
+            // The colour bitmap is already built at this point; release it so
+            // this failure path leaks no GDI object either.
+            delete_bitmap(bitmap);
+            return None;
+        }
+    };
     let info = ICONINFO {
         fIcon: windows::Win32::Foundation::BOOL(1),
         xHotspot: 0,
@@ -317,17 +424,24 @@ fn icon_from_source(source: &TrayIconSource) -> Option<HICON> {
         hbmColor: bitmap,
     };
 
-    // SAFETY: `CreateIconIndirect` borrows both bitmaps for the lifetime of the
-    // icon it returns; both stay alive until after the call and are only freed
-    // once the icon is no longer referenced.
-    let icon = unsafe { CreateIconIndirect(&info) };
-    match icon {
+    // SAFETY: `CreateIconIndirect` *copies* the content of both bitmaps into the
+    // icon it returns (MSDN: "the icon ... is created by copying the bitmaps"),
+    // so the originals remain the caller's property and are deleted below on
+    // every path, success or failure.
+    let icon = match unsafe { CreateIconIndirect(&info) } {
         Ok(icon) => Some(icon),
         Err(error) => {
             log::warn!("CreateIconIndirect failed: {error}");
             None
         }
-    }
+    };
+    // The two source bitmaps are no longer needed now that the call has
+    // returned: the icon owns its own copies. Released whether the icon was
+    // created or not, so no path leaks a GDI object (GDI handles are
+    // process-wide and capped at 10,000 by default).
+    delete_bitmap(bitmap);
+    delete_bitmap(mask);
+    icon
 }
 
 /// Build a 32bpp top-down BGRA `HBITMAP` holding `pixels`. A DIB section is used
@@ -366,6 +480,10 @@ fn create_color_bitmap(dc: HDC, width: i32, height: i32, pixels: &[u8]) -> Optio
         }
     };
     if bits.is_null() {
+        // The call reported success but handed back no pixel memory; the
+        // half-built bitmap is the caller's to release, so destroy it here
+        // rather than leaking one GDI object per attempt.
+        delete_bitmap(bitmap);
         return None;
     }
 
@@ -380,14 +498,39 @@ fn create_color_bitmap(dc: HDC, width: i32, height: i32, pixels: &[u8]) -> Optio
 
 /// Build a 1bpp monochrome mask covering the whole icon. All-zero bits mean
 /// "leave the colour bitmap visible", the correct mask when alpha already
-/// encodes the shape.
-fn create_mask_bitmap(width: i32, height: i32) -> HBITMAP {
+/// encodes the shape. Returns `None` when Win32 refuses the bitmap, so the
+/// caller aborts instead of feeding `CreateIconIndirect` a null handle.
+fn create_mask_bitmap(width: i32, height: i32) -> Option<HBITMAP> {
     // A monochrome row is padded to 16 bits; `width <= 32` for any tray icon, so
     // one u16 per row is enough and the rest stays zero.
     let row_bytes = (((width + 15) / 16) * 2) as usize;
     let mut zeros = vec![0u8; row_bytes * height as usize];
     // SAFETY: `CreateBitmap` reads `zeros` as planar data of the documented size.
-    unsafe { CreateBitmap(width, height, 1, 1, Some(zeros.as_mut_ptr().cast())) }
+    let bitmap = unsafe { CreateBitmap(width, height, 1, 1, Some(zeros.as_mut_ptr().cast())) };
+    if bitmap.is_invalid() {
+        let last = unsafe { GetLastError() };
+        log::warn!("CreateBitmap(mask) failed with Win32 error {}", last.0);
+        return None;
+    }
+    Some(bitmap)
+}
+
+/// Release one GDI bitmap, logging a failure instead of panicking.
+///
+/// The bitmaps fed to `CreateIconIndirect` remain the caller's property (the
+/// icon copies their content), so every creation path must reach this exactly
+/// once per bitmap it created.
+fn delete_bitmap(bitmap: HBITMAP) {
+    if bitmap.is_invalid() {
+        return;
+    }
+    // SAFETY: `bitmap` came from `CreateDIBSection` or `CreateBitmap` in this
+    // module and is deleted exactly once here.
+    unsafe {
+        if !DeleteObject(bitmap).as_bool() {
+            log::debug!("DeleteObject reported a failure");
+        }
+    }
 }
 
 /// Destroy an icon built by [`icon_from_source`]. A named function so the drop
@@ -449,9 +592,10 @@ fn menus_equal(
 /// One command id allocated for a menu row, plus the callback it fires.
 ///
 /// `WM_COMMAND` carries a 16-bit id, so the backend keeps an `id -> row` table
-/// rebuilt on every menu mutation (`tray_specs.md` §2.5 item 4). The callback is
-/// cloned out of the host's row at build time, so a click never reaches back
-/// into `TrayMenu` while the shell menu is open.
+/// filled by the single allocation pass of [`MenuTable::build`]
+/// (`tray_specs.md` §2.5 item 4). The callback is cloned out of the host's row
+/// at build time, so a click never reaches back into `TrayMenu` while the
+/// shell menu is open.
 struct MenuEntry {
     /// Win32 command id used in `AppendMenuW`.
     command_id: u16,
@@ -464,11 +608,22 @@ struct MenuEntry {
 /// A `TrayMenu` flattened into Win32 command ids.
 ///
 /// Rows are visited depth-first and ids are allocated contiguously, which keeps
-/// a click addressable regardless of how the host nested its submenus.
+/// a click addressable regardless of how the host nested its submenus. The
+/// table is filled by exactly one pass of [`MenuTable::build`], so every entry
+/// corresponds to one row of the `HMENU` the shell was handed: a separator has
+/// no command id and no entry, and nothing survives from an earlier build.
 struct MenuTable {
     entries: Vec<MenuEntry>,
     /// The next id to hand out; starts above 1 so 0 can mean "nothing chosen".
     next_id: u16,
+    /// The host menu the current entries were built from, by identity.
+    ///
+    /// [`Worker::on_command`] compares this against the menu still attached to
+    /// the icon before invoking anything: if the host detached or replaced the
+    /// menu while a popup was open (or while a chosen id was still travelling
+    /// through the message queue), these entries describe a menu that no
+    /// longer exists and their callbacks must not fire.
+    source: Option<Arc<uda_core::tray::TrayMenu>>,
 }
 
 /// The lowest allocated command id.
@@ -483,6 +638,7 @@ impl MenuTable {
         Self {
             entries: Vec::new(),
             next_id: FIRST_COMMAND_ID,
+            source: None,
         }
     }
 
@@ -507,39 +663,6 @@ impl MenuTable {
             .and_then(|entry| entry.action.clone())
     }
 
-    /// Rebuild the table from a host menu. It is disposable: every mutation
-    /// produces a fresh one, so a stale id can never fire an outdated callback.
-    fn from_menu(menu: &uda_core::tray::TrayMenu) -> Self {
-        let mut table = Self::new();
-        for item in menu.items() {
-            table.push_item(&item);
-        }
-        table
-    }
-
-    /// Allocate ids for one row and, for a submenu, its children.
-    fn push_item(&mut self, item: &MenuItem) -> u16 {
-        match item {
-            MenuItem::Separator => {
-                // A separator still consumes an id so positions line up.
-                self.allocate(String::new(), None)
-            }
-            MenuItem::Text { label, action, .. } => self.allocate(label.clone(), action.clone()),
-            MenuItem::Checkbox { label, action, .. } => {
-                self.allocate(label.clone(), action.clone())
-            }
-            MenuItem::Submenu {
-                label, children, ..
-            } => {
-                let command_id = self.allocate(label.clone(), None);
-                for child in children.items() {
-                    self.push_item(&child);
-                }
-                command_id
-            }
-        }
-    }
-
     /// Log which command id landed on which row, the mapping the shell is about
     /// to be handed.
     fn trace(&self) {
@@ -552,11 +675,26 @@ impl MenuTable {
         }
     }
 
-    /// Build a Win32 `HMENU` for the whole menu, allocating ids as it goes.
+    /// Build a Win32 `HMENU` for the whole menu, allocating ids in the same
+    /// pass.
     ///
-    /// Returns the popup menu and leaves the id table populated; the caller
-    /// destroys the `HMENU` once the shell is done with it.
-    fn build(&mut self, menu: &uda_core::tray::TrayMenu) -> Option<HMENU> {
+    /// The table is reset first, so the result describes exactly one build and
+    /// opening the menu twice cannot accumulate dead entries. On success the
+    /// table records `menu` by identity ([`MenuTable::source`]) — the guard
+    /// [`Worker::on_command`] checks before invoking anything — and every row
+    /// of the returned `HMENU` that carries a command id has exactly one entry
+    /// here; separators carry none. The caller destroys the `HMENU` once the
+    /// shell is done with it. A row Win32 refuses fails the whole build: a
+    /// partially rendered menu would show rows whose command ids can never
+    /// fire anything.
+    fn build(&mut self, menu: &Arc<uda_core::tray::TrayMenu>) -> Option<HMENU> {
+        // The single allocation pass starts from a clean table: `append_item`
+        // below is the only place ids are handed out, so ids, entries and the
+        // `HMENU` stay in one-to-one correspondence.
+        self.entries.clear();
+        self.next_id = FIRST_COMMAND_ID;
+        self.source = None;
+
         let popup = match create_popup() {
             Ok(popup) => popup,
             Err(error) => {
@@ -565,19 +703,41 @@ impl MenuTable {
             }
         };
         for item in menu.items() {
-            self.append_item(popup, &item);
+            if !self.append_item(popup, &item) {
+                // `append_item` already logged the offending row; release the
+                // half-built menu (never handed to the shell) so a failed
+                // append cannot leak it.
+                destroy_menu(popup);
+                // Leave nothing behind: the table must not describe a menu
+                // that was never handed to the shell.
+                self.entries.clear();
+                return None;
+            }
         }
+        self.source = Some(Arc::clone(menu));
         self.trace();
         Some(popup)
     }
 
     /// Append one row (and its submenu, recursively) to `menu`.
-    fn append_item(&mut self, menu: HMENU, item: &MenuItem) {
+    ///
+    /// Returns `false` when Win32 refused the row, so the caller can fail the
+    /// whole menu rather than silently show one with missing rows.
+    fn append_item(&mut self, menu: HMENU, item: &MenuItem) -> bool {
         match item {
             MenuItem::Separator => {
+                // A separator can never be chosen, so it carries no command id
+                // and gets no table entry either.
                 // SAFETY: `menu` is a live popup created by `CreatePopupMenu`.
-                let _ =
+                let appended =
                     unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null()) };
+                match appended {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!("AppendMenuW(separator) failed: {error}");
+                        false
+                    }
+                }
             }
             MenuItem::Text {
                 label,
@@ -585,7 +745,7 @@ impl MenuTable {
                 action,
             } => {
                 let command_id = self.allocate(label.clone(), action.clone());
-                append_row(menu, command_id, label, state.enabled, false, false);
+                append_row(menu, command_id, label, state.enabled, false, false)
             }
             MenuItem::Checkbox {
                 label,
@@ -593,27 +753,33 @@ impl MenuTable {
                 action,
             } => {
                 let command_id = self.allocate(label.clone(), action.clone());
-                append_row(menu, command_id, label, state.enabled, true, state.checked);
+                append_row(menu, command_id, label, state.enabled, true, state.checked)
             }
             MenuItem::Submenu {
                 label, children, ..
             } => {
                 // The submenu row claims one id so its position is stable.
-                let command_id = self.allocate(label.clone(), None);
+                self.allocate(label.clone(), None);
                 let child_menu = match create_popup() {
                     Ok(child_menu) => child_menu,
                     Err(error) => {
                         log::warn!("CreatePopupMenu failed for a submenu: {error}");
-                        return;
+                        return false;
                     }
                 };
                 for child in children.items() {
-                    self.append_item(child_menu, &child);
+                    if !self.append_item(child_menu, &child) {
+                        // The child menu was never attached to the parent, so
+                        // nothing else can reach it; destroy it instead of
+                        // leaking the HMENU.
+                        destroy_menu(child_menu);
+                        return false;
+                    }
                 }
                 let wide = to_utf16(label);
                 // SAFETY: `menu` and `child_menu` are live menus, and `wide`
                 // outlives the call (the label is copied by the shell).
-                let _ = unsafe {
+                let appended = unsafe {
                     AppendMenuW(
                         menu,
                         MF_POPUP,
@@ -621,7 +787,17 @@ impl MenuTable {
                         windows::core::PCWSTR(wide.as_ptr()),
                     )
                 };
-                let _ = command_id;
+                match appended {
+                    // On success ownership of `child_menu` moved into `menu`.
+                    Ok(()) => true,
+                    Err(error) => {
+                        log::error!("AppendMenuW(submenu {label:?}) failed: {error}");
+                        // The append failed, so the popup was never attached to
+                        // the parent and would leak if it were not destroyed.
+                        destroy_menu(child_menu);
+                        false
+                    }
+                }
             }
         }
     }
@@ -633,10 +809,29 @@ fn create_popup() -> windows::core::Result<HMENU> {
     unsafe { CreatePopupMenu() }
 }
 
+/// Release a popup menu built by this module.
+///
+/// Every caller holds either a menu the shell is done with (a finished tracking
+/// loop) or one that was never handed to it (a half-built menu released after a
+/// failed append), so each call destroys a menu nothing else can reach. A named
+/// function so every release path shares one point; a failed destroy is only a
+/// log line.
+fn destroy_menu(menu: HMENU) {
+    // SAFETY: `menu` came from `CreatePopupMenu` in this module and is destroyed
+    // exactly once here; no caller keeps a copy of the handle.
+    unsafe {
+        if let Err(error) = DestroyMenu(menu) {
+            log::debug!("DestroyMenu failed: {error}");
+        }
+    }
+}
+
 /// Append a text or checkbox row to `menu`.
 ///
 /// A disabled row gets both `MF_DISABLED` and `MF_GRAYED`: the first stops it
 /// firing, the second is what actually greys it out (`tray_specs.md` §2.5).
+/// Returns `false` when Win32 refused the row, so a row can never disappear
+/// silently from a menu the host believes it attached.
 fn append_row(
     menu: HMENU,
     command_id: u16,
@@ -644,7 +839,7 @@ fn append_row(
     enabled: bool,
     checkbox: bool,
     checked: bool,
-) {
+) -> bool {
     let wide = to_utf16(label);
     let mut flags = MF_STRING;
     if !enabled {
@@ -655,14 +850,20 @@ fn append_row(
     }
     // SAFETY: `menu` is live and `wide` is kept alive until the call returns;
     // the shell copies the label, so the buffer does not have to outlive it.
-    let _ = unsafe {
+    match unsafe {
         AppendMenuW(
             menu,
             flags,
             command_id as usize,
             windows::core::PCWSTR(wide.as_ptr()),
         )
-    };
+    } {
+        Ok(()) => true,
+        Err(error) => {
+            log::error!("AppendMenuW({command_id}, {label:?}) failed: {error}");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -784,12 +985,22 @@ struct Worker {
     shared: Arc<Mutex<TrayShared>>,
     /// The icon id inside `NOTIFYICONDATAW`; unique per registered icon.
     icon_id: u32,
-    /// The hidden message-only window, once created.
+    /// The hidden worker window, once created.
     hwnd: HWND,
     /// The icon currently registered with the shell, if any.
     icon: HICON,
-    /// Command-id table rebuilt whenever the host changes the menu.
+    /// Command-id table, filled by [`MenuTable::build`] while a popup is
+    /// prepared and discarded when the host's menu changes.
     menu_table: MenuTable,
+    /// Whether this worker's modal menu tracking loop is running.
+    ///
+    /// Per-worker on purpose, not a process-wide static: re-entry can only
+    /// happen on this thread (the modal loop pumps *this* window's messages),
+    /// while a process-wide flag silently swallowed the legitimate menu
+    /// requests of every *other* tray icon's worker. The window procedure takes
+    /// `&mut Worker` per message, so the guard is set, observed and cleared
+    /// through this one field with no cross-thread synchronization.
+    menu_tracking: bool,
     /// Whether the shell has acknowledged `NIM_SETVERSION`.
     version_handshake_done: bool,
     /// Whether the icon was registered and still needs unregistering.
@@ -808,6 +1019,12 @@ struct Worker {
     menu: Option<Arc<uda_core::tray::TrayMenu>>,
     /// Visibility applied by the last successful update.
     visible: bool,
+    /// Message id registered for the shell's `TaskbarCreated` broadcast.
+    ///
+    /// Zero when the registration failed; the window procedure then never
+    /// matches (no real registered message can be 0) and a shell restart is
+    /// simply not survivable, which the setup path logs loudly.
+    taskbar_created_msg: u32,
 }
 
 // SAFETY: the only non-`Send` field is `hwnd` (a raw pointer wrapper). Win32
@@ -825,6 +1042,7 @@ impl Default for Worker {
             hwnd: HWND::default(),
             icon: HICON::default(),
             menu_table: MenuTable::new(),
+            menu_tracking: false,
             version_handshake_done: false,
             registered: false,
             tooltip: String::new(),
@@ -833,6 +1051,7 @@ impl Default for Worker {
             // A new icon is visible until the host hides it; `TrayShared` seeds
             // the same value so the first tick is not mistaken for a change.
             visible: true,
+            taskbar_created_msg: 0,
         }
     }
 }
@@ -864,8 +1083,9 @@ impl Worker {
 
         let wide = to_utf16(class_name);
         let title = to_utf16(&self.name());
-        // `HWND_MESSAGE` as the parent makes the window message-only: it has no
-        // Z-order, never appears in Alt-Tab, and cannot be shown.
+        // A null parent makes this a normal top-level window, which is what
+        // `WINDOW_STYLE_BITS` requires: only such a window receives the
+        // `TaskbarCreated` broadcast registered below.
         //
         // SAFETY: the class is registered, both wide strings outlive the call,
         // and a null `lpparam` is allowed.
@@ -879,7 +1099,7 @@ impl Worker {
                 0,
                 0,
                 0,
-                HWND_MESSAGE,
+                HWND::default(),
                 HMENU::default(),
                 instance,
                 Some(std::ptr::null()),
@@ -909,6 +1129,37 @@ impl Worker {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut Worker as isize);
         }
 
+        // Register for the shell's restart broadcast. The id is session-unique
+        // for this string; zero means the registration failed, in which case
+        // the worker will simply never see a shell restart, so the icon cannot
+        // survive an explorer restart and that deserves a loud log line.
+        self.taskbar_created_msg =
+            unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
+        if self.taskbar_created_msg == 0 {
+            let last = unsafe { GetLastError() };
+            log::error!(
+                "RegisterWindowMessageW(TaskbarCreated) failed with Win32 error {}; \
+                 the tray icon will not survive a shell restart",
+                last.0
+            );
+        }
+
+        // The heartbeat must exist before the icon: `add_icon` is what makes the
+        // shell state live, and a failed timer would orphan it (no tick would
+        // ever apply an update or notice shutdown), so a zero return is a fatal
+        // setup error rather than a silent degradation.
+        //
+        // SAFETY: `hwnd` is this thread's live window, and a `None` timer
+        // procedure means the tick arrives as `WM_TIMER` instead of a call.
+        let timer = unsafe { SetTimer(hwnd, SYNC_TIMER_ID, SYNC_INTERVAL_MS, None) };
+        if timer == 0 {
+            let last = unsafe { GetLastError() };
+            return Err(UdaError::Internal(format!(
+                "could not start the tray sync timer (Win32 error {})",
+                last.0
+            )));
+        }
+
         self.add_icon()?;
         Ok(())
     }
@@ -928,8 +1179,6 @@ impl Worker {
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         data.hWnd = self.hwnd;
         data.uID = self.icon_id;
-        // Only the flags that are actually set may appear in `uFlags`, so the
-        // icon is only requested when a source exists.
         data.uCallbackMessage = CALLBACK_MESSAGE;
 
         let (tip, icon) = {
@@ -944,7 +1193,9 @@ impl Worker {
             )
         };
 
-        let mut flags = NIF_MESSAGE | NIF_TIP;
+        // Only flags that are actually set may appear in `uFlags`, so the icon
+        // is only requested when a source exists.
+        let mut flags = BASE_ICON_FLAGS;
         if !icon.is_invalid() {
             flags |= NIF_ICON;
             data.hIcon = icon;
@@ -953,7 +1204,7 @@ impl Worker {
         data.szTip = tip;
 
         // SAFETY: `data` is fully initialised and `hwnd` is this thread's
-        // message-only window; the shell copies what it needs before returning.
+        // hidden worker window; the shell copies what it needs before returning.
         let added = unsafe { Shell_NotifyIconW(NIM_ADD, &data) };
         if !added.as_bool() {
             log::warn!("Shell_NotifyIconW(NIM_ADD) failed; no tray icon");
@@ -962,6 +1213,10 @@ impl Worker {
                 "the shell refused to add a tray icon".to_string(),
             ));
         }
+        // A shell-restart re-registration supersedes the previous handle only
+        // after the shell accepted the new one; on a first registration the
+        // previous handle is the invalid default and `destroy_icon` is a no-op.
+        destroy_icon(self.icon);
         self.icon = icon;
         // Only now is the item really registered, which is what lets `teardown`
         // decide whether a `NIM_DELETE` is owed at all.
@@ -988,17 +1243,18 @@ impl Worker {
     ///
     /// Rebuilds the whole `NOTIFYICONDATAW` from the mirror, which is what keeps
     /// tooltip, icon and visibility in step after any sequence of host calls.
-    fn apply_refresh(&mut self) {
+    ///
+    /// Returns `true` when the shell accepted the update. The caches
+    /// (`tooltip`, `last_icon`, `visible`) are rewritten **only on success**,
+    /// so a failed update leaves them stale and the next tick retries it
+    /// instead of recording a change as applied that the shell never saw.
+    fn apply_refresh(&mut self) -> bool {
         if self.hwnd.is_invalid() {
-            return;
+            return false;
         }
-        let (tip, icon_source, visible) = {
+        let (tooltip, icon_source, visible) = {
             let shared = lock_or_recover(&self.shared, "worker refresh");
-            (
-                to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&shared.tooltip)),
-                shared.icon.clone(),
-                shared.visible,
-            )
+            (shared.tooltip.clone(), shared.icon.clone(), shared.visible)
         };
 
         let mut data = NOTIFYICONDATAW::default();
@@ -1006,10 +1262,10 @@ impl Worker {
         data.hWnd = self.hwnd;
         data.uID = self.icon_id;
         data.uCallbackMessage = CALLBACK_MESSAGE;
-        data.szTip = tip;
+        data.szTip = to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&tooltip));
 
         let mut new_icon = self.icon;
-        let mut flags = NIF_MESSAGE | NIF_TIP;
+        let mut flags = BASE_ICON_FLAGS;
         if visible {
             if let Some(source) = icon_source.as_ref() {
                 new_icon = icon_from_source(source).unwrap_or(self.icon);
@@ -1018,17 +1274,19 @@ impl Worker {
                 flags |= NIF_ICON;
                 data.hIcon = new_icon;
             }
-            // Clearing `NIS_HIDDEN` explicitly, so a previously hidden icon
-            // comes back rather than staying passive.
+            // Showing the icon clears `NIS_HIDDEN`: `dwStateMask` selects which
+            // bits are touched, so the mask must name `NIS_HIDDEN` while the
+            // state itself is zero. A zero mask would change nothing and a
+            // hidden icon would never come back.
             flags |= NIF_STATE;
-            data.dwState = windows::Win32::UI::Shell::NOTIFY_ICON_STATE(0);
-            data.dwStateMask = windows::Win32::UI::Shell::NOTIFY_ICON_STATE(0);
+            data.dwState = NOTIFY_ICON_STATE(0);
+            data.dwStateMask = NIS_HIDDEN;
         } else {
             // A hidden icon keeps its registration but is not drawn, which is
             // the documented alternative to unregistering and re-adding.
             flags |= NIF_STATE;
-            data.dwState = windows::Win32::UI::Shell::NIS_HIDDEN;
-            data.dwStateMask = windows::Win32::UI::Shell::NIS_HIDDEN;
+            data.dwState = NIS_HIDDEN;
+            data.dwStateMask = NIS_HIDDEN;
         }
         data.uFlags = flags;
 
@@ -1036,8 +1294,14 @@ impl Worker {
         // documented modify path.
         let updated = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
         if !updated.as_bool() {
-            log::debug!("Shell_NotifyIconW(NIM_MODIFY) failed");
-            return;
+            log::debug!("Shell_NotifyIconW(NIM_MODIFY) failed; keeping the previous state");
+            // A freshly built handle must not leak — but it may legitimately be
+            // the still-registered one (`unwrap_or(self.icon)` above), which has
+            // to survive a failed update.
+            if !new_icon.is_invalid() && new_icon != self.icon {
+                destroy_icon(new_icon);
+            }
+            return false;
         }
 
         // Only retire the previous icon once the shell accepted the new one,
@@ -1046,18 +1310,25 @@ impl Worker {
             destroy_icon(self.icon);
             self.icon = new_icon;
         }
+        // Record exactly what the shell now shows, so the next tick compares
+        // against reality rather than against intent (and retries a failed
+        // update because the cache still holds the old value).
+        self.tooltip = tooltip;
+        self.last_icon = icon_source;
+        self.visible = visible;
+        true
     }
 
-    /// Rebuild the command-id table from the host's menu.
-    fn rebuild_menu(&mut self) {
-        let menu = {
-            let shared = lock_or_recover(&self.shared, "worker menu");
-            shared.menu.clone()
-        };
-        self.menu_table = match menu {
-            Some(menu) => MenuTable::from_menu(&menu),
-            None => MenuTable::new(),
-        };
+    /// Discard the command-id table after the host's menu changed.
+    ///
+    /// Ids are allocated only while a popup is being prepared
+    /// ([`MenuTable::build`]), so between opens "rebuilding" means dropping:
+    /// entries left over from the last build describe a popup the shell is no
+    /// longer showing. [`Worker::on_command`] independently re-checks the
+    /// table's `source` against the menu still attached, so a command that
+    /// arrives before this tick runs is discarded there as well.
+    fn invalidate_menu_table(&mut self) {
+        self.menu_table = MenuTable::new();
     }
 
     /// Mirror the host state, then apply or tear down as needed.
@@ -1068,13 +1339,13 @@ impl Worker {
     ///
     /// Returns `false` when the worker must stop.
     fn on_tick(&mut self) -> bool {
-        let (tooltip, icon, menu, visible, shutdown) = {
+        let (menu, tooltip, icon, visible, shutdown) = {
             let mut shared = lock_or_recover(&self.shared, "tick");
             shared.sync_from();
             (
+                shared.menu.clone(),
                 shared.tooltip.clone(),
                 shared.icon.clone(),
-                shared.menu.clone(),
                 shared.visible,
                 shared.shutdown,
             )
@@ -1087,18 +1358,20 @@ impl Worker {
             return false;
         }
 
-        if visible != self.visible {
-            self.visible = visible;
-            self.apply_refresh();
-        }
-        if tooltip != self.tooltip || !icons_equal(icon.as_ref(), self.last_icon.as_ref()) {
-            self.tooltip = tooltip;
-            self.last_icon = icon;
+        // One refresh covers visibility, tooltip and icon together; whether the
+        // mirror differs from what the shell last accepted decides whether a
+        // `NIM_MODIFY` is worth issuing. `apply_refresh` rewrites its caches
+        // only on success, so a failed update stays dirty here and is retried
+        // on the next tick instead of being recorded as applied.
+        if visible != self.visible
+            || tooltip != self.tooltip
+            || !icons_equal(icon.as_ref(), self.last_icon.as_ref())
+        {
             self.apply_refresh();
         }
         if !menus_equal(menu.as_ref(), self.menu.as_ref()) {
             self.menu = menu;
-            self.rebuild_menu();
+            self.invalidate_menu_table();
         }
         true
     }
@@ -1108,17 +1381,9 @@ impl Worker {
     /// This is the thread entry point: the message loop blocks in
     /// `GetMessageW` until a message arrives or the window is destroyed, so the
     /// thread parks without burning CPU and never blocks the host. The sync
-    /// timer posts `WM_TIMER` into this same loop, so everything the worker does
-    /// happens on one thread.
+    /// timer (registered by `setup`) posts `WM_TIMER` into this same loop, so
+    /// everything the worker does happens on one thread.
     fn run(&mut self) {
-        // The timer is the worker's heartbeat: it drives state mirroring and
-        // shutdown detection without a channel the host would have to signal.
-        // SAFETY: `hwnd` is this thread's live window, and a `None` timer
-        // procedure means the tick arrives as `WM_TIMER` instead of a call.
-        unsafe {
-            SetTimer(self.hwnd, SYNC_TIMER_ID, SYNC_INTERVAL_MS, None);
-        }
-
         // SAFETY: `msg` is a plain out-struct owned by this frame, and the loop
         // exits on `<= 0` as documented (0 = WM_QUIT, -1 = error).
         let mut msg = MSG::default();
@@ -1149,7 +1414,8 @@ impl Worker {
     /// `NIM_SETVERSION`; `tray_specs.md` §2.2) **both** the event and the icon id
     /// travel packed into `lParam`:
     ///
-    /// * **low 16 bits of `lParam`** - the mouse message (`WM_LBUTTONUP`, ...).
+    /// * **low 16 bits of `lParam`** - the notification (`WM_LBUTTONUP`,
+    ///   `WM_CONTEXTMENU`, `NIN_SELECT`, ...).
     /// * **high 16 bits of `lParam`** - the icon id from `NOTIFYICONDATAW::uID`.
     /// * **`wParam`** - the cursor's **screen coordinates**, `x` in the low word
     ///   and `y` in the high word. It is *not* an id, so comparing it against
@@ -1157,8 +1423,8 @@ impl Worker {
     ///   coordinate pair, which is exactly the "icon appears but nothing
     ///   responds" symptom.
     ///
-    /// `wParam` is still forwarded to [`Worker::show_menu`], because a popup
-    /// anchored at the mouse position needs those coordinates.
+    /// The event-to-action mapping itself lives in
+    /// [`classify_callback_event`], where it is unit-testable.
     fn on_callback(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         let payload = unpack_callback(wparam, lparam);
         // Ignore anything addressed to a different icon in this window's set.
@@ -1166,26 +1432,24 @@ impl Worker {
             return LRESULT(0);
         }
 
-        match payload.event {
-            x if x == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
-                self.dispatch(TrayEvent::Click);
-            }
-            x if x == windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK => {
-                self.dispatch(TrayEvent::DoubleClick);
-            }
-            x if x == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP
-                || x == windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN
-                || x == windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU =>
-            {
+        match classify_callback_event(payload.event, payload.cursor) {
+            CallbackAction::Click => self.dispatch(TrayEvent::Click),
+            CallbackAction::DoubleClick => self.dispatch(TrayEvent::DoubleClick),
+            CallbackAction::Menu(anchor) => {
+                // While the modal tracking loop pumps messages, a further menu
+                // trigger would stack a second popup on the first; the guard
+                // turns the inner request into a no-op instead. The flag is
+                // per-worker (re-entry only ever happens on this thread), so
+                // another icon's worker is never blocked by this popup.
+                if self.menu_tracking {
+                    log::debug!("menu trigger ignored while a popup is already tracking");
+                    return LRESULT(0);
+                }
                 // A menu request is not a `TrayEvent`; it is handled inline so
                 // the shell's own event ordering is respected.
-                //
-                // `wParam` is the only place the shell reports *where* the click
-                // happened, so the popup can open at the cursor instead of
-                // wherever a separate `GetCursorPos` happens to read.
-                self.show_menu(payload.cursor);
+                self.show_menu(anchor);
             }
-            _ => {
+            CallbackAction::Unhandled => {
                 // SAFETY: fall through to the default handler for everything
                 // UDA does not consume.
                 return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
@@ -1217,106 +1481,136 @@ impl Worker {
         }
     }
 
-    /// Build and show the context menu at the cursor.
+    /// Build and show the context menu.
     ///
-    /// The focus dance in `tray_specs.md` §2.5 item 3 is mandatory: without
-    /// `SetForegroundWindow` the popup does not dismiss on an outside click, and
-    /// without the trailing `WM_NULL` some shells leave it stuck open.
+    /// The work is split in two so no borrow of the worker is alive while the
+    /// modal loop pumps messages: everything touching `self` happens in
+    /// [`Worker::prepare_menu`], and tracking runs from plain locals
+    /// ([`MenuSession`]). The window procedure, which takes `&mut Worker` from
+    /// `GWLP_USERDATA`, can therefore re-enter freely — any `WM_COMMAND`, click
+    /// handler or menu trigger it serves behaves exactly as it would without a
+    /// menu open. The chosen command id is forwarded through the message queue
+    /// ([`MENU_COMMAND_MESSAGE`]) so its invocation also runs under a fresh,
+    /// exclusive worker borrow.
+    fn show_menu(&mut self, anchor: MenuAnchor) {
+        // `session` owns only plain values, so the borrow of `self` ends here;
+        // the tracking guard is handed over as a plain `&mut bool` so the modal
+        // loop can set and release it without touching the worker again.
+        if let Some(session) = self.prepare_menu(anchor) {
+            session.track(&mut self.menu_tracking);
+        }
+    }
+
+    /// Phase one of the menu: everything that needs the worker.
     ///
-    /// `anchor` is the cursor position the shell reported in the callback's
-    /// `wParam`. It is only a hint: some shells deliver (0, 0) for keyboard
-    /// invocations (the `Shift+F10` path), so a zero anchor falls back to a live
-    /// `GetCursorPos` query instead of pinning the menu to the screen's origin.
-    fn show_menu(&mut self, anchor: POINT) {
+    /// Builds a fresh popup menu from the host's menu (a Win32 menu is a
+    /// snapshot of the rows at build time, and the host may have mutated it
+    /// since it was last shown), resolves the anchor point and claims
+    /// foreground status.
+    fn prepare_menu(&mut self, anchor: MenuAnchor) -> Option<MenuSession> {
         let menu = {
             let shared = lock_or_recover(&self.shared, "show menu");
             shared.menu.clone()
         };
-        let Some(menu) = menu else {
-            return;
-        };
+        let menu = menu?;
 
-        // Rebuilt on every open: the host may have mutated the menu since it was
-        // last shown, and a Win32 menu is a snapshot of the rows at build time.
-        self.rebuild_menu();
-        self.menu_table.trace();
-        let popup = match self.menu_table.build(&menu) {
-            Some(popup) => popup,
-            None => return,
-        };
+        // One allocation pass: `build` resets the table, hands every row with
+        // a command id exactly one id and records which menu the ids belong
+        // to. (The previous rebuild-then-build pair allocated every row twice
+        // — once for the table and once for the `HMENU` — which doubled the
+        // table, left dead ids that could never be chosen, and filled `trace`
+        // with entries the shell could never send.)
+        let popup = self.menu_table.build(&menu)?;
 
-        // A zero anchor means "no position was supplied" (keyboard invocation, or
-        // a shell that reports only the icon rectangle); the live cursor position
-        // is then the better guess. A cursor query failure is not fatal either:
-        // the alignment flags below still keep the menu on screen.
-        let point = if anchor.x != 0 || anchor.y != 0 {
-            anchor
-        } else {
-            let mut cursor = POINT::default();
-            if unsafe { GetCursorPos(&mut cursor) }.is_ok() {
-                cursor
-            } else {
-                POINT { x: 0, y: 0 }
-            }
+        // One read serves both fallbacks; `resolve_menu_anchor` holds the
+        // policy, and a failed query is not fatal because the alignment flags
+        // still keep the menu on screen.
+        let mut cursor = POINT::default();
+        // SAFETY: `cursor` is a plain out-struct owned by this frame.
+        let live_cursor = match unsafe { GetCursorPos(&mut cursor) } {
+            Ok(()) => Some(cursor),
+            Err(_) => None,
         };
+        let point = resolve_menu_anchor(anchor, live_cursor);
 
         // SAFETY: `hwnd` is this thread's window; making it foreground is the
         // documented requirement for a dismissible popup.
-        unsafe {
-            let _ = SetForegroundWindow(self.hwnd);
+        let foreground = unsafe { SetForegroundWindow(self.hwnd) };
+        if !foreground.as_bool() {
+            // The call is what lets the popup dismiss on an outside click, so a
+            // failure (typically the foreground-lock timeout) degrades the
+            // menu rather than aborting it. There is deliberately no
+            // `NIM_SETFOCUS` fallback: that request only tells the shell to
+            // hand focus back to the *notification area*, it does not make this
+            // window foreground, so it cannot substitute here.
+            log::warn!("SetForegroundWindow failed; the menu may not dismiss on an outside click");
         }
 
-        // SAFETY: `popup` is live, `hwnd` is live, and no `TPMPARAMS` is needed
-        // for a simple popup. `TPM_RETURNCMD` hands the chosen id back instead
-        // of posting `WM_COMMAND`, which keeps the lookup in one place.
-        let chosen = unsafe {
-            TrackPopupMenuEx(
-                popup,
-                (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD).0,
-                point.x,
-                point.y,
-                self.hwnd,
-                None,
-            )
-        };
+        Some(MenuSession {
+            hwnd: self.hwnd,
+            popup,
+            point,
+        })
+    }
 
-        // SAFETY: a harmless posted message that unblocks the menu's own modal
-        // loop, per the documented workaround.
-        unsafe {
-            let _ = PostMessageW(self.hwnd, 0, WPARAM(0), LPARAM(0));
+    /// Re-register the icon after the shell restarted (`TaskbarCreated`).
+    ///
+    /// explorer.exe forgets every notification-area item when it (re)starts; the
+    /// worker re-adds the icon from its mirrored state. A refusal is not fatal:
+    /// the next `TaskbarCreated` or the sync tick still sees a consistent
+    /// worker.
+    fn on_taskbar_created(&mut self) {
+        if self.hwnd.is_invalid() {
+            return;
         }
-
-        // SAFETY: `popup` is no longer referenced by the shell once
-        // `TrackPopupMenuEx` returned.
-        unsafe {
-            let _ = DestroyMenu(popup);
+        log::debug!("shell restarted; re-registering the tray icon");
+        // explorer forgot the item, so the local flag must be cleared before
+        // the re-add: `add_icon` sets it again only on success.
+        self.registered = false;
+        if let Err(error) = self.add_icon() {
+            log::warn!("could not re-register the tray icon after a shell restart: {error}");
+            return;
         }
-
-        // 0 means the user dismissed the menu without choosing anything.
-        let command_id = chosen.0 as u16;
-        if command_id != 0 {
-            let action = self.menu_table.action_for(command_id);
-            if let Some(action) = action {
-                action.invoke(&TrayEvent::Click);
-            }
+        if !self.visible {
+            // `add_icon` registers the icon shown. Flip the applied cache back
+            // to "visible" so the next tick sees a difference from the hidden
+            // mirror and re-applies `NIS_HIDDEN`; a failed hide is retried
+            // there too, because the caches only advance on success.
+            self.visible = true;
         }
     }
 
-    /// Handle a `WM_COMMAND` addressed at the popup menu.
+    /// Handle a menu command id.
     ///
-    /// `TPM_RETURNCMD` already resolves the id, but a shell that posts the
-    /// message instead still lands here; both paths use the same lookup so there
-    /// is exactly one place a command becomes a callback.
+    /// The one place a command becomes a callback, reached two ways: the modal
+    /// loop forwards the id the user chose via [`MENU_COMMAND_MESSAGE`]
+    /// (`TPM_RETURNCMD` returns it instead of posting `WM_COMMAND`), and a shell
+    /// that posts `WM_COMMAND` on its own lands on the same lookup.
+    ///
+    /// Before anything is invoked, the id is gated on the menu *still attached*
+    /// to the icon: the table records which menu it was built from
+    /// ([`MenuTable::source`]) and a command whose menu has since been detached
+    /// or replaced is dropped. This is the last gate against firing a callback
+    /// captured from a menu the host destroyed while the popup was open or
+    /// while the chosen id was still travelling through the message queue — the
+    /// FFI side unlinks the menu from the icon but cannot recall the actions
+    /// already cloned into the worker's table. Identity comparison cannot close
+    /// every race (a host mutating the same `TrayMenu` in place is invisible to
+    /// it), but it covers the window the message queue opens.
     fn on_command(&mut self, command_id: u16) {
         if command_id == 0 {
             return;
         }
+        let attached = lock_or_recover(&self.shared, "menu command").menu.clone();
+        if !menus_equal(self.menu_table.source.as_ref(), attached.as_ref()) {
+            log::debug!("tray command {command_id} dropped: its menu is no longer attached");
+            return;
+        }
         let action = self.menu_table.action_for(command_id);
-        // The row's label is logged alongside the id so a host debugging its own
-        // menu can see which row the shell actually delivered.
-        match action.is_some() {
-            true => log::debug!("tray command {command_id} resolved to a row"),
-            false => log::debug!("tray command {command_id} matched no row"),
+        if action.is_some() {
+            log::debug!("tray command {command_id} resolved to a row");
+        } else {
+            log::debug!("tray command {command_id} matched no row");
         }
         if let Some(action) = action {
             action.invoke(&TrayEvent::Click);
@@ -1343,31 +1637,36 @@ impl Worker {
     /// keeps a dangling `hWnd` and may show a ghost icon until logoff
     /// (`tray_specs.md` §2.7).
     fn teardown(&mut self) {
-        // A window with no registration owed nothing to the shell, so the
-        // `NIM_DELETE` is skipped entirely rather than issued against an id the
-        // shell may have recycled for another item.
-        if self.registered && !self.hwnd.is_invalid() {
-            // Stop the heartbeat first: no tick may fire while the icon is being
-            // unregistered, or it would try to refresh an item mid-deletion.
+        // Stop the heartbeat first: no tick may fire while the icon is being
+        // unregistered, or it would try to refresh an item mid-deletion. The
+        // timer is killed whenever the window exists (not only on a successful
+        // registration) because `setup` creates it before `add_icon`; killing
+        // an id the window has no timer for is a harmless no-op.
+        if !self.hwnd.is_invalid() {
             // SAFETY: `hwnd` is this thread's live window and the timer id is
-            // the one `run` registered.
+            // the one `setup` registered.
             unsafe {
                 let _ = KillTimer(self.hwnd, SYNC_TIMER_ID);
             }
 
-            let mut data = NOTIFYICONDATAW::default();
-            data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-            data.hWnd = self.hwnd;
-            data.uID = self.icon_id;
-            // SAFETY: same window and id as registration; the shell forgets the
-            // item immediately, so no other field has to be filled.
-            let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
-            if !removed.as_bool() {
-                log::debug!("Shell_NotifyIconW(NIM_DELETE) reported a failure");
+            // A window with no registration owed the shell nothing, so the
+            // `NIM_DELETE` is skipped entirely rather than issued against an id
+            // the shell may have recycled for another item.
+            if self.registered {
+                let mut data = NOTIFYICONDATAW::default();
+                data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                data.hWnd = self.hwnd;
+                data.uID = self.icon_id;
+                // SAFETY: same window and id as registration; the shell forgets
+                // the item immediately, so no other field has to be filled.
+                let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                if !removed.as_bool() {
+                    log::debug!("Shell_NotifyIconW(NIM_DELETE) reported a failure");
+                }
+                // Either way the item is gone from this worker's point of view;
+                // a second teardown must not try again.
+                self.registered = false;
             }
-            // Either way the item is gone from this worker's point of view; a
-            // second teardown must not try again.
-            self.registered = false;
         }
 
         destroy_icon(self.icon);
@@ -1377,6 +1676,81 @@ impl Worker {
             // SAFETY: this thread created the window and owns its message loop.
             let _ = unsafe { DestroyWindow(self.hwnd) };
             self.hwnd = HWND::default();
+        }
+    }
+}
+
+/// The modal phase of a context menu: plain values only, no worker borrow.
+///
+/// A standalone bundle on purpose, so the modal loop inside `TrackPopupMenuEx`
+/// can let the window procedure take the worker's `&mut` as the only live
+/// reference.
+struct MenuSession {
+    /// The worker window the popup is attached to.
+    hwnd: HWND,
+    /// The popup menu to track, destroyed by [`MenuSession::track`].
+    popup: HMENU,
+    /// The screen point the menu opens at.
+    point: POINT,
+}
+
+impl MenuSession {
+    /// Run the modal tracking loop and forward the chosen command id.
+    ///
+    /// The id is posted back as [`MENU_COMMAND_MESSAGE`] instead of returned,
+    /// because resolving it needs the worker and the caller holds no borrow of
+    /// it across (or after) the modal loop. A failed forward is logged as an
+    /// error — the choice is then lost, which is strictly worse than a failed
+    /// menu build.
+    fn track(self, menu_tracking: &mut bool) {
+        // The window procedure ignores further menu triggers while this is
+        // set; it reads the same worker field through `&mut Worker` on every
+        // nested message, so the nested trigger sees it before any pumping
+        // starts and the flag never has to be process-wide.
+        *menu_tracking = true;
+
+        // SAFETY: `popup` is live, `hwnd` is live, and no `TPMPARAMS` is needed
+        // for a simple popup. `TPM_RETURNCMD` hands the chosen id back instead
+        // of posting `WM_COMMAND`, which keeps the lookup in one place.
+        let chosen = unsafe {
+            TrackPopupMenuEx(
+                self.popup,
+                (TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD).0,
+                self.point.x,
+                self.point.y,
+                self.hwnd,
+                None,
+            )
+        };
+
+        // SAFETY: a harmless posted `WM_NULL` that unblocks the menu's own modal
+        // loop, per the documented workaround.
+        unsafe {
+            let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        }
+
+        // The modal loop is done; release the guard before any later message
+        // could legitimately be treated as a menu request again.
+        *menu_tracking = false;
+
+        // `popup` is no longer referenced by the shell once `TrackPopupMenuEx`
+        // returned.
+        destroy_menu(self.popup);
+
+        // 0 means the user dismissed the menu without choosing anything.
+        if chosen.0 != 0 {
+            // SAFETY: `hwnd` is this thread's live window; posting only enqueues
+            // a message for the worker's own pump to dispatch.
+            unsafe {
+                if let Err(error) = PostMessageW(
+                    self.hwnd,
+                    MENU_COMMAND_MESSAGE,
+                    WPARAM(chosen.0 as usize),
+                    LPARAM(0),
+                ) {
+                    log::error!("could not forward the chosen menu command: {error}");
+                }
+            }
         }
     }
 }
@@ -1437,10 +1811,10 @@ fn unregister_window_class(class_name: &str) {
     }
 }
 
-/// The window procedure for the hidden tray window.
+/// The window procedure for the hidden worker window.
 ///
 /// The worker pointer is stashed in `GWLP_USERDATA` at creation, so this is a
-/// thin trampoline: it hands UDA's own message to the worker and defers
+/// thin trampoline: it hands UDA's own messages to the worker and defers
 /// everything else to `DefWindowProcW`.
 ///
 /// # Safety
@@ -1463,8 +1837,19 @@ unsafe extern "system" fn tray_window_proc(
         if message == CALLBACK_MESSAGE {
             return worker.on_callback(hwnd, message, wparam, lparam);
         }
-        if message == windows::Win32::UI::WindowsAndMessaging::WM_COMMAND {
-            // The low word of `wParam` is the command id.
+        // The shell's restart broadcast. Zero never matches (no registered
+        // message id can be 0), which is what keeps a failed registration from
+        // turning every `WM_NULL` into a re-registration attempt.
+        if worker.taskbar_created_msg != 0 && message == worker.taskbar_created_msg {
+            // explorer.exe (re)started and forgot the icon; re-register it. A
+            // broadcast is a notification, not a request for a default handler,
+            // so it ends here.
+            worker.on_taskbar_created();
+            return LRESULT(0);
+        }
+        if message == WM_COMMAND || message == MENU_COMMAND_MESSAGE {
+            // The low word of `wParam` is the command id, both for a shell-posted
+            // `WM_COMMAND` and for the id forwarded out of the modal menu loop.
             worker.on_command((wparam.0 & 0xFFFF) as u16);
             return LRESULT(0);
         }
@@ -1813,9 +2198,10 @@ mod tests {
     #[test]
     fn command_ids_are_allocated_above_zero_and_uniquely() {
         let menu = sample_menu();
-        let mut table = MenuTable::from_menu(&menu);
-        // `from_menu` already allocated the top-level rows; the ids must all be
-        // non-zero, because `TrackPopupMenuEx` returns 0 for "nothing chosen".
+        let mut table = MenuTable::new();
+        assert!(table.build(&menu).is_some());
+        // The ids must all be non-zero, because `TrackPopupMenuEx` returns 0
+        // for "nothing chosen".
         let mut seen = Vec::new();
         for entry in &table.entries {
             assert_ne!(entry.command_id, 0, "0 is reserved for dismissal");
@@ -1826,7 +2212,9 @@ mod tests {
             );
             seen.push(entry.command_id);
         }
-        assert!(seen.len() >= 5, "one entry per row: {}", seen.len());
+        // One entry per row that carries a command id: the sample has five
+        // (the separator is id-less in the HMENU and has no entry).
+        assert_eq!(seen.len(), 5, "one entry per id-bearing row: {}", seen.len());
 
         // A further allocation must not reuse an id.
         let extra = table.allocate("x".to_string(), None);
@@ -1844,9 +2232,9 @@ mod tests {
             }))
             .is_ok());
 
-        let mut table = MenuTable::from_menu(&menu);
-        // Rebuild through `build` so the id that `AppendMenuW` received is the
-        // one the lookup uses.
+        let mut table = MenuTable::new();
+        // Build so the id that `AppendMenuW` received is the one the lookup
+        // uses.
         let popup = table.build(&menu);
         assert!(popup.is_some(), "a menu must build");
         let action = table.action_for(FIRST_COMMAND_ID);
@@ -1863,7 +2251,7 @@ mod tests {
     #[test]
     fn nested_rows_get_their_own_ids_so_a_click_is_addressable() {
         let menu = sample_menu();
-        let mut table = MenuTable::from_menu(&menu);
+        let mut table = MenuTable::new();
         // Build so the ids handed to `AppendMenuW` are the ones the lookup uses.
         assert!(table.build(&menu).is_some());
 
@@ -1891,10 +2279,102 @@ mod tests {
     #[test]
     fn a_menu_without_rows_still_encodes() {
         let menu = Arc::new(uda_core::tray::TrayMenu::new());
-        let mut table = MenuTable::from_menu(&menu);
+        let mut table = MenuTable::new();
         assert!(table.entries.is_empty());
         let popup = table.build(&menu);
         assert!(popup.is_some(), "an empty menu is still a valid popup");
+        // An empty menu builds an empty table: no rows, no ids, no entries.
+        assert!(table.entries.is_empty());
+    }
+
+    #[test]
+    fn a_second_build_replaces_the_table_instead_of_accumulating() {
+        // Opening the menu twice must not double the table: `build` is the one
+        // allocation pass and starts from a clean table every time.
+        let menu = sample_menu();
+        let mut table = MenuTable::new();
+        assert!(table.build(&menu).is_some());
+        let first: Vec<u16> = table.entries.iter().map(|entry| entry.command_id).collect();
+
+        assert!(table.build(&menu).is_some());
+        let second: Vec<u16> = table.entries.iter().map(|entry| entry.command_id).collect();
+        assert_eq!(second, first, "the same menu must build the same ids");
+        assert_eq!(second.first(), Some(&FIRST_COMMAND_ID));
+        assert_eq!(second.last(), Some(&(FIRST_COMMAND_ID + 4)));
+    }
+
+    #[test]
+    fn a_build_yields_one_entry_per_row_of_the_real_menu() {
+        // Every row of the built HMENU carries a command id, so the table must
+        // mirror the shell's menu exactly — one entry per row, one id per
+        // entry, no dead allocations. Submenu rows are counted through their
+        // own popup: `GetMenuItemCount` sees only a menu's immediate rows.
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        assert!(menu.push(MenuItem::text("open")).is_ok());
+        assert!(menu.push(MenuItem::checkbox_checked("pin")).is_ok());
+        let child = Arc::new(uda_core::tray::TrayMenu::new());
+        assert!(child.push(MenuItem::text("inner")).is_ok());
+        assert!(menu
+            .push(MenuItem::submenu("more", Arc::clone(&child)))
+            .is_ok());
+
+        let mut table = MenuTable::new();
+        let popup = match table.build(&menu) {
+            Some(popup) => popup,
+            None => panic!("a menu must build"),
+        };
+
+        // The built HMENU really has one row per entry, so the ids the shell
+        // can send and the table's lookups stay in one-to-one correspondence.
+        // SAFETY: `popup` is a live menu built above; these calls only read
+        // its structure.
+        let top_rows =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount(popup) };
+        // SAFETY: same live menu; the submenu is the third top-level row.
+        let child_menu = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSubMenu(popup, 2) };
+        assert!(!child_menu.is_invalid(), "the submenu must be attached");
+        // SAFETY: `child_menu` is the live submenu attached to `popup`.
+        let child_rows =
+            unsafe { windows::Win32::UI::WindowsAndMessaging::GetMenuItemCount(child_menu) };
+        assert_eq!(
+            top_rows + child_rows,
+            table.entries.len() as i32,
+            "one entry per row of the HMENU, nested rows included"
+        );
+        assert_eq!(table.entries.len(), 4);
+        for (index, entry) in table.entries.iter().enumerate() {
+            assert_eq!(entry.command_id, FIRST_COMMAND_ID + index as u16);
+        }
+        destroy_menu(popup);
+    }
+
+    #[test]
+    fn a_built_table_remembers_which_menu_it_was_built_from() {
+        // `on_command` drops a command when the menu it was built from is no
+        // longer the one attached to the icon; that guard needs the table to
+        // record its source by identity.
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        assert!(menu.push(MenuItem::text("open")).is_ok());
+        let replacement = Arc::new(uda_core::tray::TrayMenu::new());
+        assert!(replacement.push(MenuItem::text("quit")).is_ok());
+
+        let mut table = MenuTable::new();
+        assert!(table.source.is_none(), "an unbuilt table has no source");
+
+        assert!(table.build(&menu).is_some());
+        assert!(Arc::ptr_eq(
+            table.source.as_ref().expect("a build records its source"),
+            &menu
+        ));
+        assert!(!menus_equal(table.source.as_ref(), Some(&replacement)));
+
+        // A rebuild retargets the identity and describes only the new menu.
+        assert!(table.build(&replacement).is_some());
+        assert!(Arc::ptr_eq(
+            table.source.as_ref().expect("a rebuild records its source"),
+            &replacement
+        ));
+        assert_eq!(table.entries.len(), 1);
     }
 
     #[test]
@@ -1942,6 +2422,27 @@ mod tests {
         const WM_USER: u32 = 0x0400;
         assert!(CALLBACK_MESSAGE >= WM_USER);
         assert_eq!(CALLBACK_MESSAGE, 0x8000);
+    }
+
+    #[test]
+    fn the_private_messages_are_distinct_from_the_callback_message() {
+        // Both live in the `WM_APP` range; a collision would route one message
+        // kind into the handler of the other.
+        assert_ne!(MENU_COMMAND_MESSAGE, CALLBACK_MESSAGE);
+        assert!(MENU_COMMAND_MESSAGE > CALLBACK_MESSAGE);
+    }
+
+    #[test]
+    fn the_base_icon_flags_always_carry_the_mandatory_showtip_bit() {
+        // `NIF_SHOWTIP` must accompany `NIF_TIP` under `NOTIFYICON_VERSION_4`,
+        // or the shell suppresses the tooltip (`tray_specs.md` §2.2).
+        assert_eq!(BASE_ICON_FLAGS.0 & NIF_MESSAGE.0, NIF_MESSAGE.0);
+        assert_eq!(BASE_ICON_FLAGS.0 & NIF_TIP.0, NIF_TIP.0);
+        assert_eq!(BASE_ICON_FLAGS.0 & NIF_SHOWTIP.0, NIF_SHOWTIP.0);
+        // Neither state bit belongs in the base set: `NIF_ICON` and `NIF_STATE`
+        // are added per update.
+        assert_eq!(BASE_ICON_FLAGS.0 & NIF_ICON.0, 0);
+        assert_eq!(BASE_ICON_FLAGS.0 & NIF_STATE.0, 0);
     }
 
     #[test]
@@ -2149,5 +2650,104 @@ mod tests {
             state.tooltip = "written once".to_string();
         }
         assert_eq!(lock_or_recover(&clone, "test").tooltip, "written once");
+    }
+
+    #[test]
+    fn every_activation_notification_maps_to_a_click() {
+        const CURSOR: POINT = POINT { x: 12, y: 34 };
+        // Mouse activation...
+        assert_eq!(
+            classify_callback_event(WM_LBUTTONUP, CURSOR),
+            CallbackAction::Click
+        );
+        // ...and both version-4 keyboard activations (`NIN_SELECT` is what the
+        // shell reports after a mouse selection, `NIN_KEYSELECT` after Enter or
+        // Space); dropping either loses keyboard access to the icon.
+        assert_eq!(
+            classify_callback_event(NIN_SELECT, CURSOR),
+            CallbackAction::Click
+        );
+        assert_eq!(
+            classify_callback_event(NIN_KEYSELECT, CURSOR),
+            CallbackAction::Click
+        );
+        assert_eq!(
+            classify_callback_event(WM_LBUTTONDBLCLK, CURSOR),
+            CallbackAction::DoubleClick
+        );
+    }
+
+    #[test]
+    fn only_rbutton_up_and_context_menu_open_the_menu() {
+        const CURSOR: POINT = POINT { x: -96, y: 40 };
+        assert_eq!(
+            classify_callback_event(WM_RBUTTONUP, CURSOR),
+            CallbackAction::Menu(MenuAnchor::Reported(CURSOR))
+        );
+        // `WM_CONTEXTMENU` never trusts its `wParam`: the anchor is resolved
+        // from the live cursor instead.
+        assert_eq!(
+            classify_callback_event(WM_CONTEXTMENU, CURSOR),
+            CallbackAction::Menu(MenuAnchor::AtCursor)
+        );
+        // `WM_RBUTTONDOWN` must not trigger a second tracking loop on top of
+        // the one the UP event opens.
+        assert_eq!(
+            classify_callback_event(
+                windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN,
+                CURSOR
+            ),
+            CallbackAction::Unhandled
+        );
+        // A left click is a `TrayEvent`, never a menu.
+        assert_ne!(
+            classify_callback_event(WM_LBUTTONUP, CURSOR),
+            CallbackAction::Menu(MenuAnchor::AtCursor)
+        );
+    }
+
+    #[test]
+    fn the_keyboard_activation_constant_matches_shellapi() {
+        // `shellapi.h`: `NIN_SELECT` is `WM_USER`, `NIN_KEYSELECT` is
+        // `WM_USER + 1`. The latter is spelled out locally, so the value is
+        // pinned here against the documented definition.
+        assert_eq!(NIN_SELECT, 0x0400);
+        assert_eq!(NIN_KEYSELECT, 0x0401);
+        assert_eq!(NIN_KEYSELECT, NIN_SELECT + 1);
+    }
+
+    #[test]
+    fn a_non_zero_reported_anchor_wins_over_the_live_cursor() {
+        let reported = POINT { x: 100, y: 40 };
+        let cursor = POINT { x: 1, y: 2 };
+        assert_eq!(
+            resolve_menu_anchor(MenuAnchor::Reported(reported), Some(cursor)),
+            reported
+        );
+    }
+
+    #[test]
+    fn a_zero_report_or_no_report_falls_back_to_the_cursor() {
+        let cursor = POINT { x: 1, y: 2 };
+        // An exact (0, 0) report means "no position was supplied" (the
+        // keyboard Shift+F10 path), not "the user is at the screen origin".
+        assert_eq!(
+            resolve_menu_anchor(MenuAnchor::Reported(POINT { x: 0, y: 0 }), Some(cursor)),
+            cursor
+        );
+        assert_eq!(
+            resolve_menu_anchor(MenuAnchor::AtCursor, Some(cursor)),
+            cursor
+        );
+    }
+
+    #[test]
+    fn a_failed_cursor_query_degrades_to_the_origin() {
+        // Nothing usable anywhere: the alignment flags still place the menu on
+        // screen, so the origin is a survivable answer and not a panic path.
+        assert_eq!(
+            resolve_menu_anchor(MenuAnchor::AtCursor, None),
+            POINT { x: 0, y: 0 }
+        );
     }
 }

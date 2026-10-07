@@ -224,37 +224,27 @@ fn resolve_aumid(app_name: &str) -> String {
     }
 }
 
-/// Register the process's toast identity exactly once.
+/// Register the process's toast identity exactly once and report which id is in
+/// force.
 ///
 /// `SetCurrentProcessExplicitAppUserModelID` is the documented way to let an
 /// unpackaged Win32 process receive toasts. The first call wins, and a host that
-/// registered its own AUMID before UDA ran keeps it.
-fn ensure_app_identity(app_name: &str) -> Result<(), UdaError> {
+/// registered its own AUMID before UDA ran keeps it. The returned string is the
+/// identity every notifier of this process must address, so the id a toast is
+/// sent under can never fork from the id the process registered.
+fn ensure_app_identity(app_name: &str) -> Result<String, UdaError> {
     // An initialised cell means an identity exists, from UDA or from the host.
-    if REGISTERED_AUMID.get().is_some() {
-        return Ok(());
+    if let Some(aumid) = REGISTERED_AUMID.get() {
+        return Ok(aumid.clone());
     }
 
-    // `GetCurrentProcessExplicitAppUserModelID` returns a string the shell owns,
-    // so it is only inspected and then released.
-    if let Ok(existing) = unsafe { GetCurrentProcessExplicitAppUserModelID() } {
-        if !existing.is_null() {
-            // SAFETY: a null-terminated UTF-16 string owned by the shell, read
-            // once into an owned `String` here.
-            let text = unsafe { existing.to_string() };
-            if let Ok(text) = text {
-                if !text.is_empty() {
-                    log::debug!("process already has AppUserModelID {text}; leaving it untouched");
-                    let _ = REGISTERED_AUMID.set(text);
-                    return Ok(());
-                }
-            }
-            // SAFETY: allocated by the shell with the COM task allocator, so it
-            // is released with the matching call.
-            unsafe {
-                let _ = CoTaskMemFree(Some(existing.0.cast()));
-            }
-        }
+    // Adopt an identity the host registered before UDA ran: overwriting it
+    // would break the host's own activation routing. `existing_process_aumid`
+    // owns the shell string, including its `CoTaskMemFree`.
+    if let Some(existing) = existing_process_aumid() {
+        log::debug!("process already has AppUserModelID {existing}; leaving it untouched");
+        let _ = REGISTERED_AUMID.set(existing.clone());
+        return Ok(existing);
     }
 
     let aumid = resolve_aumid(app_name);
@@ -275,37 +265,71 @@ fn ensure_app_identity(app_name: &str) -> Result<(), UdaError> {
     }
 
     log::debug!("registered process AppUserModelID {aumid}");
-    let _ = REGISTERED_AUMID.set(aumid);
-    Ok(())
+    let _ = REGISTERED_AUMID.set(aumid.clone());
+    Ok(aumid)
+}
+
+/// Read the process's existing AppUserModelID without registering anything.
+///
+/// Returns `None` when the shell reports no id, an unreadable one, or an empty
+/// one. Used by both the registration path (to adopt a host identity) and the
+/// availability probe, which must stay read-only: registering from a probe
+/// would consume the once-per-process slot before the real notifier runs.
+///
+/// The string the shell hands back is COM-task-allocated, so it is copied into
+/// an owned `String` and released with `CoTaskMemFree` on every path.
+fn existing_process_aumid() -> Option<String> {
+    let existing = unsafe { GetCurrentProcessExplicitAppUserModelID() }.ok()?;
+    if existing.is_null() {
+        // Nothing was allocated, so there is nothing to free.
+        return None;
+    }
+    // SAFETY: a null-terminated UTF-16 string owned by the shell, read once
+    // into an owned `String` here.
+    let text = unsafe { existing.to_string() }
+        .ok()
+        .filter(|text| !text.is_empty());
+    // SAFETY: allocated by the shell with the COM task allocator, so it is
+    // released with the matching call on every path through this function.
+    unsafe {
+        let _ = CoTaskMemFree(Some(existing.0.cast()));
+    }
+    text
+}
+
+/// Create a notifier for an explicit toast identity.
+///
+/// `CreateToastNotifierWithId` is what makes an unpackaged process work: the
+/// parameterless `CreateToastNotifier()` resolves the identity from the
+/// process, and an unpackaged host has none, so it fails with
+/// `ELEMENT_NOT_FOUND` no matter what AUMID was registered. An unresolvable
+/// identity is a capability answer ([`UdaError::NotSupported`]), any other
+/// failure an internal one.
+fn notifier_for_aumid(aumid: &str) -> Result<ToastNotifier, UdaError> {
+    let application_id: HSTRING = aumid.into();
+
+    ToastNotificationManager::CreateToastNotifierWithId(&application_id).map_err(|e| {
+        if is_element_not_found(&e) {
+            UdaError::NotSupported(format!(
+                "no toast app identity could be resolved for {application_id:?}; \
+                 toasts require a packaged app or an AppUserModelID"
+            ))
+        } else {
+            UdaError::Internal(format!("CreateToastNotifierWithId failed: {e}"))
+        }
+    })
 }
 
 impl WindowsNotificationManager {
-    /// Create the notifier for an explicit toast identity.
+    /// Create the notifier a send addresses.
     ///
-    /// `CreateToastNotifierWithId` is what makes an unpackaged process work: the
-    /// parameterless `CreateToastNotifier()` resolves the identity from the
-    /// process, and an unpackaged host has none, so it fails with
-    /// `ELEMENT_NOT_FOUND` no matter what AUMID was registered.
-    ///
-    /// `ensure_app_identity` still runs first, because the shell also matches the
-    /// id against the process's AUMID when deciding where to show the toast.
+    /// `ensure_app_identity` runs first, and the id it reports is the one the
+    /// notifier addresses: the shell also matches that id against the process's
+    /// AUMID when deciding where to show the toast, so addressing a different
+    /// id would fork the toast's ownership from the process identity.
     fn create_notifier(app_name: &str) -> Result<ToastNotifier, UdaError> {
-        ensure_app_identity(app_name)?;
-        let application_id: HSTRING = resolve_aumid(app_name).into();
-
-        let notifier = ToastNotificationManager::CreateToastNotifierWithId(&application_id)
-            .map_err(|e| {
-                if is_element_not_found(&e) {
-                    UdaError::NotSupported(format!(
-                        "no toast app identity could be resolved for {application_id:?}; \
-                         toasts require a packaged app or an AppUserModelID"
-                    ))
-                } else {
-                    UdaError::Internal(format!("CreateToastNotifierWithId failed: {e}"))
-                }
-            })?;
-
-        Ok(notifier)
+        let aumid = ensure_app_identity(app_name)?;
+        notifier_for_aumid(&aumid)
     }
 
     /// Report whether toasts can actually be displayed for this process.
@@ -313,13 +337,21 @@ impl WindowsNotificationManager {
     /// The Windows analogue of a capability probe: `DisabledForApplication` for a
     /// process whose toasts are turned off, [`UdaError::NotSupported`] for one
     /// with no identity at all.
+    ///
+    /// The probe is deliberately read-only: it addresses whichever identity is
+    /// already in force (registered earlier in this process) or, failing that,
+    /// the host's own AUMID or the fallback id — and registers none of them, so
+    /// calling `availability` never consumes the once-per-process registration
+    /// slot or forks the identity a real send would use.
     pub fn availability(
         &self,
     ) -> Result<windows::UI::Notifications::NotificationSetting, UdaError> {
-        // Probe with the fallback identity a send with no `app_name` uses, so the
-        // probe answers the same question the send would ask.
-        let notifier = Self::create_notifier("")?;
+        let aumid = match REGISTERED_AUMID.get() {
+            Some(aumid) => aumid.clone(),
+            None => existing_process_aumid().unwrap_or_else(|| FALLBACK_AUMID.to_string()),
+        };
 
+        let notifier = notifier_for_aumid(&aumid)?;
         notifier.Setting().map_err(|e| {
             // `Setting` resolves the identity again, so an unresolved id surfaces
             // here too and maps to the same `NotSupported` as `create_notifier`.

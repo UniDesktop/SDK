@@ -27,7 +27,7 @@
 //! - **Logout**: `TerminateSession("")` first - the empty session id means "the
 //!   calling one", so no session enumeration is needed; when logind refuses, the
 //!   desktop's own session manager (`org.gnome.SessionManager`,
-//!   `org.kde.Shutdown`, `org.xfce.Session.Manager`) is tried.
+//!   `org.kde.Shutdown`, `org.xfce.SessionManager`) is tried.
 //! - **Power**: logind only. There is no portable CLI equivalent that does its
 //!   own authorisation, so a machine without logind reports the action
 //!   unsupported rather than guessing at `shutdown -h now`.
@@ -48,20 +48,13 @@
 //! See `docs/internals/session_specs.md` for the full mapping.
 
 use std::process::Command;
-use std::time::Duration;
 
 use uda_core::capability::Capability;
 use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-/// Hard ceiling for one D-Bus round trip in this backend.
-///
-/// Power actions legitimately take a moment (logind talks to polkit and then to
-/// the init system), so five seconds is generous for a round trip while still
-/// bounding a wedged daemon.
-const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
-
+use crate::DBUS_TIMEOUT;
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
 
@@ -123,15 +116,12 @@ impl LinuxSessionManager {
     /// Call a no-argument `login1.Manager` power method with `interactive: false`.
     ///
     /// Synchronous on the outside (the trait is synchronous), asynchronous on
-    /// the inside: one current-thread runtime per call owns the connection and
-    /// the proxy, so nothing outlives the call.
+    /// the inside: the future is driven by [`crate::sync::run_async`], which is
+    /// safe to call from inside a tokio runtime as well (P1-15).
     fn login1_power(&self, method: &str) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
+        let method = method.to_string();
 
-        runtime.block_on(async {
+        crate::sync::run_async(async move {
             let connection = Self::system_connection().await?;
 
             let proxy = match tokio::time::timeout(
@@ -157,7 +147,7 @@ impl LinuxSessionManager {
             // so logind must not open its own confirmation dialog.
             match tokio::time::timeout(
                 DBUS_TIMEOUT,
-                proxy.call::<&str, (bool,), ()>(method, &(false,)),
+                proxy.call::<&str, (bool,), ()>(method.as_str(), &(false,)),
             )
             .await
             {
@@ -165,22 +155,17 @@ impl LinuxSessionManager {
                     log::debug!("logind accepted {method}");
                     Ok(())
                 }
-                Ok(Err(e)) => Err(map_login1_error(method, &e.to_string())),
+                Ok(Err(e)) => Err(map_login1_error(&method, &e.to_string())),
                 Err(_) => Err(UdaError::CommandFailed(format!(
                     "logind {method} timed out after {DBUS_TIMEOUT:?}"
                 ))),
             }
-        })
+        })?
     }
 
     /// Lock through `org.freedesktop.ScreenSaver`, then through `loginctl`.
     fn lock_via_screen_saver(&self) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+        crate::sync::run_async(async {
             let connection = Self::session_connection().await?;
 
             let proxy = match tokio::time::timeout(
@@ -222,7 +207,7 @@ impl LinuxSessionManager {
                     "the screen saver did not answer Lock".to_string(),
                 )),
             }
-        })
+        })?
     }
 
     /// Lock through `loginctl lock-session` (the CLI fallback tier).
@@ -248,14 +233,9 @@ impl LinuxSessionManager {
 
     /// End the calling user's session.
     fn logout(&self) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
         // `TerminateSession("")` means "the calling session", so no session id
         // has to be enumerated first.
-        let logind = runtime.block_on(async {
+        let logind = crate::sync::run_async(async {
             let connection = Self::system_connection().await?;
 
             let proxy = tokio::time::timeout(
@@ -275,40 +255,22 @@ impl LinuxSessionManager {
             .await
             .map_err(|_| UdaError::CommandFailed("logind TerminateSession timed out".to_string()))?
             .map_err(|e| map_login1_error("TerminateSession", &e.to_string()))
-        });
+        })?;
 
         match logind {
             Ok(()) => Ok(()),
             Err(logind_error) => {
                 // Tier 3: ask the desktop's own session manager. GNOME, KDE and
-                // XFCE each expose a logout entry point under a different name,
-                // and all three are tried because `$XDG_CURRENT_DESKTOP` is not
-                // reliable enough to pick one.
+                // XFCE each expose a logout entry point under a different name
+                // *and* a different wire signature, so the candidates carry
+                // their arguments (P1-19); all three are tried because
+                // `$XDG_CURRENT_DESKTOP` is not reliable enough to pick one.
                 log::debug!(
                     "logind logout failed ({logind_error}); trying the desktop session manager"
                 );
 
-                for (service, path, interface, method) in [
-                    (
-                        "org.gnome.SessionManager",
-                        "/org/gnome/SessionManager",
-                        "org.gnome.SessionManager",
-                        "Logout",
-                    ),
-                    (
-                        "org.kde.Shutdown",
-                        "/Shutdown",
-                        "org.kde.Shutdown",
-                        "logout",
-                    ),
-                    (
-                        "org.xfce.Session.Manager",
-                        "/org/xfce/Session/Manager",
-                        "org.xfce.Session.Manager",
-                        "Logout",
-                    ),
-                ] {
-                    if logout_via_desktop(service, path, interface, method) {
+                for candidate in LOGOUT_CANDIDATES {
+                    if logout_via_desktop(*candidate) {
                         return Ok(());
                     }
                 }
@@ -319,52 +281,135 @@ impl LinuxSessionManager {
     }
 }
 
+/// One desktop session manager's logout entry point, with the exact wire
+/// signature of its method (P1-19: a single shared argument list cannot satisfy
+/// all three interfaces - KDE takes none and XFCE takes two booleans, so a
+/// uniform `(0u32,)` body always came back as `InvalidArgs`).
+///
+/// `Copy`, and every field is `'static`, so a candidate can travel into the
+/// future [`logout_via_desktop`] hands to [`crate::sync::run_async`].
+#[derive(Clone, Copy)]
+struct LogoutCandidate {
+    service: &'static str,
+    path: &'static str,
+    interface: &'static str,
+    method: &'static str,
+    args: LogoutArgs,
+}
+
+/// The typed argument lists the three logout entry points accept.
+#[derive(Clone, Copy)]
+enum LogoutArgs {
+    /// GNOME `org.gnome.SessionManager.Logout(u mode)`: mode 0 asks for a
+    /// normal, user-confirmed logout.
+    Gnome(u32),
+    /// KDE `org.kde.Shutdown.logout()` takes no arguments at all.
+    Kde,
+    /// XFCE `org.xfce.Session.Manager.Logout(bb)`.
+    Xfce(bool, bool),
+}
+
+/// The Tier-3 logout candidates, in try order.
+const LOGOUT_CANDIDATES: &[LogoutCandidate] = &[
+    LogoutCandidate {
+        service: "org.gnome.SessionManager",
+        path: "/org/gnome/SessionManager",
+        interface: "org.gnome.SessionManager",
+        method: "Logout",
+        args: LogoutArgs::Gnome(0),
+    },
+    LogoutCandidate {
+        service: "org.kde.Shutdown",
+        path: "/Shutdown",
+        interface: "org.kde.Shutdown",
+        method: "logout",
+        args: LogoutArgs::Kde,
+    },
+    LogoutCandidate {
+        service: "org.xfce.SessionManager",
+        path: "/org/xfce/SessionManager",
+        interface: "org.xfce.Session.Manager",
+        method: "Logout",
+        // Upstream signature is `Logout(allow_save: b, arbitrary: b)`.
+        // `allow_save = true` keeps the session-save option the desktop's own
+        // logout dialog offers a user; `arbitrary = false` requests a normal
+        // logout instead of forcing one past the session manager's checks.
+        args: LogoutArgs::Xfce(true, false),
+    },
+];
+
 /// Try one desktop session manager's logout entry point.
 ///
 /// A service that is not running is the normal case (only one desktop is ever
 /// present), so a missing service is `false` rather than an error - the caller
 /// keeps trying the next candidate and only reports an error when all of them
 /// fail.
-fn logout_via_desktop(service: &str, path: &str, interface: &str, method: &str) -> bool {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
+fn logout_via_desktop(candidate: LogoutCandidate) -> bool {
+    crate::sync::run_async(async move {
+        let LogoutCandidate {
+            service,
+            path,
+            interface,
+            method,
+            args,
+        } = candidate;
 
-    let connection = match runtime.block_on(Connection::session()) {
-        Ok(connection) => connection,
-        Err(_) => return false,
-    };
+        let connection = match tokio::time::timeout(DBUS_TIMEOUT, Connection::session()).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(e)) => {
+                log::debug!("no session bus for {service}: {e}");
+                return false;
+            }
+            Err(_) => {
+                log::debug!("connecting to the session bus timed out for {service}");
+                return false;
+            }
+        };
 
-    let proxy = runtime.block_on(async {
-        tokio::time::timeout(
+        let Ok(Ok(proxy)) = tokio::time::timeout(
             DBUS_TIMEOUT,
             zbus::Proxy::new(&connection, service, path, interface),
         )
         .await
-    });
+        else {
+            return false;
+        };
 
-    let Ok(Ok(proxy)) = proxy else {
-        return false;
-    };
+        // Each interface disagrees about the Logout signature, so the argument
+        // tuple comes from the candidate instead of being shared.
+        let call = match args {
+            LogoutArgs::Gnome(mode) => {
+                tokio::time::timeout(
+                    DBUS_TIMEOUT,
+                    proxy.call::<&str, (u32,), ()>(method, &(mode,)),
+                )
+                .await
+            }
+            LogoutArgs::Kde => {
+                tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (), ()>(method, &())).await
+            }
+            LogoutArgs::Xfce(allow_save, arbitrary) => {
+                tokio::time::timeout(
+                    DBUS_TIMEOUT,
+                    proxy.call::<&str, (bool, bool), ()>(method, &(allow_save, arbitrary)),
+                )
+                .await
+            }
+        };
 
-    let call = runtime.block_on(async {
-        tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (u32,), ()>(method, &(0,))).await
-    });
-
-    match call {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            log::debug!("{service} refused {method}: {e}");
-            false
+        match call {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                log::debug!("{service} refused {method}: {e}");
+                false
+            }
+            Err(_) => {
+                log::debug!("{service} did not answer {method} in time");
+                false
+            }
         }
-        Err(_) => {
-            log::debug!("{service} did not answer {method} in time");
-            false
-        }
-    }
+    })
+    .unwrap_or(false)
 }
 
 /// Translate a logind D-Bus error into a typed [`UdaError`].
@@ -503,6 +548,39 @@ mod tests {
         // `PowerOff` is the logind name; there is no `Shutdown` method, and
         // sending one would surface as an UnknownMethod error.
         assert_ne!(method_for(SessionAction::Shutdown), Some("Shutdown"));
+    }
+
+    #[test]
+    fn the_xfce_candidate_uses_the_upstream_service_name_and_path() {
+        // The Tier-3 fallback used to dial `org.xfce.Session.Manager` /
+        // `/org/xfce/Session/Manager`, which no service publishes (P1-19).
+        let xfce = LOGOUT_CANDIDATES
+            .iter()
+            .find(|candidate| candidate.service.starts_with("org.xfce"))
+            .expect("the XFCE candidate is part of the table");
+
+        assert_eq!(xfce.service, "org.xfce.SessionManager");
+        assert_eq!(xfce.path, "/org/xfce/SessionManager");
+        assert_eq!(xfce.interface, "org.xfce.Session.Manager");
+        assert_eq!(xfce.method, "Logout");
+    }
+
+    #[test]
+    fn every_logout_candidate_carries_its_own_wire_signature() {
+        // GNOME `Logout(u)`, KDE `logout()`, XFCE `Logout(bb)`: a uniform
+        // `(0u32,)` body made every non-GNOME candidate fail with InvalidArgs.
+        let [gnome, kde, xfce] = LOGOUT_CANDIDATES else {
+            panic!("the candidate table has exactly three entries");
+        };
+
+        assert_eq!(gnome.service, "org.gnome.SessionManager");
+        assert!(matches!(gnome.args, LogoutArgs::Gnome(0)));
+
+        assert_eq!(kde.service, "org.kde.Shutdown");
+        assert_eq!(kde.method, "logout");
+        assert!(matches!(kde.args, LogoutArgs::Kde));
+
+        assert!(matches!(xfce.args, LogoutArgs::Xfce(true, false)));
     }
 
     #[test]

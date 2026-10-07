@@ -27,7 +27,12 @@
 //! [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) so a caller can
 //! tell "there was nobody to command" from "the player declined it".
 
-use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
+use uda_core::media::{MediaCommand, MediaMetadata, PlaybackStatus};
+// `active_metadata` and friends call trait methods on the platform managers;
+// the placeholder branches below answer without the trait, so an unconditional
+// import would be unused (and warned about) on those targets.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use uda_core::media::MediaManager as _;
 
 use crate::error::Failure;
 
@@ -139,6 +144,7 @@ pub(crate) fn send_command(command: MediaCommand) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uda_core::error::UdaError;
 
     #[test]
     fn command_codes_match_the_c_header() {
@@ -189,6 +195,15 @@ mod tests {
         // rather than an error, and on a real desktop it returns whatever is
         // playing. Either branch must be usable without unwrapping.
         let result = active_metadata();
+        if let Err(Failure::Uda(UdaError::NotSupported(message))) = &result {
+            // A target with no media backend at all answers `-2` before any
+            // player lookup; nothing else is acceptable here.
+            assert!(
+                message.contains("no media backend"),
+                "message was: {message}"
+            );
+            return;
+        }
         assert!(
             result.is_ok(),
             "a missing player is not an error: {result:?}"

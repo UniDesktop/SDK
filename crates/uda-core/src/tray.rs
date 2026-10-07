@@ -509,7 +509,10 @@ impl TrayMenu {
     fn validate(item: &MenuItem) -> Result<(), UdaError> {
         if let Some(label) = item.label() {
             if label.trim().is_empty() {
-                return Err(UdaError::NotSupported(
+                // A caller input error, not a platform gap: reporting it as
+                // `NotSupported` would make a typo look like "tray is
+                // unavailable" to a host that degrades on `NotSupported`.
+                return Err(UdaError::InvalidArgument(
                     "tray menu items must have a non-empty label".to_string(),
                 ));
             }
@@ -1222,9 +1225,11 @@ impl TrayIcon {
     /// Replace the icon. The source is validated first, so an invalid value
     /// leaves the previous icon in place and returns a typed error.
     pub fn set_icon(&self, icon: TrayIconSource) -> Result<(), UdaError> {
+        // A malformed caller input is an argument error, not a platform gap:
+        // `NotSupported` here would hide a typo behind "tray is unavailable".
         icon.validate().map_err(|error| {
             log::warn!("tray '{}' rejected an icon: {error}", self.inner.name);
-            UdaError::NotSupported(format!("invalid tray icon: {error}"))
+            UdaError::InvalidArgument(format!("invalid tray icon: {error}"))
         })?;
         self.inner.lock_state().icon = Some(icon);
         log::debug!("tray '{}' icon updated", self.inner.name);
@@ -1241,6 +1246,24 @@ impl TrayIcon {
     pub fn clear_menu(&self) {
         self.inner.lock_state().menu = None;
         log::debug!("tray '{}' menu cleared", self.inner.name);
+    }
+
+    /// Drop the context menu only if it is still `menu`; report whether it was.
+    ///
+    /// The check and the clear run under one state lock, so a caller destroying
+    /// a menu handle can detach it from a live icon without ever clearing a
+    /// *different* menu that raced in between the inspection and the removal.
+    pub fn detach_menu_if(&self, menu: &Arc<TrayMenu>) -> bool {
+        let mut state = self.inner.lock_state();
+        let is_current = state
+            .menu
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, menu));
+        if is_current {
+            state.menu = None;
+            log::debug!("tray '{}' detached its menu", self.inner.name);
+        }
+        is_current
     }
 
     /// The current context menu, if one is attached. The backend re-exports a
@@ -1382,8 +1405,8 @@ mod tests {
     fn push_rejects_an_blank_label() {
         let menu = TrayMenu::new();
         match menu.push(MenuItem::text("   ")) {
-            Err(UdaError::NotSupported(_)) => {}
-            other => panic!("expected NotSupported, got {other:?}"),
+            Err(UdaError::InvalidArgument(_)) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
         assert!(menu.is_empty());
         // A separator has no label, so it must pass validation.
@@ -1673,8 +1696,8 @@ mod tests {
 
         let bad = TrayIconSource::Path(String::new());
         match icon.set_icon(bad) {
-            Err(UdaError::NotSupported(_)) => {}
-            other => panic!("expected NotSupported, got {other:?}"),
+            Err(UdaError::InvalidArgument(_)) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
         // The previous icon must survive a rejected update.
         let kept = icon.inner().lock_state().icon.clone();
@@ -1703,6 +1726,27 @@ mod tests {
         icon.show();
         assert!(icon.is_visible());
         assert_eq!(menu.len(), 0);
+    }
+
+    #[test]
+    fn detach_menu_if_only_clears_the_menu_it_was_given() {
+        let icon = TrayIcon::from_inner(Arc::new(TrayIconInner::new("test".to_string())));
+        let first = Arc::new(TrayMenu::new());
+        let second = Arc::new(TrayMenu::new());
+        icon.set_menu(Arc::clone(&first));
+
+        // A different menu is never detached, so a racing attach cannot be
+        // destroyed by a concurrent handle cleanup.
+        assert!(!icon.detach_menu_if(&second));
+        assert!(icon
+            .menu()
+            .is_some_and(|attached| Arc::ptr_eq(&attached, &first)));
+
+        // The matching menu is detached exactly once.
+        assert!(icon.detach_menu_if(&first));
+        assert!(icon.menu().is_none());
+        assert!(!icon.detach_menu_if(&first));
+        assert!(icon.menu().is_none());
     }
 
     #[test]

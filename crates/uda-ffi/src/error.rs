@@ -81,8 +81,14 @@ impl From<UdaError> for Failure {
 /// Map a typed [`UdaError`] onto its C status code.
 fn status_of_uda_error(error: &UdaError) -> UdaStatus {
     match error {
+        UdaError::InvalidArgument(_) => UDA_ERR_INVALID_ARGUMENT,
         UdaError::NotSupported(_) => UDA_ERR_NOT_SUPPORTED,
         UdaError::DetectionFailed(_) => UDA_ERR_DETECTION_FAILED,
+        // Deliberately NOT `UDA_ERR_NOT_SUPPORTED`: `CommandFailed` means "the
+        // OS or an application tried and refused", which is an internal failure
+        // from the caller's point of view. A player merely *declining* a media
+        // command is reported as `NotSupported` by the backends themselves, so
+        // the `include/uda.h` promise for `uda_media_send_command` still holds.
         UdaError::CommandFailed(_) => UDA_ERR_INTERNAL,
         UdaError::Io(_) => UDA_ERR_IO,
         UdaError::Internal(_) => UDA_ERR_INTERNAL,
@@ -138,6 +144,10 @@ mod tests {
     #[test]
     fn uda_errors_map_to_the_documented_codes() {
         let cases = [
+            (
+                UdaError::InvalidArgument("x".into()),
+                UDA_ERR_INVALID_ARGUMENT,
+            ),
             (UdaError::NotSupported("x".into()), UDA_ERR_NOT_SUPPORTED),
             (
                 UdaError::DetectionFailed("x".into()),
@@ -153,6 +163,20 @@ mod tests {
         for (error, expected) in cases {
             assert_eq!(Failure::Uda(error).status(), expected);
         }
+    }
+
+    #[test]
+    fn a_command_failure_stays_an_internal_error_not_not_supported() {
+        // `include/uda.h` promises `UDA_ERR_NOT_SUPPORTED` for a player that
+        // *declines* a media command, and the backends report that case as
+        // `NotSupported` directly. `CommandFailed` is a different thing - the
+        // OS refused a well-formed request - so it must keep mapping to
+        // `UDA_ERR_INTERNAL` and never silently alias the graceful -2 path.
+        let failure = Failure::Uda(UdaError::CommandFailed(
+            "the desktop service refused".to_string(),
+        ));
+        assert_eq!(failure.status(), UDA_ERR_INTERNAL);
+        assert_ne!(failure.status(), UDA_ERR_NOT_SUPPORTED);
     }
 
     #[test]

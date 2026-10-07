@@ -1,8 +1,11 @@
-use crate::error::UdaError;
 use std::sync::Arc;
+
 use uda_core::capability::Capability;
 use uda_core::notification::{Notification, NotificationManager};
 use zbus::Connection;
+
+use crate::error::UdaError;
+use crate::internal_dbus;
 
 // The FreeDesktop `Notify` D-Bus method takes nine parameters. `clippy`'s
 // default `too_many_arguments` threshold of seven cannot be met without
@@ -36,9 +39,8 @@ pub struct LinuxNotificationManager {
 
 impl LinuxNotificationManager {
     pub async fn new() -> Result<Self, UdaError> {
-        let connection = Connection::session()
-            .await
-            .map_err(|e| UdaError::Internal(format!("Failed to connect to session bus: {e}")))?;
+        let connection =
+            internal_dbus("connecting to the session bus", Connection::session()).await?;
         Ok(Self {
             connection: Arc::new(connection),
         })
@@ -48,11 +50,11 @@ impl LinuxNotificationManager {
 #[async_trait::async_trait]
 impl NotificationManager for LinuxNotificationManager {
     async fn send(&self, notification: &Notification) -> Result<u32, UdaError> {
-        let proxy = NotificationsProxy::new(&self.connection)
-            .await
-            .map_err(|e| {
-                UdaError::Internal(format!("Failed to create notifications proxy: {e}"))
-            })?;
+        let proxy = internal_dbus(
+            "building the notifications proxy",
+            NotificationsProxy::new(&self.connection),
+        )
+        .await?;
 
         let actions_flat: Vec<String> = notification
             .actions
@@ -71,8 +73,9 @@ impl NotificationManager for LinuxNotificationManager {
             Vec::new()
         };
 
-        let notification_id = proxy
-            .Notify(
+        internal_dbus(
+            "the Notify call",
+            proxy.Notify(
                 &notification.app_name,
                 notification.replaces_id,
                 &notification.app_icon,
@@ -81,11 +84,9 @@ impl NotificationManager for LinuxNotificationManager {
                 actions_flat,
                 hints,
                 notification.expire_timeout,
-            )
-            .await
-            .map_err(|e| UdaError::Internal(format!("Notify call failed: {e}")))?;
-
-        Ok(notification_id)
+            ),
+        )
+        .await
     }
 
     fn capabilities(&self) -> Result<Capability, UdaError> {

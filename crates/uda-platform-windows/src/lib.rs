@@ -13,8 +13,10 @@
 //! - [`wakelock`]: display/system sleep inhibition via `SetThreadExecutionState`.
 //! - [`detection`]: OS release detection via `RtlGetVersion`.
 //! - [`notification`]: native toasts via the WinRT `ToastNotificationManager`.
-//! - [`tray`]: system tray icons via `Shell_NotifyIconW` on a hidden message-only
-//!   window driven by a dedicated worker thread.
+//! - [`tray`]: system tray icons via `Shell_NotifyIconW` on a hidden top-level
+//!   window driven by a dedicated worker thread (a normal window rather than a
+//!   message-only one, so the worker sees the shell's `TaskbarCreated`
+//!   broadcast and the icon survives an explorer restart).
 
 //! # Fallback tiers
 //!

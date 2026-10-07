@@ -15,7 +15,9 @@
 //! # Memory ownership
 //!
 //! - Strings **returned** by UDA are allocated by Rust and must be freed with
-//!   [`uda_free_string`].
+//!   [`uda_free_string`]. The two exceptions are [`uda_last_error_message`]
+//!   (a borrow of library-owned thread-local storage) and [`uda_status_message`]
+//!   (a static string): neither must ever be freed.
 //! - Strings **passed in** are borrowed for the duration of the call only.
 //! - Wake-lock handles are `uint64_t` values owned by this process; release each
 //!   exactly once with [`uda_wakelock_release`].
@@ -61,6 +63,14 @@ pub use session::{
     UDA_SESSION_CAP_HIBERNATE, UDA_SESSION_CAP_LOCK, UDA_SESSION_CAP_LOGOUT,
     UDA_SESSION_CAP_MANAGEMENT, UDA_SESSION_CAP_REBOOT, UDA_SESSION_CAP_SHUTDOWN,
     UDA_SESSION_CAP_SUSPEND,
+};
+
+// Part of the C ABI, so a caller can ask what the tray backend offers *before*
+// registering an icon.
+pub use tray::{
+    UDA_TRAY_CAP_CHECKBOX, UDA_TRAY_CAP_CLICK, UDA_TRAY_CAP_CONTEXT_MENU,
+    UDA_TRAY_CAP_DOUBLE_CLICK, UDA_TRAY_CAP_DYNAMIC_MENU, UDA_TRAY_CAP_ICON,
+    UDA_TRAY_CAP_SYSTEM_TRAY, UDA_TRAY_CAP_TOOLTIP,
 };
 
 /// Status code for "success".
@@ -160,10 +170,11 @@ pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: c_int
 /// Read the metadata of the active media player.
 ///
 /// The three strings are allocated by Rust and must be released with
-/// [`uda_free_string`]. An unpublished field is written as a null pointer, or
-/// zero for a duration, so each pointer must be checked before it is read. With
-/// no player running every out-parameter is set to null/zero and [`UDA_OK`] is
-/// still returned.
+/// [`uda_free_string`]. An unpublished field - including a field the player
+/// publishes as an empty string - is written as a null pointer, or zero for a
+/// duration, so each pointer must be checked before it is read. With no player
+/// running every out-parameter is set to null/zero and [`UDA_OK`] is still
+/// returned.
 ///
 /// `out_position_ms` is optional: pass null to skip it.
 ///
@@ -385,7 +396,9 @@ pub unsafe extern "C" fn uda_session_shutdown() -> c_int {
 /// On success `*out_path` receives a heap C string the caller must release with
 /// [`uda_free_string`]. When no wallpaper is configured (or the platform cannot
 /// report one), `*out_path` is set to null and the call still returns
-/// [`UDA_OK`] - check the pointer, not the status, to detect "no wallpaper".
+/// [`UDA_OK`] - check the pointer, not the status, to detect "no wallpaper". An
+/// empty value is never handed back as a zero-length string; it is reported as
+/// null too.
 ///
 /// # Safety
 ///
@@ -432,6 +445,11 @@ pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
 /// success `*out_handle` receives a non-zero handle to pass to
 /// [`uda_wakelock_release`]; on failure it is left untouched.
 ///
+/// A lock acquired through the CLI fallback (no native IPC available) is
+/// bounded to roughly one hour: past that deadline the lock is retired and its
+/// handle stops being live, so a host that needs a longer lock must re-acquire
+/// it.
+///
 /// # Safety
 ///
 /// `out_handle` must be a valid, writable, non-null `uint64_t` location and
@@ -465,7 +483,8 @@ pub unsafe extern "C" fn uda_wakelock_acquire(
 /// Release a wake lock previously obtained from [`uda_wakelock_acquire`].
 ///
 /// Returns [`UDA_ERR_INVALID_ARGUMENT`] when the handle is not a live lock in
-/// this process (already released, or never issued here).
+/// this process (already released, never issued here, or a fallback lock
+/// retired after its bounded lifetime elapsed).
 #[no_mangle]
 pub extern "C" fn uda_wakelock_release(handle: u64) -> c_int {
     util::catch_boundary(|| {
@@ -559,22 +578,14 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> c_int {
 
 /// Return the message describing the most recent failure on this thread.
 ///
-/// The returned string is owned by the library and stays valid until the next
-/// UDA call on the same thread; copy it if it must outlive that. Returns null
-/// when no failure has been recorded yet.
+/// The returned pointer borrows library-owned storage: it stays valid until the
+/// next UDA call on the same thread replaces the message, and it must **not**
+/// be passed to [`uda_free_string`] (freeing it is undefined behaviour). Copy
+/// the text if it must outlive that. Returns null when no failure has been
+/// recorded on this thread yet.
 #[no_mangle]
 pub extern "C" fn uda_last_error_message() -> *const c_char {
-    let Some(message) = util::take_last_message() else {
-        return std::ptr::null();
-    };
-
-    // Leaked on purpose: the caller frees it with `uda_free_string`, keeping one
-    // allocation policy for every string the library hands out. `UdaError`'s
-    // `Display` never emits an interior nul, so the failure arm is unreachable.
-    match std::ffi::CString::new(message) {
-        Ok(c_string) => c_string.into_raw().cast_const(),
-        Err(_) => std::ptr::null(),
-    }
+    util::last_error_pointer()
 }
 
 /// Describe a status code with a static string.
@@ -611,6 +622,33 @@ pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
 // `0` means "no handle". A handle is single-use: a second destroy of the same
 // value is `UDA_ERR_INVALID_ARGUMENT` rather than a silent no-op, so a host
 // cannot double-release a shell resource.
+
+/// Report which tray features the active platform backend advertises.
+///
+/// Writes a bitmask made of the [`UDA_TRAY_CAP_*`] constants to
+/// `*out_capabilities`; `0` means "no tray backend exists on this target", and
+/// a feature the backend cannot deliver has its bit cleared. The query is
+/// side-effect-free - it never registers anything with the shell - so a host
+/// may call it freely to decide whether to build tray UI at all, and what to
+/// degrade gracefully.
+///
+/// # Safety
+///
+/// `out_capabilities` must point at a writable `uint32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_capabilities(out_capabilities: *mut u32) -> c_int {
+    if out_capabilities.is_null() {
+        util::set_last_message("`out_capabilities` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `uint32_t` at this address.
+        unsafe { *out_capabilities = tray::capabilities().bits() };
+        Ok(())
+    })
+}
 
 /// Create a tray icon.
 ///
@@ -775,8 +813,8 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_in
 ///
 /// `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
 /// must be a readable, null-terminated UTF-8 string; a blank label is rejected
-/// with [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) because
-/// it would render an invisible row.
+/// with [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT)
+/// because it would render an invisible row.
 #[no_mangle]
 pub unsafe extern "C" fn uda_tray_menu_add_text(
     menu_handle: u64,
@@ -812,9 +850,11 @@ pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> c_int {
 
 /// Append a checkbox row to a menu.
 ///
-/// The row's own stored value is inverted *before* `callback` runs, so the
-/// `checked` argument is the new state the shell will render. `callback` may be
-/// null, in which case the row still toggles silently.
+/// When a `callback` is supplied, the row's own stored value is inverted *before*
+/// it runs, so the `checked` argument is the new state the shell will render.
+/// A null callback installs no handler at all: the row renders with its initial
+/// state and never toggles, which is what a host that drives the checkbox
+/// through its own UI wants.
 ///
 /// # Safety
 ///
@@ -852,8 +892,9 @@ pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
 /// Attach a menu to a tray icon, replacing any menu set earlier.
 ///
 /// The menu handle stays valid after this call: the icon holds its own
-/// reference, so `uda_tray_menu_destroy` on the same menu is optional and does
-/// not clear the tray's rows.
+/// reference, so the menu keeps working whether or not the handle is destroyed
+/// later. Destroying the handle (see [`uda_tray_menu_destroy`]) detaches the
+/// menu from every icon still showing it.
 #[no_mangle]
 pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int {
     util::catch_boundary(|| tray::set_menu(tray_handle, menu_handle))
@@ -861,8 +902,12 @@ pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int
 
 /// Destroy a menu handle.
 ///
-/// Safe to call after `uda_tray_set_menu`, as documented there. Returns
-/// `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live menu.
+/// The menu is detached from **every** tray icon that still shows it, so its
+/// rows and callbacks stop firing immediately; the icons themselves stay alive
+/// and simply have no menu afterwards. This makes destroying a menu handle safe
+/// even when the host has already attached it. Terminal: the handle cannot be
+/// reused afterwards. Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not
+/// a live menu.
 #[no_mangle]
 pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> c_int {
     util::catch_boundary(|| tray::destroy_menu(menu_handle))
@@ -962,6 +1007,12 @@ mod tests {
         let mut theme: c_int = -100;
         // SAFETY: `theme` is a live, writable `int32_t` on this stack frame.
         let status = unsafe { uda_detect_theme(&mut theme) };
+        if status == UDA_ERR_NOT_SUPPORTED {
+            // A host with no appearance backend (e.g. macOS, where this crate
+            // ships no backend) answers -2 before touching the slot; the same
+            // early-out the wake-lock round trip uses.
+            return;
+        }
         assert_eq!(status, UDA_OK);
         assert!((0..=2).contains(&theme), "unexpected theme {theme}");
     }
@@ -1166,5 +1217,53 @@ mod tests {
         // Whatever the platform reports, a zeroed slot is the documented
         // "no accent colour" answer and must not be mistaken for a failure.
         let _ = rgba;
+    }
+
+    #[test]
+    fn tray_capabilities_reject_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_capabilities(std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn tray_capabilities_report_only_documented_bits() {
+        let mut bits: u32 = 0;
+        // SAFETY: `bits` is a live, writable `uint32_t` on this stack frame.
+        let status = unsafe { uda_tray_capabilities(&mut bits) };
+        assert_eq!(status, UDA_OK);
+
+        // The export must forward the backend's answer verbatim: the bits it
+        // reports are the module-level query's own.
+        assert_eq!(bits, tray::capabilities().bits());
+        assert_eq!(
+            bits & !tray::DOCUMENTED_TRAY_CAPABILITIES,
+            0,
+            "undocumented tray capability bits: {bits:#x}"
+        );
+        if !cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert_eq!(bits, 0, "a target with no tray backend must report 0");
+        }
+    }
+
+    #[test]
+    fn last_error_message_returns_a_readable_library_owned_string() {
+        let _ = util::take_last_message();
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_detect_theme(std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+
+        let pointer = uda_last_error_message();
+        assert!(
+            !pointer.is_null(),
+            "a failure must leave a readable message"
+        );
+        // SAFETY: the pointer borrows the library's thread-local buffer, which
+        // outlives this read; the test must not (and does not) free it.
+        let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("the message is valid UTF-8");
+        assert!(text.contains("out_theme"), "got: {text}");
     }
 }
