@@ -23,7 +23,7 @@ use crate::COMMAND_TIMEOUT;
 /// 3. **KDE Plasma** (`kreadconfig5`):
 ///    - `kdeglobals` -> `General` -> `ColorScheme`
 /// 4. **XFCE** (`xfconf-query`):
-///    - `xfce4-desktop` related theme settings
+///    - xsettings `Net/ThemeName`, answered dark-or-unknown like KDE
 /// 5. **Default**: `Theme::Unknown`
 ///
 /// The fallback is `Unknown` rather than `Light`: on a tiling window manager no

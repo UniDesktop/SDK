@@ -1174,7 +1174,7 @@ impl TrayIconInner {
     /// the registration path before the icon reaches the host, so a host can
     /// never observe an undecided support level.
     pub fn set_degraded(&self, reason: Option<String>) {
-        // An empty reason is not a reason: `uda.h` promises that PARTIAL always
+        // A blank reason is not a reason: `uda.h` promises that PARTIAL always
         // carries a non-empty explanation and `uda_tray_support_reason` maps an
         // empty string to NULL, which would surface as PARTIAL with no answer.
         // Normalising here keeps every consumer - the trait, the C exports and
@@ -1827,10 +1827,6 @@ mod tests {
             icon.support_level(TrayFeature::Icon),
             SupportLevel::Partial(reason)
         );
-        assert_eq!(
-            icon.support_level(TrayFeature::Icon).reason().map(str::len),
-            Some("no StatusNotifierWatcher is reachable on the session bus".len())
-        );
 
         // The degradation is about shell-side visibility: the other exported
         // features keep working, so they stay `Full`.
@@ -1838,6 +1834,44 @@ mod tests {
 
         // Clearing the reason (a backend that recovered) restores `Full`.
         inner.set_degraded(None);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+    }
+
+    #[test]
+    fn set_degraded_normalises_an_empty_reason_to_none() {
+        // `uda.h` promises that PARTIAL always carries a non-empty explanation,
+        // and `set_degraded` is the one place that promise is enforced. Neither
+        // `Some("")` nor a whitespace-only string is a reason: both must be
+        // stored as `None`, so the icon keeps answering `Full` instead of
+        // reporting a degradation nobody can explain.
+        let inner = Arc::new(TrayIconInner::new("blank".to_string()));
+        let icon = TrayIcon::from_inner(Arc::clone(&inner));
+        inner.set_capabilities(Capability::SYSTEM_TRAY);
+
+        inner.set_degraded(Some(String::new()));
+        assert_eq!(
+            inner.lock_state().degraded,
+            None,
+            "empty string is not a reason"
+        );
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        inner.set_degraded(Some("   \t\n".to_string()));
+        assert_eq!(
+            inner.lock_state().degraded,
+            None,
+            "a whitespace-only string is not a reason either"
+        );
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // A real reason still lands verbatim, and `None` clears it from there.
+        inner.set_degraded(Some("no StatusNotifierWatcher".to_string()));
+        assert_eq!(
+            icon.support_level(TrayFeature::Icon),
+            SupportLevel::Partial("no StatusNotifierWatcher".to_string())
+        );
+        inner.set_degraded(None);
+        assert_eq!(inner.lock_state().degraded, None);
         assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
     }
 

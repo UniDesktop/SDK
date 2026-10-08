@@ -46,9 +46,14 @@ impl LinuxWakeLockManager {
     /// How well wake locks work right now, with the reason when degraded.
     ///
     /// `Full` when the native ScreenSaver protocol answers on the session bus;
-    /// `Partial` with the reason when only logind is there (the acquire path
-    /// then has to go through the CLI tier); `None` when neither is reachable,
-    /// matching an empty [`Self::capabilities`].
+    /// `Partial` with the reason when only logind is there; `None` when neither
+    /// is reachable, matching an empty [`Self::capabilities`].
+    ///
+    /// The `Partial` tier is honest about the whole UDA stack, not just this
+    /// crate: this manager's own [`Self::acquire`] only speaks ScreenSaver -
+    /// the `systemd-inhibit` CLI tier the reason points at is wired up one
+    /// layer higher, in `uda-ffi`'s wake-lock registry. Rust hosts that call
+    /// this manager directly get the ScreenSaver path only.
     pub fn support_level(&self) -> SupportLevel {
         wake_lock_support(Self::reachability()).1
     }

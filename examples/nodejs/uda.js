@@ -127,6 +127,17 @@ const WINDOWS_TARGET_TRIPLES = [
   'aarch64-pc-windows-msvc',
 ];
 
+/**
+ * 各平台 cargo 产物名（与 python 绑定的 `_LIBRARY_FILENAME_BY_PLATFORM` 一致）。
+ * 漏掉 darwin 的 `.dylib` 会让文档承诺的 `cargo build && node 07_session.js`
+ * 在 macOS 上直接加载失败；未列出的平台回落到 `libuda_ffi.so`。
+ */
+const LIBRARY_FILENAME_BY_PLATFORM = {
+  linux: 'libuda_ffi.so',
+  darwin: 'libuda_ffi.dylib',
+  win32: 'uda_ffi.dll',
+};
+
 // ---------------------------------------------------------------------------
 // 动态库定位与加载（内部）
 // ---------------------------------------------------------------------------
@@ -156,16 +167,8 @@ function candidateLibraries() {
   }
 
   // 本文件位于 <repo>/examples/nodejs/，向上两级即仓库根目录。
-  // darwin 上 cargo 产物是 .dylib（与 python 绑定的 _LIBRARY_FILENAME_BY_PLATFORM
-  // 一致）：漏掉它会让示例文档承诺的 `cargo build && node 07_session.js` 在
-  // macOS 上直接加载失败。
   const repoRoot = path.resolve(__dirname, '..', '..');
-  const libName =
-    process.platform === 'win32'
-      ? 'uda_ffi.dll'
-      : process.platform === 'darwin'
-        ? 'libuda_ffi.dylib'
-        : 'libuda_ffi.so';
+  const libName = LIBRARY_FILENAME_BY_PLATFORM[process.platform] ?? 'libuda_ffi.so';
 
   const cargoTarget = queryCargoTargetDirectory(repoRoot);
   const targetRoots = new Set();

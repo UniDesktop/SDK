@@ -226,7 +226,7 @@ fn verify_someone_receives_the_lock() -> Result<(), Failure> {
     match crate::notify::run_sync(uda_platform_linux::wakelock::logind_present()) {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err(Failure::Uda(UdaError::NotSupported(
-            "no systemd-logind on the system bus: an inhibition lock would not be honored"
+            "no systemd-logind on the system bus: an inhibition lock would not be honoured"
                 .to_string(),
         ))),
         Ok(Err(error)) | Err(error) => Err(Failure::Uda(error)),
