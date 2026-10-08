@@ -70,7 +70,8 @@ org.freedesktop.DBus -> ListNames()
   毫秒会让一首 3 分钟的歌唱成 50 小时。
 - `xesam:title` 可能是 **数组**（Chromium 系历史上这么发过）。取首个元素即可，
   否则标题整段丢失。
-- 任何键都可能缺席（直播流、无元数据的本地文件）。缺席 == 空字符串，不是错误。
+- 任何键都可能缺席（直播流、无元数据的本地文件）。缺席映射为 `None`（C-ABI
+  上是 NULL），不是错误；已发布但为空的值保持空字符串，两者可区分。
 - `mpris:length` <= 0 表示直播或未知时长，映射为 `None` 而不是 0。
 
 ### 2.4 错误分层
@@ -156,7 +157,8 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 ## 6. 测试基线
 
 - 元数据解析（数组拼接、单位换算、空字段）必须是纯函数，可在无 D-Bus /
-  无 WinRT 的 CI 里测——`docs/../crates/uda-platform-linux/src/media.rs` 的
-  `metadata_from_dbus` 与 `crates/uda-platform-windows/src/media.rs` 的
-  `duration_from_ticks` 都是为此设计的。
+  无 WinRT 的 CI 里测：`crates/uda-platform-linux/src/media.rs` 的
+  `metadata_from_dict` / `duration_from_micros` 与
+  `crates/uda-platform-windows/src/media.rs` 的 `milliseconds_from_ticks`
+  即为此而设。
 - 无播放器场景：`active_metadata()` == `Ok(None)`，不 panic、不 unwrap。
