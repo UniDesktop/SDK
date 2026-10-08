@@ -407,8 +407,9 @@ int32_t uda_get_accent_color(uint8_t *out_rgba);
  * with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
  * unconditionally. A field the player does not publish (a radio stream with
  * no album, say) is NULL rather than an empty string, which lets a binding
- * skip it. The artist list is already joined with ", " when the player
- * publishes several artists.
+ * skip it, while a field published as an empty string stays an empty string -
+ * the two cases remain distinguishable. The artist list is already joined
+ * with ", " when the player publishes several artists.
  *
  * `out_duration_ms` receives the track length in milliseconds, or 0 when
  * unknown (a live stream). `out_position_ms` is optional: pass NULL to skip
