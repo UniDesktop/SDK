@@ -23,9 +23,9 @@
 //! may be null when the corresponding field is empty, which is the normal case
 //! for a player that publishes only a title.
 //!
-//! A refused command (an app that disables `Next`, for example) returns
-//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED) so a caller can
-//! tell "there was nobody to command" from "the player declined it".
+//! A machine with nobody to command reports
+//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED); any other
+//! non-`UDA_OK` status means the command was not delivered.
 
 use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
 

@@ -21,8 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   - A new `scripts/gen-header.sh` (with `--check`) adds a regenerate-and-diff gate to the Cross-Compile Hygiene CI job: a Rust change that forgets to regenerate the header now fails the build.
   - 对 C 调用者零语义变化：33 个常量值、32 个函数签名与 2 个回调 typedef 逐一比对等价；`header_symbols.py` 与 `pe_exports.py` 的「头文件 ↔ 动态库符号」校验保持不变。
   - Zero semantic change for C callers: all 33 constant values, 32 function signatures and both callback typedefs compare equal one by one; the `header_symbols.py` / `pe_exports.py` header-to-library symbol checks are unchanged.
-  - 两处「文档与实现不符」借此次迁移一并修正：`uda_set_wallpaper` 现在真的以 `UDA_ERR_INVALID_ARGUMENT` 拒绝空路径（原 Rust 文档如此承诺但从未实现）；`uda_tray_set_icon_rgba` 的文档不再声称 `data` 可在 `len` 为 0 时为 NULL（实现一贯拒绝 NULL）。
-  - Two documentation-versus-implementation mismatches were fixed along the way: `uda_set_wallpaper` now actually rejects an empty path with `UDA_ERR_INVALID_ARGUMENT` (the Rust docs always promised this but it was never implemented), and `uda_tray_set_icon_rgba` no longer documents a NULL `data` for `len == 0` (the implementation has always rejected NULL).
+  - 三处「文档与实现不符」借此次迁移一并修正：`uda_set_wallpaper` 现在真的以 `UDA_ERR_INVALID_ARGUMENT` 拒绝空路径（原 Rust 文档如此承诺但从未实现）；`uda_tray_set_icon_rgba` 的文档不再声称 `data` 可在 `len` 为 0 时为 NULL（实现一贯拒绝 NULL）；`uda_media_get_metadata` 现按文档为未发布字段与「无播放器」写回 NULL（此前写回指向空字符串的非 NULL 指针，与 `docs/internals/media_specs.md` 及 Python/Node 绑定的注释相悖）。
+  - Three documentation-versus-implementation mismatches were fixed along the way: `uda_set_wallpaper` now actually rejects an empty path with `UDA_ERR_INVALID_ARGUMENT` (the Rust docs always promised this but it was never implemented), `uda_tray_set_icon_rgba` no longer documents a NULL `data` for `len == 0` (the implementation has always rejected NULL), and `uda_media_get_metadata` now writes NULL for unpublished fields and for "no player" as documented (it previously wrote non-NULL pointers to empty strings, contradicting `docs/internals/media_specs.md` and the Python/Node binding comments).
 
 ## [v0.2.1] - Honest Theme Reporting & Reasoned Degradation · 2026-10-06
 

@@ -446,10 +446,9 @@ int32_t uda_media_get_status(int32_t *out_status);
  * `UDA_MEDIA_CMD_STOP`. An unrecognised code returns
  * `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
  *
- * A player that refuses the command (an app that disables "next track") and
- * a machine with no player running both report `UDA_ERR_NOT_SUPPORTED`, so
- * a caller can tell "not delivered" from "delivered" without inspecting the
- * player.
+ * A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`, and any
+ * non-`UDA_OK` status means the command was not delivered, so a caller can
+ * tell "not delivered" from "delivered" without inspecting the player.
  *
  * # Safety
  *

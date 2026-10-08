@@ -19,7 +19,7 @@
 use std::cell::RefCell;
 use std::os::raw::c_char;
 
-use crate::abi::UDA_ERR_PANIC;
+use crate::abi::{UDA_ERR_PANIC, UDA_OK};
 use crate::error::{Failure, UdaStatus};
 
 thread_local! {
@@ -120,7 +120,7 @@ where
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
 
     match outcome {
-        Ok(Ok(())) => crate::abi::UDA_OK,
+        Ok(Ok(())) => UDA_OK,
         Ok(Err(failure)) => {
             set_last_message(&failure.message());
             failure.status()

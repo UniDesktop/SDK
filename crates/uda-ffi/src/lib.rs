@@ -364,11 +364,29 @@ pub unsafe extern "C" fn uda_media_get_metadata(
     }
 
     util::catch_boundary(|| {
-        let metadata = media::active_metadata()?.unwrap_or_default();
+        let metadata = media::active_metadata()?;
 
-        let title = util::c_string_from(&metadata.title);
-        let artist = util::c_string_from(&metadata.artist);
-        let album = util::c_string_from(&metadata.album);
+        // The documented empty answer: an unpublished field is NULL rather
+        // than an empty C string, "no player" (which the backends already
+        // normalize into `None`) is NULL everywhere, and a zero duration
+        // means "unknown" - all with a UDA_OK status, so a now-playing card
+        // renders as empty instead of as a failure.
+        let (title, artist, album, duration_ms, position_ms) = match metadata {
+            Some(ref metadata) => (
+                c_string_or_null(Some(&metadata.title)),
+                c_string_or_null(Some(&metadata.artist)),
+                c_string_or_null(Some(&metadata.album)),
+                metadata.duration_ms.unwrap_or(0),
+                metadata.position_ms.unwrap_or(0),
+            ),
+            None => (
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                0,
+            ),
+        };
 
         // SAFETY: all four pointers were validated non-null and writable above;
         // `out_position_ms` is checked before the optional write.
@@ -376,9 +394,9 @@ pub unsafe extern "C" fn uda_media_get_metadata(
             *out_title = title;
             *out_artist = artist;
             *out_album = album;
-            *out_duration_ms = metadata.duration_ms.unwrap_or(0);
+            *out_duration_ms = duration_ms;
             if !out_position_ms.is_null() {
-                *out_position_ms = metadata.position_ms.unwrap_or(0);
+                *out_position_ms = position_ms;
             }
         }
         Ok(())
@@ -419,10 +437,9 @@ pub unsafe extern "C" fn uda_media_get_status(out_status: *mut i32) -> i32 {
 /// `UDA_MEDIA_CMD_STOP`. An unrecognised code returns
 /// `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
 ///
-/// A player that refuses the command (an app that disables "next track") and
-/// a machine with no player running both report `UDA_ERR_NOT_SUPPORTED`, so
-/// a caller can tell "not delivered" from "delivered" without inspecting the
-/// player.
+/// A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`, and any
+/// non-`UDA_OK` status means the command was not delivered, so a caller can
+/// tell "not delivered" from "delivered" without inspecting the player.
 ///
 /// # Safety
 ///
@@ -954,6 +971,18 @@ fn owned_or_empty(pointer: *const c_char, parameter: &str) -> Result<String, err
     unsafe { util::owned_string_from(pointer, parameter) }
 }
 
+/// Allocate a C string for a media metadata field, or return null.
+///
+/// A field the player does not publish arrives as an empty `String` (the core
+/// model has no per-field `Option`), but the C contract hands out NULL for it
+/// so a binding can skip the field instead of rendering an empty row.
+fn c_string_or_null(text: Option<&str>) -> *mut c_char {
+    match text {
+        Some(text) if !text.is_empty() => util::c_string_from(text),
+        _ => std::ptr::null_mut(),
+    }
+}
+
 thread_local! {
     /// Cache of the leaked status-message strings, so repeated calls with the
     /// same code reuse a single allocation instead of leaking one per call.
@@ -997,6 +1026,17 @@ fn wake_lock_type_from_c(code: i32) -> Result<uda_core::wakelock::WakeLockType, 
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn metadata_fields_publish_null_for_unpublished_strings() {
+        assert!(c_string_or_null(None).is_null());
+        assert!(c_string_or_null(Some("")).is_null());
+        let pointer = c_string_or_null(Some("/music/track.flac"));
+        assert!(!pointer.is_null());
+        // SAFETY: the pointer came from `c_string_from` in this test and has
+        // not been handed to anyone else.
+        unsafe { util::free_c_string(pointer) };
+    }
 
     #[test]
     fn fill_mode_codes_are_accepted_and_rejected() {

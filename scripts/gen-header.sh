@@ -14,6 +14,29 @@
 #   scripts/gen-header.sh --check   # diff only; exit 1 when the header is stale
 set -euo pipefail
 
+usage() {
+    echo "Usage: scripts/gen-header.sh [--check]" >&2
+    echo "  --check   compare include/uda.h with fresh cbindgen output; exit 1 if stale" >&2
+    echo "  (default) rewrite include/uda.h in place" >&2
+}
+
+if [ "$#" -gt 1 ]; then
+    echo "error: expected at most one argument, got $#" >&2
+    usage
+    exit 2
+fi
+
+check=false
+case "${1:-}" in
+    "") ;;
+    --check) check=true ;;
+    *)
+        echo "error: unknown argument: $1" >&2
+        usage
+        exit 2
+        ;;
+esac
+
 # Keep in sync with .github/workflows/ci.yml and crates/uda-ffi/cbindgen.toml:
 # output can differ between cbindgen releases, so every consumer uses the same
 # pinned version.
@@ -26,6 +49,15 @@ CONFIG="$ROOT/crates/uda-ffi/cbindgen.toml"
 if ! command -v cbindgen >/dev/null 2>&1; then
     echo "cbindgen not found; installing pinned v${CBINDGEN_VERSION} ..." >&2
     cargo install cbindgen --locked --version "$CBINDGEN_VERSION"
+fi
+
+# `cargo install` can succeed while its bin directory (CARGO_HOME/bin) is not
+# on PATH; fail with an actionable message instead of a bare "command not
+# found" from the version probe below.
+if ! command -v cbindgen >/dev/null 2>&1; then
+    echo "error: cbindgen is still not on PATH after installing it." >&2
+    echo "       Add the cargo bin directory (usually ~/.cargo/bin) to PATH." >&2
+    exit 1
 fi
 
 installed="$(cbindgen --version | awk '{print $2}')"
@@ -46,7 +78,7 @@ trap 'rm -f "$output"' EXIT
 # negative literals in parentheses the way the header always has.
 perl -pi -e 's/^(#define UDA_[A-Z0-9_]+) (-\d+)$/$1 ($2)/' "$output"
 
-if [ "${1:-}" = "--check" ]; then
+if [ "$check" = true ]; then
     if ! diff -u "$HEADER" "$output"; then
         echo
         echo "error: include/uda.h is stale. Re-run scripts/gen-header.sh and" >&2
