@@ -305,33 +305,34 @@ mod tests {
     #[test]
     fn the_capability_query_neither_errors_nor_lies() {
         // The query is what a UI calls freely, so it must always answer, and it
-        // must never report an action the platform cannot reach.
+        // must only ever report one of the documented per-platform states.
         let capabilities = capabilities();
 
-        for action in [
-            SessionAction::Lock,
-            SessionAction::Logout,
-            SessionAction::Suspend,
-            SessionAction::Hibernate,
-            SessionAction::Reboot,
-            SessionAction::Shutdown,
-        ] {
-            if capabilities.contains(action.capability()) {
-                // An advertised action always sits behind a session backend: a
-                // bit without the management bit would mean a caller can be
-                // offered a button the platform has no code path for.
-                assert!(
-                    capabilities.contains(Capability::SESSION_MANAGEMENT),
-                    "{action:?} advertised with no session backend behind it"
-                );
-            }
-        }
+        let full_set = Capability::SESSION_MANAGEMENT
+            | Capability::LOCK
+            | Capability::LOGOUT
+            | Capability::SUSPEND
+            | Capability::HIBERNATE
+            | Capability::REBOOT
+            | Capability::SHUTDOWN;
 
-        // On a real backend the management bit is always set; on an exotic
-        // target the answer is "nothing at all".
-        if cfg!(any(target_os = "linux", target_os = "windows")) {
-            assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
+        if cfg!(target_os = "windows") {
+            // Every supported Windows release ships the session/power Win32
+            // APIs, so the full matrix is unconditional there.
+            assert_eq!(capabilities, full_set);
+        } else if cfg!(target_os = "linux") {
+            // The Linux answer is probed, not hardcoded: logind reachable ->
+            // the full set, screen saver alone -> LOCK (its receiver lives on
+            // the session bus, no logind involved), neither -> empty (the WSL
+            // case). Anything else means the probe and the matrix disagree.
+            assert!(
+                capabilities == full_set
+                    || capabilities == Capability::LOCK
+                    || capabilities.is_empty(),
+                "Linux must answer one of the three probe states, got {capabilities:?}"
+            );
         } else {
+            // No backend on an exotic target: "nothing at all".
             assert!(capabilities.is_empty());
         }
     }

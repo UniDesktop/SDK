@@ -229,7 +229,13 @@ fn verify_someone_receives_the_lock() -> Result<(), Failure> {
             "no systemd-logind on the system bus: an inhibition lock would not be honoured"
                 .to_string(),
         ))),
-        Ok(Err(error)) | Err(error) => Err(Failure::Uda(error)),
+        // "Probe failed" refuses with the same status as "probe says absent":
+        // an unprovable receiver is not a receiver. The probe's own
+        // diagnostics stay in the message, mirroring how session attempts
+        // keep their `loginctl` text under UDA_ERR_NOT_SUPPORTED.
+        Ok(Err(error)) | Err(error) => Err(Failure::Uda(UdaError::NotSupported(format!(
+            "could not prove a receiver for the CLI wake lock, refusing: {error}"
+        )))),
     }
 }
 
