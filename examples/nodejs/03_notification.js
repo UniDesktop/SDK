@@ -54,7 +54,6 @@ function main() {
 
 // 与 Python 示例的 `_bootstrap.run` 同一退出语义：环境不可用属于可预期的
 // 失败，打印一行诊断并以退出码 1 结束，而不是留下未捕获异常的调用栈。
-// （上面缺图标的前置检查自行设置 exitCode，同样落到退出码 1。）
 try {
   main();
 } catch (error) {

@@ -97,10 +97,11 @@ pub trait SessionManager {
 
     /// The session actions this platform's backend can deliver.
     ///
-    /// Computed once at construction and answering for the platform, not the
+    /// Cached after the first query and answering for the platform, not the
     /// moment: a machine that *could* sleep but has hibernation switched off
-    /// still reports [`Capability::HIBERNATE`], because the code path exists and
-    /// the failure would be a runtime `Err`, not an `Unsupported`.
+    /// still reports [`Capability::HIBERNATE`], because the receiver (logind)
+    /// is reachable and the failure would be a runtime `Err`, not an
+    /// `Unsupported`.
     fn capabilities(&self) -> Capability;
 }
 

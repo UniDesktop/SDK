@@ -14,7 +14,7 @@
 矩阵的每一行都是 ``uda.session.capabilities``（FFI 导出
 ``uda_session_capabilities``）的**实时探测结果**，不是硬编码的承诺：能力位未
 置位的动作会明确标注"当前环境不支持（探测结果）"，锁屏演示也会在 ``lock``
-位未置位时直接跳过。注意能力位表达"代码路径存在"，不等于"运行时一定被授权"
+位未置位时直接跳过。注意能力位表达"查询时有接收方可达"，不等于"运行时一定被授权"
 （例如 Windows 的 ``SeShutdownPrivilege``），真正的拒绝发生在调用时（状态码
 -2）。
 
@@ -84,7 +84,7 @@ def _print_matrix(capabilities: dict[str, bool]) -> None:
         marker = "支持" if capabilities.get(action) else _UNSUPPORTED
         print(f"  {action:<9} {marker}")
     print()
-    print("能力位表达\"代码路径存在\"，不保证运行时被授权；真正的拒绝发生在调用时。")
+    print("能力位表达\"查询时有接收方可达\"，不保证运行时被授权；真正的拒绝发生在调用时。")
     print()
 
     for action in _ACTIONS:

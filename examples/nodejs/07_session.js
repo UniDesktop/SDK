@@ -15,7 +15,7 @@
  * 矩阵的每一行都是 `uda.session.capabilities`（FFI 导出
  * `uda_session_capabilities`）的**实时探测结果**，不是硬编码的承诺：能力位未
  * 置位的动作会明确标注"当前环境不支持（探测结果）"，锁屏演示也会在 `lock`
- * 位未置位时直接跳过。能力位表达"代码路径存在"，不等于"运行时一定被授权"，
+ * 位未置位时直接跳过。能力位表达"查询时有接收方可达"，不等于"运行时一定被授权"，
  * 真正的拒绝发生在调用时（状态码 -2）。
  *
  * 技术细节见 `docs/internals/session_specs.md`。
@@ -60,7 +60,7 @@ function printMatrix(capabilities) {
     console.log(`  ${action.padEnd(9)} ${marker}`);
   }
   console.log();
-  console.log('能力位表达"代码路径存在"，不保证运行时被授权；真正的拒绝发生在调用时。');
+  console.log('能力位表达"查询时有接收方可达"，不保证运行时被授权；真正的拒绝发生在调用时。');
   console.log();
 
   for (const action of SESSION_ACTIONS) {

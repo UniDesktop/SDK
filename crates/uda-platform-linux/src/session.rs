@@ -45,12 +45,11 @@
 //! actually there before advertising anything: the full set only when
 //! `org.freedesktop.login1` answers on the system bus, `LOCK` alone when only
 //! `org.freedesktop.ScreenSaver` answers on the session bus, and nothing when
-//! neither does (a WSL host exports neither, and still used to get all seven
-//! bits). The probe runs once per process and is cached, the same trade the
-//! wake-lock backend makes.
+//! neither does (a WSL host exports neither). The probe runs once per process
+//! and is cached, the same trade the wake-lock backend makes.
 //!
 //! Whatever the probe said, an action that is attempted and then not delivered
-//! - logind refusing or timing out, `loginctl` exiting nonzero - reports
+//! (logind refusing or timing out, `loginctl` exiting nonzero) reports
 //! `UDA_ERR_NOT_SUPPORTED`, the one failure code `include/uda.h` promises C
 //! hosts for an attempted session action; the diagnostic stays in the message.
 //!
@@ -70,8 +69,7 @@ use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-use crate::internal_dbus;
-use crate::wakelock::{bus_has_service, logind_present};
+use crate::wakelock::{logind_present, screensaver_present};
 use crate::DBUS_TIMEOUT;
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
@@ -107,9 +105,8 @@ impl LinuxSessionManager {
 
     /// Connect to the **system** bus, where logind lives.
     ///
-    /// A bus that cannot be reached is an attempt that cannot even be made, so
-    /// the error folds into the one contract error below ([`not_delivered`])
-    /// like every other failure in this module.
+    /// A bus that cannot be reached folds into [`not_delivered`] like every
+    /// other failure in this module.
     async fn system_connection() -> Result<Connection, UdaError> {
         match tokio::time::timeout(DBUS_TIMEOUT, Connection::system()).await {
             Ok(Ok(connection)) => Ok(connection),
@@ -124,8 +121,7 @@ impl LinuxSessionManager {
 
     /// Connect to the **session** bus, where the screen saver lives.
     ///
-    /// Same contract as [`Self::system_connection`]: the error folds into
-    /// [`not_delivered`].
+    /// Same contract as [`Self::system_connection`].
     async fn session_connection() -> Result<Connection, UdaError> {
         match tokio::time::timeout(DBUS_TIMEOUT, Connection::session()).await {
             Ok(Ok(connection)) => Ok(connection),
@@ -145,9 +141,8 @@ impl LinuxSessionManager {
     /// safe to call from inside a tokio runtime as well (P1-15).
     fn login1_power(&self, method: &str) -> Result<(), UdaError> {
         let method = method.to_string();
-        // The future takes ownership of the method name; a copy keeps it in the
-        // bridge-failure message below, which otherwise would not say which
-        // action could not even be attempted.
+        // The future takes ownership of `method`; `action` keeps the name for
+        // the bridge-failure message below.
         let action = method.clone();
 
         crate::sync::run_async(async move {
@@ -190,9 +185,8 @@ impl LinuxSessionManager {
                 ))),
             }
         })
-        // The bridge failing to run the future at all is an attempt that never
-        // happened; it folds into the same contract error as every other
-        // failure rather than leaking a generic code to the host.
+        // A bridge failure would otherwise leak as -5; fold it into the
+        // contract error like every other outcome.
         .map_err(|e| {
             not_delivered(format!(
                 "the logind {action} call could not be attempted: {e}"
@@ -243,8 +237,6 @@ impl LinuxSessionManager {
                 )),
             }
         })
-        // Same bridge fold as `login1_power`: a lock that never got attempted
-        // is still an attempt failure in the eyes of the C-ABI contract.
         .map_err(|e| not_delivered(format!("the screen-saver lock could not be attempted: {e}")))?
     }
 
@@ -289,7 +281,6 @@ impl LinuxSessionManager {
             .map_err(|_| not_delivered("logind TerminateSession timed out".to_string()))?
             .map_err(|e| map_login1_error("TerminateSession", &e.to_string()))
         })
-        // Same bridge fold as `login1_power`.
         .map_err(|e| not_delivered(format!("the logind logout could not be attempted: {e}")))?;
 
         match logind {
@@ -457,12 +448,10 @@ fn logout_via_desktop(candidate: LogoutCandidate) -> bool {
 /// administrator" instead of a generic failure, which matters because power
 /// actions are exactly where users hit polkit.
 ///
-/// The variant is [`UdaError::NotSupported`] for *every* outcome, via
-/// [`not_delivered`]: an action that was attempted and not delivered must be
-/// catchable with one `UDA_ERR_NOT_SUPPORTED` comparison, which is what
-/// `include/uda.h` promises C hosts (review round 3, comment 3). Keeping the
-/// message as the only discriminator keeps the classification honest without
-/// leaking a generic failure code.
+/// Every outcome - polkit refusal, "this machine cannot", or a plain failure -
+/// maps to [`UdaError::NotSupported`] via [`not_delivered`], so one status
+/// comparison in a host catches all of them; only the message distinguishes
+/// the cases.
 ///
 /// The error is taken as already-rendered text so the classification is a pure
 /// function over a string: unit-testable, and free of any assumption about how
@@ -483,10 +472,9 @@ fn map_login1_error(method: &str, text: &str) -> UdaError {
 
 /// Translate a failed `loginctl lock-session` run into the contract error.
 ///
-/// Pure so the mapping is testable without spawning anything. A nonzero exit is
-/// the WSL case from review round 3: the action was attempted, the CLI answered
-/// "no", and the host must see `UDA_ERR_NOT_SUPPORTED` - with the exit code
-/// kept in the message for diagnosis - rather than a generic internal error.
+/// A nonzero exit is an attempted action the CLI refused (the WSL case): the
+/// host must see `UDA_ERR_NOT_SUPPORTED`, with the exit code kept in the
+/// message for diagnosis.
 fn map_loginctl_exit(code: Option<i32>) -> UdaError {
     not_delivered(format!(
         "loginctl lock-session exited with {}",
@@ -496,61 +484,42 @@ fn map_loginctl_exit(code: Option<i32>) -> UdaError {
 
 /// Translate a `loginctl` spawn failure into the contract error.
 ///
-/// `loginctl` missing is "the CLI tier cannot deliver this action at all", not
-/// a transient glitch, so it folds into the same [`UdaError::NotSupported`] the
-/// exit-code path produces; the OS error stays in the message.
+/// A missing `loginctl` means the CLI tier cannot deliver at all, so it folds
+/// into the same contract error as a refused run; the OS error stays in the
+/// message.
 fn map_loginctl_spawn(error: std::io::Error) -> UdaError {
     not_delivered(format!("could not run loginctl: {error}"))
 }
 
-/// The one error an attempted session action may report when it cannot deliver.
+/// The single error an attempted session action may report when it cannot
+/// deliver.
 ///
-/// `include/uda.h` promises C hosts that a `uda_session_*` action which was
-/// attempted but not delivered fails with `UDA_ERR_NOT_SUPPORTED` - and with
-/// nothing else - so a single `status == UDA_ERR_NOT_SUPPORTED` comparison is
-/// enough to degrade (review round 3, comment 3). Every failure path in this
+/// `include/uda.h` promises C hosts that an attempted `uda_session_*` action
+/// which is not delivered fails with `UDA_ERR_NOT_SUPPORTED` and nothing else,
+/// so one status comparison is enough to degrade. Every failure path in this
 /// module funnels through this constructor, directly or through
-/// [`map_login1_error`] and the `loginctl` mappers, which makes the promise
-/// hold by construction; the underlying diagnostic always stays in the message.
+/// [`map_login1_error`] and the `loginctl` mappers, which makes that promise
+/// hold by construction; the diagnostic always stays in the message.
 fn not_delivered(detail: impl std::fmt::Display) -> UdaError {
     UdaError::NotSupported(detail.to_string())
 }
 
-/// Is the FreeDesktop screen saver (`org.freedesktop.ScreenSaver`) reachable on
-/// the session bus?
-///
-/// This is the receiver [`LinuxSessionManager::lock`] tries first. The contract
-/// matches [`crate::wakelock::logind_present`], one bus over: every step is
-/// bounded by `DBUS_TIMEOUT`, and any error means "not proven present", so a
-/// caller must treat the receiver as absent rather than advertise what it
-/// cannot address.
-pub(crate) async fn screen_saver_present() -> Result<bool, UdaError> {
-    let connection = internal_dbus("connecting to the session bus", Connection::session()).await?;
-    bus_has_service(
-        &connection,
-        "building the session bus daemon proxy",
-        SCREENSAVER_SERVICE,
-    )
-    .await
-}
-
 /// Which session receivers are reachable, probed once per process.
 ///
-/// Returns `(logind, screen_saver)`. The answer is cached in a process-wide
-/// [`OnceLock`], the same trade the wake-lock backend makes: D-Bus receivers
-/// are not installed mid-session, while `capabilities()` sits on the hot path
-/// (the core `perform` guard consults it before *every* action), so one bounded
-/// probe pair per process beats a bus round trip per query. The flip side - a
-/// receiver that appears later is only noticed after a restart - errs in the
-/// honest direction: something unadvertised stays unavailable, never the
+/// Returns `(logind, screen_saver)`, cached in a process-wide [`OnceLock`]:
+/// receivers are not installed mid-session, while `capabilities()` sits on the
+/// hot path (the core `perform` guard consults it before *every* action), so
+/// one bounded probe pair per process beats a bus round trip per query. A
+/// receiver that appears later is only noticed after a restart, which errs in
+/// the honest direction: something unadvertised stays unavailable, never the
 /// reverse. A probe failure caches as "absent"; see [`probe_reachable`].
 fn session_reachability() -> (bool, bool) {
     static REACHABLE: OnceLock<(bool, bool)> = OnceLock::new();
     *REACHABLE.get_or_init(|| {
         let logind = probe_reachable(crate::sync::run_async(logind_present()), "logind");
         let screen_saver = probe_reachable(
-            crate::sync::run_async(screen_saver_present()),
-            "the screen saver",
+            crate::sync::run_async(screensaver_present()),
+            "screen saver",
         );
         (logind, screen_saver)
     })
@@ -561,8 +530,8 @@ fn session_reachability() -> (bool, bool) {
 /// The sync bridge wraps the probe's own `Result`, so there are two failure
 /// layers: the bridge failing to run the future at all, and the probe failing
 /// on the bus. For capability honesty both mean the same thing - "not proven
-/// present" - so both collapse to `false`, the same conservative fold the
-/// wake-lock backend applies to its probes.
+/// present" - so both collapse to `false`, matching the wake-lock backend's
+/// fold.
 fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &str) -> bool {
     match probe {
         Ok(Ok(reachable)) => reachable,
@@ -579,10 +548,10 @@ fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &s
 /// the full set is honest: logind receives every power and session-management
 /// action, and its presence is also what the `loginctl` CLI tier needs, so
 /// `LOCK` is covered twice. With only the screen saver answering, `LOCK` alone
-/// is claimable: the power actions have no receiver at all, and the desktop
-/// session managers in the logout fallback are tried opportunistically rather
-/// than probed, so `LOGOUT` stays unadvertised. With neither reachable - the
-/// WSL case that motivated this probe - nothing is claimed.
+/// is claimable: no receiver exists for the power actions, and the desktop
+/// logout managers are tried opportunistically rather than probed, so `LOGOUT`
+/// stays unadvertised. With neither reachable - the WSL case - nothing is
+/// claimed.
 fn session_capability_set(logind: bool, screen_saver: bool) -> Capability {
     if logind {
         return Capability::SESSION_MANAGEMENT
@@ -635,12 +604,9 @@ impl SessionManager for LinuxSessionManager {
     }
 
     fn capabilities(&self) -> Capability {
-        // Probed, not hardcoded (review round 3, comment 2): a WSL host exports
-        // neither logind nor a screen saver and still got all seven bits before.
-        // The matrix itself is pure and unit-tested; this call only feeds it the
-        // per-process reachability answer. Whether logind *authorises* the
-        // caller is a runtime question answered by the methods above, not a
-        // capability question.
+        // Probed, not hardcoded: a WSL host exports neither receiver. Whether
+        // logind *authorises* the caller remains a runtime question for the
+        // methods above, not a capability question.
         let (logind, screen_saver) = session_reachability();
         session_capability_set(logind, screen_saver)
     }
@@ -779,10 +745,9 @@ mod tests {
 
     #[test]
     fn a_generic_failure_is_still_an_undelivered_attempt() {
-        // Review round 3, comment 3: whatever logind answered, a host that
-        // checks `status == UDA_ERR_NOT_SUPPORTED` must catch it, so even a
-        // plain failure folds into NotSupported. The reason stays in the
-        // message.
+        // Whatever logind answered, a host that checks
+        // `status == UDA_ERR_NOT_SUPPORTED` must catch it, so even a plain
+        // failure folds into NotSupported; the reason stays in the message.
         let error = map_login1_error("Suspend", "device busy");
 
         match error {
@@ -827,9 +792,9 @@ mod tests {
 
     #[test]
     fn the_loginctl_exit_message_keeps_the_diagnostic() {
-        // The WSL reproduction from review round 3: `loginctl lock-session`
-        // exiting 1 used to surface as a generic internal error (-5) while
-        // include/uda.h promises UDA_ERR_NOT_SUPPORTED (-2).
+        // The WSL reproduction: `loginctl lock-session` exiting 1 must surface
+        // as UDA_ERR_NOT_SUPPORTED (-2), which include/uda.h promises, not as
+        // a generic internal error (-5).
         let error = map_loginctl_exit(Some(1));
 
         match error {
@@ -914,8 +879,8 @@ mod tests {
 
     #[test]
     fn without_any_receiver_nothing_is_advertised() {
-        // The WSL case from review round 3: no logind, no screen saver, so the
-        // answer is the empty set rather than a full house nothing can deliver.
+        // The WSL case: no logind, no screen saver, so the answer is the empty
+        // set rather than a full house nothing can deliver.
         assert!(session_capability_set(false, false).is_empty());
     }
 
@@ -937,10 +902,10 @@ mod tests {
 
     #[test]
     fn the_probed_service_names_are_the_exact_well_known_ones() {
-        // The bus probe matches names exactly and case-sensitively (see the
-        // wake-lock backend's `bus_names_contain` tests, which this module
-        // reuses), so the constants must be spelled exactly as the services
-        // publish themselves on their respective buses.
+        // The probe and the Lock proxy both address these services by name,
+        // with exact, case-sensitive matching (pinned by the wake-lock
+        // backend's `bus_names_contain` tests), so the constants must be
+        // spelled exactly as the services publish themselves.
         assert_eq!(LOGIN1_SERVICE, "org.freedesktop.login1");
         assert_eq!(SCREENSAVER_SERVICE, "org.freedesktop.ScreenSaver");
     }

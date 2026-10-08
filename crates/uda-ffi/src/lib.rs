@@ -277,10 +277,16 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 ///
 /// Writes a bitmask made of the `UDA_SESSION_CAP_*` constants to
 /// `*out_capabilities`; `0` means "no session backend exists on this target".
-/// The query is side-effect-free, so a UI may call it freely to decide which
-/// menu entries to draw.
+/// The query is side-effect-free - it never touches the machine's power state;
+/// on Linux it answers from a one-shot, cached service probe - so a UI may
+/// call it freely to decide which menu entries to draw, and must call it
+/// before drawing one that could shut the machine down.
 ///
-/// A set bit means "the code path exists", not "the account is allowed".
+/// A set bit means a receiver for the action was reachable when the
+/// capabilities were queried; the attempt can still fail (hibernation
+/// switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
+/// Windows reboot and shutdown can likewise fail at attempt time when the
+/// caller lacks the SeShutdownPrivilege.
 ///
 /// # Safety
 ///

@@ -95,8 +95,9 @@ pub async fn logind_present() -> Result<bool, UdaError> {
 /// Is the native ScreenSaver inhibit service reachable on the session bus?
 ///
 /// Same contract as [`logind_present`], one tier up: this is the receiver the
-/// manager's own `acquire` speaks to.
-async fn screensaver_present() -> Result<bool, UdaError> {
+/// manager's own `acquire` speaks to, and one of the two the session backend's
+/// capability matrix probes.
+pub(crate) async fn screensaver_present() -> Result<bool, UdaError> {
     let connection = internal_dbus("connecting to the session bus", Connection::session()).await?;
     bus_has_service(
         &connection,
@@ -111,12 +112,8 @@ async fn screensaver_present() -> Result<bool, UdaError> {
 /// `DBusProxy::list_names` resolves to the fdo error type rather than
 /// `zbus::Error`, so that one call cannot go through
 /// [`crate::internal_dbus`]; it gets its own `DBUS_TIMEOUT` and the same
-/// mapping instead.
-///
-/// `pub(crate)` so the session backend's `screen_saver_present` probe reuses
-/// the exact same ListNames machinery instead of growing a second copy; the
-/// name-matching semantics are pinned by the tests below.
-pub(crate) async fn bus_has_service(
+/// mapping instead. The name-matching semantics are pinned by the tests below.
+async fn bus_has_service(
     connection: &Connection,
     step: &str,
     service: &str,

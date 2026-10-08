@@ -1074,11 +1074,11 @@ class SessionController {
    * `{ lock: true, logout: true, suspend: true, hibernate: false,
    *    reboot: true, shutdown: true }`。
    *
-   * 该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调用来
-   * 决定界面上画哪些按钮——也必须在画出“关机”这类按钮之前调用。
+   * 该查询探测一次后缓存且无副作用：不会触碰机器的电源状态，因此可以随意调
+   * 用来决定界面上画哪些按钮——也必须在画出“关机”这类按钮之前调用。
    *
-   * 能力位表达“代码路径存在”，**不是**“当前账户被允许”：关掉休眠的机器依然
-   * `hibernate: true`，真正拒绝发生在调用时。Windows 的 `reboot` / `shutdown`
+   * 能力位表达“查询时有接收方可达”，**不是**“当前账户被允许”：关掉休眠的机
+   * 器依然 `hibernate: true`，真正拒绝发生在调用时。Windows 的 `reboot` / `shutdown`
    * 还需要 `SeShutdownPrivilege`，同样是运行时答案。
    *
    * @returns {{lock: boolean, logout: boolean, suspend: boolean,

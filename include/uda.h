@@ -415,9 +415,10 @@ int32_t uda_media_send_command(int32_t command);
  * Writes a bitmask made of the UDA_SESSION_CAP_* flags to `*out_capabilities`;
  * 0 means "no session backend exists on this target".
  *
- * The query is static and side-effect-free - it never touches the machine's
- * power state - so a host may call it freely to decide which menu entries to
- * draw, and *must* call it before drawing one that could shut the machine down.
+ * The query is side-effect-free - it never touches the machine's power state;
+ * on Linux it answers from a one-shot, cached service probe - so a host may
+ * call it freely to decide which menu entries to draw, and *must* call it
+ * before drawing one that could shut the machine down.
  *
  * A set bit means a receiver for the action was reachable when the
  * capabilities were queried; the attempt can still fail (hibernation switched

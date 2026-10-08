@@ -182,8 +182,8 @@ class SessionAction:
 class SessionCapability:
     """会话能力位常量，与 ``include/uda.h`` 的 UDA_SESSION_CAP_* 一致。
 
-    能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器仍置位
-    ``HIBERNATE``，真正拒绝发生在调用时（抛 :class:`UdaError` 状态码 -2）。
+    能力位表达"查询时有接收方可达"，**不是**"当前账户被允许"：关掉休眠的机器
+    仍置位 ``HIBERNATE``，真正拒绝发生在调用时（抛 :class:`UdaError` 状态码 -2）。
     """
 
     MANAGEMENT: Final[int] = 0x00010000
@@ -1188,11 +1188,11 @@ class _SessionController:
             {"lock": True, "logout": True, "suspend": True,
              "hibernate": False, "reboot": True, "shutdown": True}
 
-        该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调
-        用来决定界面上画哪些按钮——也必须在画出"关机"这类按钮之前调用。
+        该查询探测一次后缓存且无副作用：不会触碰机器的电源状态，因此可以随意
+        调用来决定界面上画哪些按钮——也必须在画出"关机"这类按钮之前调用。
 
-        能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器依
-        然 ``hibernate: True``，真正拒绝发生在调用时。Windows 的 reboot /
+        能力位表达"查询时有接收方可达"，**不是**"当前账户被允许"：关掉休眠的机
+        器依然 ``hibernate: True``，真正拒绝发生在调用时。Windows 的 reboot /
         shutdown 还需要 `SeShutdownPrivilege`，同样是运行时答案。
         """
         slot = _UInt32Slot()

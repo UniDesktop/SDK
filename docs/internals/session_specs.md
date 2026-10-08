@@ -20,8 +20,8 @@
 | `SessionAction::Hibernate` | `org.freedesktop.login1.Manager.Hibernate(false)` | `powrprof!SetSuspendState(true, false, false)` |
 | `SessionAction::Reboot` | `org.freedesktop.login1.Manager.Reboot(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_REBOOT \| EWX_FORCEIFHUNG, 0)` |
 | `SessionAction::Shutdown` | `org.freedesktop.login1.Manager.PowerOff(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_POWEROFF \| EWX_FORCEIFHUNG, 0)` |
-| `Capability::SESSION_MANAGEMENT` | logind 或 `loginctl` 可用 | Win32 会话/电源 API 存在 |
-| `Capability::LOCK` / `LOGOUT` / ... | 对应代码路径存在 | 对应代码路径存在 |
+| `Capability::SESSION_MANAGEMENT` | 探测到 `org.freedesktop.login1` 可达 | Win32 会话/电源 API 存在 |
+| `Capability::LOCK` / `LOGOUT` / ... | 探测到对应接收方可达 | Win32 API 存在 |
 
 ### 1.1 能力位（ABI 稳定）
 
@@ -210,13 +210,14 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
 
 ## 5. 能力与降级
 
-- **能力位表达"代码路径存在"，不是"账户被允许"。** 关掉休眠的机器仍上报
-  `Capability::HIBERNATE`；真正拒绝发生在运行时，成为
+- **能力位表达"查询时有接收方可达"，不是"账户被允许"。** 关掉休眠的机器
+  （logind 仍可达）仍上报 `Capability::HIBERNATE`；真正拒绝发生在运行时，成为
   `UdaError::NotSupported`。这与 Linux 的 polkit、Windows 的 1314 完全对称。
-- Linux 后端无条件上报全部七位：任何装了 systemd 的机器都有 logind，而锁屏
-  的 `loginctl` 回退连 screen saver 服务都不需要。
-- Windows 后端同样无条件上报全部七位：Win10/11 都有这四个 API；权限是运行时
-  问题（1300/1314），不是能力问题。
+- Linux 后端按运行时探测上报（结果按进程缓存一次，探测失败按不可达处理）：
+  `org.freedesktop.login1` 可达 → 全部七位；仅 `org.freedesktop.ScreenSaver`
+  可达 → 只有 `Capability::LOCK`；两者皆不可达（如 WSL 无头会话）→ 空集。
+- Windows 后端仍无条件上报全部七位：Win10/11 都有这四个 API，接收方恒可达；
+  权限是运行时问题（1300/1314），不是能力问题。
 - 非 Linux / 非 Windows 目标：`capabilities()` 返回空集，六个动作一律
   `UDA_ERR_NOT_SUPPORTED`。
 
