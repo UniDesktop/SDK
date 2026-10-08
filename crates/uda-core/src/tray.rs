@@ -1111,11 +1111,12 @@ pub struct TrayIconState {
     /// The canonical case is a Linux session without a
     /// `StatusNotifierWatcher` (`tray_specs.md` §1.6): the item is exported on
     /// the bus and fully serviceable, but the desktop shell may never display
-    /// it. The backend writes the reason before the icon is handed to the host
-    /// and never clears it, so [`TrayIcon::support_level`] can always explain
-    /// the degradation instead of leaving the host to guess from a log line no
-    /// embedder reads. A backend without a degradation path (Windows) leaves
-    /// the field `None` for the icon's whole life.
+    /// it. The backend writes the reason before the icon is handed to the host,
+    /// so [`TrayIcon::support_level`] can always explain the degradation
+    /// instead of leaving the host to guess from a log line no embedder reads;
+    /// a later `set_degraded(None)` clears it again. A backend without a
+    /// degradation path (Windows) leaves the field `None` for the icon's whole
+    /// life.
     pub degraded: Option<String>,
 }
 
@@ -1173,7 +1174,12 @@ impl TrayIconInner {
     /// the registration path before the icon reaches the host, so a host can
     /// never observe an undecided support level.
     pub fn set_degraded(&self, reason: Option<String>) {
-        self.lock_state().degraded = reason;
+        // An empty reason is not a reason: `uda.h` promises that PARTIAL always
+        // carries a non-empty explanation and `uda_tray_support_reason` maps an
+        // empty string to NULL, which would surface as PARTIAL with no answer.
+        // Normalising here keeps every consumer - the trait, the C exports and
+        // the tests - on one side of that promise.
+        self.lock_state().degraded = reason.filter(|text| !text.trim().is_empty());
     }
 
     /// Lock the shared state, recovering from a poisoned lock: the state is

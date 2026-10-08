@@ -1621,9 +1621,9 @@ impl LinuxTrayManager {
 
     /// The degradation reason of the first live icon that recorded one, if any.
     ///
-    /// Lock order note: this takes the registry lock and, per candidate, the
-    /// icon's own state lock. No path ever takes the registry lock while
-    /// holding an icon state lock, so the order cannot invert.
+    /// Lock order note: this takes the manager's icon-list lock and, per
+    /// candidate, the icon's own state lock. No path ever takes the icon-list
+    /// lock while holding an icon state lock, so the order cannot invert.
     fn recorded_degradation(&self) -> Option<String> {
         let mut icons = lock_or_recover(&self.icons, "tray manager icons");
         icons.retain(|weak| weak.strong_count() > 0);

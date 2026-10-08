@@ -156,8 +156,16 @@ function candidateLibraries() {
   }
 
   // 本文件位于 <repo>/examples/nodejs/，向上两级即仓库根目录。
+  // darwin 上 cargo 产物是 .dylib（与 python 绑定的 _LIBRARY_FILENAME_BY_PLATFORM
+  // 一致）：漏掉它会让示例文档承诺的 `cargo build && node 07_session.js` 在
+  // macOS 上直接加载失败。
   const repoRoot = path.resolve(__dirname, '..', '..');
-  const libName = process.platform === 'win32' ? 'uda_ffi.dll' : 'libuda_ffi.so';
+  const libName =
+    process.platform === 'win32'
+      ? 'uda_ffi.dll'
+      : process.platform === 'darwin'
+        ? 'libuda_ffi.dylib'
+        : 'libuda_ffi.so';
 
   const cargoTarget = queryCargoTargetDirectory(repoRoot);
   const targetRoots = new Set();

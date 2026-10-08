@@ -222,16 +222,13 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
 fn verify_someone_receives_the_lock() -> Result<(), Failure> {
     // `run_sync` yields `Result<Result<bool, UdaError>, UdaError>`: the outer
     // layer is the bridge's own failure, the inner one is the probe's verdict.
-    // Both "probe says absent" and "probe failed" refuse (see the module doc),
-    // so every arm below closes the gate.
+    // Both refuse, so every arm below closes the gate.
     match crate::notify::run_sync(uda_platform_linux::wakelock::logind_present()) {
         Ok(Ok(true)) => Ok(()),
         Ok(Ok(false)) => Err(Failure::Uda(UdaError::NotSupported(
             "no systemd-logind on the system bus: an inhibition lock would not be honored"
                 .to_string(),
         ))),
-        // The bridge failing and the probe failing both mean "cannot prove a
-        // receiver": the error text differs, the verdict does not.
         Ok(Err(error)) | Err(error) => Err(Failure::Uda(error)),
     }
 }

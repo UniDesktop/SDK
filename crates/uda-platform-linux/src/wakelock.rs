@@ -151,8 +151,8 @@ fn probe_or_absent(probe: Result<Result<bool, UdaError>, UdaError>) -> bool {
 /// Pure so the whole matrix is testable without a bus. Both receivers
 /// reachable - or the native one alone - is `Full`: the session-bus protocol
 /// is the designed path. Only logind is `Partial`, because acquisition then
-/// rides the CLI tier, whose locks are bounded rather than indefinite. Neither
-/// claims nothing at all.
+/// rides the CLI tier, whose locks are bounded rather than indefinite. With
+/// neither reachable, nothing is claimed at all.
 fn wake_lock_support(reachability: (bool, bool)) -> (Capability, SupportLevel) {
     let (screensaver, logind) = reachability;
     if screensaver {

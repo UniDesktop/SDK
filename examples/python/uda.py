@@ -53,6 +53,15 @@ __all__ = [
     "WakeLockType",
     "TrayIcon",
     "TrayMenu",
+    # 状态码常量也纳入 `from uda import *`：Node 侧 module.exports 已显式导出
+    # 同名值，两侧宿主的分流体验应当一致。
+    "OK",
+    "ERR_INVALID_ARGUMENT",
+    "ERR_NOT_SUPPORTED",
+    "ERR_DETECTION_FAILED",
+    "ERR_IO",
+    "ERR_INTERNAL",
+    "ERR_PANIC",
 ]
 
 # --------------------------------------------------------------------------

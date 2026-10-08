@@ -267,6 +267,15 @@ impl LinuxAppearanceManager {
         Self::parse_theme_from_gtk_theme(&gtk_theme, key_explicitly_set)
     }
 
+    /// KDE has no colour-scheme portal, and `kdeglobals` regularly carries
+    /// scheme names that tooling wrote even though the user never picked them
+    /// ("Breeze" is written by installers and systemsettings round-trips). The
+    /// same honesty rule as the GNOME fallback applies: a dark-named scheme is
+    /// a positive Dark answer, and anything else is "cannot know" - guessing
+    /// Light from an unconfirmed name is how a headless environment ends up
+    /// reporting a theme nobody configured. `kreadconfig5` without `--default`
+    /// already prints an empty string for a missing key, so unset keys arrive
+    /// here as `None` via [`Self::run_command`].
     async fn detect_kde_theme() -> Option<Theme> {
         let output = Self::run_command(
             "kreadconfig5",
@@ -282,25 +291,30 @@ impl LinuxAppearanceManager {
         .await;
 
         let value = output?;
-        if value.is_empty() {
-            return None;
-        }
-        if value.to_lowercase().contains("dark") {
-            Some(Theme::Dark)
-        } else {
-            Some(Theme::Light)
-        }
+        Self::theme_from_scheme_name(&value)
     }
 
+    /// XFCE: the xsettings theme name is the real theme key (the desktop
+    /// backdrop mode this check used to read is wallpaper configuration, not a
+    /// theme). `xfconf-query` exits non-zero for a property that does not
+    /// exist, so an unset key arrives as `None` via [`Self::run_command`]; the
+    /// dark-name-or-unknown rule matches the KDE and GNOME fallbacks.
     async fn detect_xfce_theme() -> Option<Theme> {
-        let prop = "xfce4-desktop";
-        let key = "/backdrop/screen0/mode";
+        let value =
+            Self::run_command("xfconf-query", &["-c", "xsettings", "-p", "/Net/ThemeName"]).await?;
+        Self::theme_from_scheme_name(&value)
+    }
 
-        let value = Self::run_command("xfconf-query", &["-c", prop, "-p", key]).await?;
+    /// Shared rule for scheme-name fallbacks without a colour-scheme portal:
+    /// a name containing "dark" is a confident Dark answer (every mainstream
+    /// dark scheme is named so), and nothing else can be trusted - "Breeze" or
+    /// "Adwaita" may be the user's choice or a default that tooling wrote, and
+    /// these paths have no way to tell.
+    fn theme_from_scheme_name(value: &str) -> Option<Theme> {
         if value.to_lowercase().contains("dark") {
             Some(Theme::Dark)
         } else {
-            Some(Theme::Light)
+            None
         }
     }
 
@@ -562,6 +576,32 @@ mod tests {
             LinuxAppearanceManager::parse_theme_from_gsettings("'default'"),
             None
         );
+    }
+
+    #[test]
+    fn scheme_name_fallbacks_answer_dark_or_nothing() {
+        // The KDE / XFCE fallbacks share the GNOME rule without the provenance
+        // refinement: a dark-named scheme is a confident Dark answer, and the
+        // platform defaults ("Breeze", "Greybird", "Raleigh") are exactly the
+        // values tooling writes without a user choice, so they must not
+        // masquerade as Light.
+        assert_eq!(
+            LinuxAppearanceManager::theme_from_scheme_name("BreezeDark"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            LinuxAppearanceManager::theme_from_scheme_name("Greybird-dark"),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            LinuxAppearanceManager::theme_from_scheme_name("Breeze"),
+            None
+        );
+        assert_eq!(
+            LinuxAppearanceManager::theme_from_scheme_name("Greybird"),
+            None
+        );
+        assert_eq!(LinuxAppearanceManager::theme_from_scheme_name(""), None);
     }
 
     #[test]
