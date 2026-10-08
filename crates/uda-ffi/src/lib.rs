@@ -579,9 +579,10 @@ pub unsafe extern "C" fn uda_session_shutdown() -> i32 {
 /// thread.
 ///
 /// Returns a newly allocated, null-terminated string that the caller must
-/// release with `uda_free_string()`, or NULL when no failure has been
-/// recorded yet. Reading consumes the message: the next call returns NULL
-/// until a new failure is recorded on the same thread.
+/// release with `uda_free_string()` (cast away `const` at the call), or NULL
+/// when no failure has been recorded yet. Reading consumes the message: the
+/// next call returns NULL until a new failure is recorded on the same
+/// thread.
 #[no_mangle]
 pub extern "C" fn uda_last_error_message() -> *const c_char {
     let Some(message) = util::take_last_message() else {

@@ -585,9 +585,10 @@ int32_t uda_session_shutdown(void);
  * thread.
  *
  * Returns a newly allocated, null-terminated string that the caller must
- * release with `uda_free_string()`, or NULL when no failure has been
- * recorded yet. Reading consumes the message: the next call returns NULL
- * until a new failure is recorded on the same thread.
+ * release with `uda_free_string()` (cast away `const` at the call), or NULL
+ * when no failure has been recorded yet. Reading consumes the message: the
+ * next call returns NULL until a new failure is recorded on the same
+ * thread.
  */
 const char *uda_last_error_message(void);
 
