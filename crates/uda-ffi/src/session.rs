@@ -32,21 +32,6 @@ use uda_core::session::{SessionAction, SessionManager};
 
 use crate::error::Failure;
 
-/// Capability bit: a session backend exists at all.
-pub const UDA_SESSION_CAP_MANAGEMENT: u32 = 1 << 16;
-/// Capability bit: the session can be locked (the only safe-to-automate one).
-pub const UDA_SESSION_CAP_LOCK: u32 = 1 << 17;
-/// Capability bit: the calling user's session can be logged out.
-pub const UDA_SESSION_CAP_LOGOUT: u32 = 1 << 18;
-/// Capability bit: the machine can be suspended to RAM.
-pub const UDA_SESSION_CAP_SUSPEND: u32 = 1 << 19;
-/// Capability bit: the machine can be hibernated to disk.
-pub const UDA_SESSION_CAP_HIBERNATE: u32 = 1 << 20;
-/// Capability bit: the machine can be rebooted.
-pub const UDA_SESSION_CAP_REBOOT: u32 = 1 << 21;
-/// Capability bit: the machine can be powered off.
-pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1 << 22;
-
 /// The actions the current platform's backend can deliver, as a bitmask.
 ///
 /// The bitmask is made of the [`UDA_SESSION_CAP_*`] constants and never
@@ -113,6 +98,11 @@ fn run<M: SessionManager>(manager: &M, action: SessionAction) -> Result<(), Fail
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{
+        UDA_SESSION_CAP_HIBERNATE, UDA_SESSION_CAP_LOCK, UDA_SESSION_CAP_LOGOUT,
+        UDA_SESSION_CAP_MANAGEMENT, UDA_SESSION_CAP_REBOOT, UDA_SESSION_CAP_SHUTDOWN,
+        UDA_SESSION_CAP_SUSPEND,
+    };
     use uda_core::error::UdaError;
 
     /// A manager that refuses everything and records nothing.

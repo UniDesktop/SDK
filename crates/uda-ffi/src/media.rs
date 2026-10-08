@@ -31,28 +31,6 @@ use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus}
 
 use crate::error::Failure;
 
-/// Playback-status code for "audio or video is actively progressing".
-pub const UDA_MEDIA_PLAYING: i32 = 0;
-/// Playback-status code for "a track is selected and halted".
-pub const UDA_MEDIA_PAUSED: i32 = 1;
-/// Playback-status code for "nothing is loaded".
-pub const UDA_MEDIA_STOPPED: i32 = 2;
-/// Playback-status code for "cannot tell" (includes "no player").
-pub const UDA_MEDIA_UNKNOWN: i32 = 3;
-
-/// Command code for "start or resume playback".
-pub const UDA_MEDIA_CMD_PLAY: i32 = 0;
-/// Command code for "halt playback but keep the track".
-pub const UDA_MEDIA_CMD_PAUSE: i32 = 1;
-/// Command code for "play/pause".
-pub const UDA_MEDIA_CMD_TOGGLE: i32 = 2;
-/// Command code for "next track".
-pub const UDA_MEDIA_CMD_NEXT: i32 = 3;
-/// Command code for "previous track".
-pub const UDA_MEDIA_CMD_PREVIOUS: i32 = 4;
-/// Command code for "stop playback".
-pub const UDA_MEDIA_CMD_STOP: i32 = 5;
-
 /// Resolve a command code into the core enum.
 ///
 /// An unknown code is rejected here rather than silently mapped, because sending
@@ -139,6 +117,11 @@ pub(crate) fn send_command(command: MediaCommand) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{
+        UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PAUSE, UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PREVIOUS,
+        UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
+        UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
+    };
 
     #[test]
     fn command_codes_match_the_c_header() {

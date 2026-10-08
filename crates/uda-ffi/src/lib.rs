@@ -33,6 +33,8 @@
 //! wake-lock registry (internally synchronised) and the thread-local
 //! last-error slot.
 
+pub mod abi;
+
 mod dispatch;
 mod error;
 mod media;
@@ -46,58 +48,8 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use uda_core::session::SessionAction;
 
-pub use error::{status_message, UdaStatus};
-
-// These numbers appear verbatim in include/uda.h and are part of the C ABI.
-pub use media::{
-    UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PAUSE, UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PREVIOUS,
-    UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
-    UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
-};
-
-// Part of the C ABI, so a caller can ask which actions exist *before* drawing a
-// menu that could shut the machine down.
-pub use session::{
-    UDA_SESSION_CAP_HIBERNATE, UDA_SESSION_CAP_LOCK, UDA_SESSION_CAP_LOGOUT,
-    UDA_SESSION_CAP_MANAGEMENT, UDA_SESSION_CAP_REBOOT, UDA_SESSION_CAP_SHUTDOWN,
-    UDA_SESSION_CAP_SUSPEND,
-};
-
-/// Status code for "success".
-pub const UDA_OK: c_int = 0;
-/// Status code for "invalid argument".
-pub const UDA_ERR_INVALID_ARGUMENT: c_int = -1;
-/// Status code for "feature not supported".
-pub const UDA_ERR_NOT_SUPPORTED: c_int = -2;
-/// Status code for "environment detection failed".
-pub const UDA_ERR_DETECTION_FAILED: c_int = -3;
-/// Status code for "I/O error".
-pub const UDA_ERR_IO: c_int = -4;
-/// Status code for "internal error".
-pub const UDA_ERR_INTERNAL: c_int = -5;
-/// Status code for "a panic was contained at the boundary".
-pub const UDA_ERR_PANIC: c_int = -6;
-
-/// Theme code for "unknown / not detected".
-pub const UDA_THEME_UNKNOWN: c_int = 0;
-/// Theme code for "dark".
-pub const UDA_THEME_DARK: c_int = 1;
-/// Theme code for "light".
-pub const UDA_THEME_LIGHT: c_int = 2;
-
-/// Fill-mode code for "crop to fill, preserving aspect ratio".
-pub const UDA_FILL_CROP: c_int = 0;
-/// Fill-mode code for "fill, ignoring aspect ratio".
-pub const UDA_FILL_FILL: c_int = 1;
-/// Fill-mode code for "fit, preserving aspect ratio".
-pub const UDA_FILL_FIT: c_int = 2;
-/// Fill-mode code for "stretch to fill".
-pub const UDA_FILL_STRETCH: c_int = 3;
-
-/// Wake-lock code for "prevent the display from sleeping".
-pub const UDA_WAKELOCK_DISPLAY: c_int = 0;
-/// Wake-lock code for "prevent the system from idling".
-pub const UDA_WAKELOCK_SYSTEM: c_int = 1;
+pub use abi::*;
+pub use error::status_message;
 
 /// Detect the current system colour scheme.
 ///
@@ -781,7 +733,7 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_in
 pub unsafe extern "C" fn uda_tray_menu_add_text(
     menu_handle: u64,
     label: *const c_char,
-    callback: Option<tray::TextCallback>,
+    callback: Option<UdaTrayTextCallback>,
     user_data: *mut c_void,
     out_item_id: *mut u64,
 ) -> c_int {
@@ -825,7 +777,7 @@ pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
     menu_handle: u64,
     label: *const c_char,
     checked: c_int,
-    callback: Option<tray::CheckboxCallback>,
+    callback: Option<UdaTrayCheckboxCallback>,
     user_data: *mut c_void,
     out_item_id: *mut u64,
 ) -> c_int {
@@ -925,14 +877,6 @@ fn wake_lock_type_from_c(code: c_int) -> Result<uda_core::wakelock::WakeLockType
 mod tests {
     use super::*;
     use std::ffi::CString;
-
-    #[test]
-    fn status_constants_match_the_error_module() {
-        assert_eq!(UDA_OK, error::UDA_OK);
-        assert_eq!(UDA_ERR_INVALID_ARGUMENT, error::UDA_ERR_INVALID_ARGUMENT);
-        assert_eq!(UDA_ERR_NOT_SUPPORTED, error::UDA_ERR_NOT_SUPPORTED);
-        assert_eq!(UDA_ERR_PANIC, error::UDA_ERR_PANIC);
-    }
 
     #[test]
     fn fill_mode_codes_are_accepted_and_rejected() {
