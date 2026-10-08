@@ -127,8 +127,10 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 - **`Duration` 为 0 不代表 0 毫秒**：SMTC 用 `TimeSpan::zero()` 表达"未知
   时长"，必须映射为 `None`。直播流、无时长信息的来源都会给 0。
 - **控制方法是 `Try*`**：返回 `false` 说明播放器拒绝（例如已暂停时再次
-  Pause）。这是正常语义，映射为 `Ok(())` 而非错误；只有 HRESULT 失败才是
-  `UdaError::Internal`。
+  Pause）。注意：当前实现把 `false` 与 HRESULT 失败都映射为
+  `UdaError::CommandFailed`（见 `crates/uda-platform-windows/src/media.rs`），
+  C-ABI 侧表现为非 `UDA_OK` 状态码；"拒绝是否应算成功"（即规范上的
+  `Ok(())` 语义）是一个待定的设计决策，头文件对该情形不承诺具体状态码。
 - **没有 JIT 属性**：所有 SMTC 调用都是 WinRT 异步，Rust 侧统一 `.get()` 同步
   等待，避免把 async 泄漏到 C-ABI。
 

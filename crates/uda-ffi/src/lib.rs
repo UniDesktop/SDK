@@ -644,9 +644,9 @@ pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
 
 // The C caller cannot hold an `Arc`, so every tray icon and context menu lives
 // in a process-wide table keyed by an opaque `uint64_t`. Handles start at `1`;
-// `0` means "no handle". A handle is single-use: a second destroy of the same
-// value is `UDA_ERR_INVALID_ARGUMENT` rather than a silent no-op, so a host
-// cannot double-release a shell resource.
+// `0` means "no handle". A handle can be destroyed exactly once: a second
+// destroy of the same value is `UDA_ERR_INVALID_ARGUMENT` rather than a silent
+// no-op, so a host cannot double-release a shell resource.
 
 /// Create a tray icon.
 ///
