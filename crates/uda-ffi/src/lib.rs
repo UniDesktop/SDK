@@ -334,8 +334,9 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> i32 {
 /// with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
 /// unconditionally. A field the player does not publish (a radio stream with
 /// no album, say) is NULL rather than an empty string, which lets a binding
-/// skip it. The artist list is already joined with ", " when the player
-/// publishes several artists.
+/// skip it, while a field published as an empty string stays an empty string -
+/// the two cases remain distinguishable. The artist list is already joined
+/// with ", " when the player publishes several artists.
 ///
 /// `out_duration_ms` receives the track length in milliseconds, or 0 when
 /// unknown (a live stream). `out_position_ms` is optional: pass NULL to skip
@@ -376,9 +377,9 @@ pub unsafe extern "C" fn uda_media_get_metadata(
         // renders as empty instead of as a failure.
         let (title, artist, album, duration_ms, position_ms) = match metadata {
             Some(ref metadata) => (
-                c_string_or_null(Some(&metadata.title)),
-                c_string_or_null(Some(&metadata.artist)),
-                c_string_or_null(Some(&metadata.album)),
+                c_string_or_null(metadata.title.as_deref()),
+                c_string_or_null(metadata.artist.as_deref()),
+                c_string_or_null(metadata.album.as_deref()),
                 metadata.duration_ms.unwrap_or(0),
                 metadata.position_ms.unwrap_or(0),
             ),
@@ -976,13 +977,13 @@ fn owned_or_empty(pointer: *const c_char, parameter: &str) -> Result<String, err
 
 /// Allocate a C string for a media metadata field, or return null.
 ///
-/// A field the player does not publish arrives as an empty `String` (the core
-/// model has no per-field `Option`), but the C contract hands out NULL for it
-/// so a binding can skip the field instead of rendering an empty row.
+/// `None` means the player did not publish the field and maps to NULL; a
+/// published value - including an empty one - maps to a real string, so a
+/// host can tell "published empty" from "not published".
 fn c_string_or_null(text: Option<&str>) -> *mut c_char {
     match text {
-        Some(text) if !text.is_empty() => util::c_string_from(text),
-        _ => std::ptr::null_mut(),
+        Some(text) => util::c_string_from(text),
+        None => std::ptr::null_mut(),
     }
 }
 
@@ -1031,13 +1032,25 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
-    fn metadata_fields_publish_null_for_unpublished_strings() {
+    fn metadata_fields_distinguish_published_empty_from_unpublished() {
+        // Unpublished -> NULL, the documented "skip this field" answer.
         assert!(c_string_or_null(None).is_null());
-        assert!(c_string_or_null(Some("")).is_null());
+        // Published as an empty string -> a real, empty C string, so a host
+        // that cares can tell the two apart; the caller frees it like any
+        // other library string.
+        let pointer = c_string_or_null(Some(""));
+        assert!(!pointer.is_null());
+        // SAFETY: the pointer came from `c_string_from` in this test.
+        let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("empty string is valid UTF-8");
+        assert_eq!(text, "");
+        // SAFETY: same pointer, freed exactly once.
+        unsafe { util::free_c_string(pointer) };
+        // Published text -> the text.
         let pointer = c_string_or_null(Some("/music/track.flac"));
         assert!(!pointer.is_null());
-        // SAFETY: the pointer came from `c_string_from` in this test and has
-        // not been handed to anyone else.
+        // SAFETY: same ownership pattern as above.
         unsafe { util::free_c_string(pointer) };
     }
 

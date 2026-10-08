@@ -379,10 +379,11 @@ fn dict_get<'d>(
 
 /// Build the metadata snapshot from an MPRIS `Metadata` dictionary.
 ///
-/// Every field is optional on the wire, and a missing one is an empty string
-/// rather than an error. `duration_ms` uses [`duration_from_micros`], which
-/// performs the microseconds -> milliseconds conversion and rejects unbounded
-/// streams.
+/// Every string field is optional on the wire: a missing key maps to `None`
+/// ("not published") and a present key to `Some(value)`, even when the value
+/// is an empty string, so the two cases stay distinguishable downstream.
+/// `duration_ms` uses [`duration_from_micros`], which performs the
+/// microseconds -> milliseconds conversion and rejects unbounded streams.
 ///
 /// [`dict_get`] is a helper rather than [`zbus::zvariant::Dict::get`] because the
 /// dictionary keys arrive as variants and the lookup must not fail the whole
@@ -390,15 +391,11 @@ fn dict_get<'d>(
 pub(crate) fn metadata_from_dict(dictionary: &zbus::zvariant::Dict<'_, '_>) -> MediaMetadata {
     // `dict_get` hands back an owned `Value`; the field readers deref-friendly
     // signatures accept it directly, so no explicit borrow is needed.
-    let title = dict_get(dictionary, "xesam:title")
-        .map(title_from_value)
-        .unwrap_or_default();
-    let artist = dict_get(dictionary, "xesam:artist")
-        .map(|value| join_artists(&artists_from_value(value)))
-        .unwrap_or_default();
-    let album = dict_get(dictionary, "xesam:album")
-        .and_then(|value| value.downcast_ref::<String>().ok())
-        .unwrap_or_default();
+    let title = dict_get(dictionary, "xesam:title").map(title_from_value);
+    let artist =
+        dict_get(dictionary, "xesam:artist").map(|value| join_artists(&artists_from_value(value)));
+    let album =
+        dict_get(dictionary, "xesam:album").and_then(|value| value.downcast_ref::<String>().ok());
 
     // The duration is a signed i64: the spec permits negative sentinels, and a
     // player that reports one must not be turned into a huge positive number.
@@ -753,21 +750,33 @@ mod tests {
             ("mpris:length", 240_000_000i64.into()),
         ]));
 
-        assert_eq!(metadata.title, "Song");
-        assert_eq!(metadata.artist, "A, B");
-        assert_eq!(metadata.album, "Album");
+        assert_eq!(metadata.title, Some("Song".to_string()));
+        assert_eq!(metadata.artist, Some("A, B".to_string()));
+        assert_eq!(metadata.album, Some("Album".to_string()));
         assert_eq!(metadata.duration_ms, Some(240_000));
         // The position is a separate, continuously changing property.
         assert_eq!(metadata.position_ms, None);
     }
 
     #[test]
-    fn an_empty_dictionary_yields_empty_fields_not_an_error() {
+    fn an_empty_dictionary_yields_unpublished_fields_not_an_error() {
         let metadata = metadata_from_dict(&dictionary(Vec::new()));
-        assert!(metadata.title.is_empty());
-        assert!(metadata.artist.is_empty());
-        assert!(metadata.album.is_empty());
+        // Absent keys mean "not published" (None), not an empty string.
+        assert_eq!(metadata.title, None);
+        assert_eq!(metadata.artist, None);
+        assert_eq!(metadata.album, None);
         assert_eq!(metadata.duration_ms, None);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn a_published_but_empty_title_stays_distinguishable_from_unpublished() {
+        // A player that publishes `xesam:title` as an empty string has said
+        // something different from a player that omits the key entirely; the
+        // parse must preserve the distinction instead of collapsing both.
+        let metadata = metadata_from_dict(&dictionary(vec![("xesam:title", "".into())]));
+        assert_eq!(metadata.title, Some(String::new()));
+        assert!(!metadata.is_empty());
     }
 
     #[test]

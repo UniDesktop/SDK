@@ -20,8 +20,8 @@
 //!
 //! The three strings written by [`uda_media_get_metadata`] are allocated by Rust
 //! and must be released with [`uda_free_string`](crate::uda_free_string); they
-//! may be null when the corresponding field is empty, which is the normal case
-//! for a player that publishes only a title.
+//! are null when the player does not publish the corresponding field, which is
+//! the normal case for a player that publishes only a title.
 //!
 //! A machine with nobody to command reports
 //! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED); any other
