@@ -122,19 +122,19 @@ pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1 << 22;
 // Tray callbacks
 // ---------------------------------------------------------------------------
 
-/// Callback type for a plain text menu row.
+/// Callback type for a plain text menu row, or NULL for a silent row.
 ///
 /// `item_id` is the row's id, as returned by `uda_tray_menu_add_text()`;
 /// `user_data` is the pointer registered alongside this callback.
-pub type UdaTrayTextCallback = extern "C" fn(u64, *mut c_void);
+pub type UdaTrayTextCallback = Option<extern "C" fn(u64, *mut c_void)>;
 
-/// Callback type for a checkbox menu row.
+/// Callback type for a checkbox menu row, or NULL for a silent row.
 ///
 /// `item_id` is the row's id, as returned by `uda_tray_menu_add_checkbox()`;
 /// `checked` is the NEW state after the toggle (`0` or `1`): the row's own
 /// stored value has already been updated, so this is what the shell renders
 /// next; `user_data` is the pointer registered alongside this callback.
-pub type UdaTrayCheckboxCallback = extern "C" fn(u64, i32, *mut c_void);
+pub type UdaTrayCheckboxCallback = Option<extern "C" fn(u64, i32, *mut c_void)>;
 
 #[cfg(test)]
 mod tests {

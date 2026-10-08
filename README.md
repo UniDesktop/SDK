@@ -54,7 +54,7 @@ The per-cell backend, the ⚠️ behaviour and what each environment reports: **
 
 ## 🚀 Quickstart in 3 Languages
 
-Three entry points: the native Rust crates, and a stable C-ABI (`include/uda.h`) reachable from Python and Node.js.
+Three entry points: the native Rust crates, and a stable C-ABI (`include/uda.h`, generated from the Rust sources by cbindgen) reachable from Python and Node.js.
 
 ```rust
 // Rust — native traits, no FFI layer

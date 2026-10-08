@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """List the ``uda_*`` function names declared in a C header.
 
-The public header (``include/uda.h``) is the single source of truth for the
-exported ABI surface: every ``#[no_mangle]`` symbol in ``crates/uda-ffi`` must be
-declared there, and every declaration must be a real export of the built shared
-library. Deriving the expected symbol set from the header means a newly added
-export can never silently fail a check that hard-codes a stale count, which is
-what broke the release pipeline.
+The public header (``include/uda.h``, generated from ``crates/uda-ffi`` by
+cbindgen) is the reference for the exported ABI surface: every ``#[no_mangle]``
+symbol in the crate must be declared there, and every declaration must be a
+real export of the built shared library. Deriving the expected symbol set from
+the header means a newly added export can never silently fail a check that
+hard-codes a stale count, which is what broke the release pipeline.
 
 Usage::
 

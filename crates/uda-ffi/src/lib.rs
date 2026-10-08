@@ -2,8 +2,10 @@
 //!
 //! This crate builds the shared library every non-Rust language links against:
 //! `libuda_ffi.so` on Linux, `uda_ffi.dll` on Windows. The matching C header is
-//! [`include/uda.h`](../../include/uda.h); ready-made bindings live under
-//! `examples/` (Python `ctypes`, Node.js `koffi`).
+//! [`include/uda.h`](../../include/uda.h), **generated** by cbindgen from the
+//! exported functions below and the surface types in [`abi`] - never edit the
+//! header by hand, run `scripts/gen-header.sh` instead. Ready-made bindings
+//! live under `examples/` (Python `ctypes`, Node.js `koffi`).
 //!
 //! # Contract
 //!
@@ -44,7 +46,7 @@ mod tray;
 mod util;
 mod wakelocks;
 
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_void};
 
 use uda_core::session::SessionAction;
 
@@ -61,7 +63,7 @@ pub use error::status_message;
 ///
 /// `out_theme` must point to a writable, non-null `int32_t` location.
 #[no_mangle]
-pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut c_int) -> c_int {
+pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut i32) -> i32 {
     if out_theme.is_null() {
         util::set_last_message("`out_theme` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -96,7 +98,7 @@ pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut c_int) -> c_int {
 ///
 /// `path` must be a valid, readable, null-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: c_int) -> c_int {
+pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: i32) -> i32 {
     if path.is_null() {
         util::set_last_message("`path` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -123,7 +125,7 @@ pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: c_int
 ///
 /// `out_path` must point to a writable, non-null pointer location.
 #[no_mangle]
-pub unsafe extern "C" fn uda_get_wallpaper(out_path: *mut *mut c_char) -> c_int {
+pub unsafe extern "C" fn uda_get_wallpaper(out_path: *mut *mut c_char) -> i32 {
     if out_path.is_null() {
         util::set_last_message("`out_path` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -174,10 +176,10 @@ pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
 /// `reason` must be a readable, null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn uda_wakelock_acquire(
-    lock_type: c_int,
+    lock_type: i32,
     reason: *const c_char,
     out_handle: *mut u64,
-) -> c_int {
+) -> i32 {
     if out_handle.is_null() {
         util::set_last_message("`out_handle` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -203,7 +205,7 @@ pub unsafe extern "C" fn uda_wakelock_acquire(
 /// Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live lock in
 /// this process (already released, or never issued here).
 #[no_mangle]
-pub extern "C" fn uda_wakelock_release(handle: u64) -> c_int {
+pub extern "C" fn uda_wakelock_release(handle: u64) -> i32 {
     util::catch_boundary(|| {
         let handle = dispatch::WakeLockHandle::from_raw(handle)
             .ok_or_else(|| error::Failure::InvalidArgument("`handle` must not be 0".to_string()))?;
@@ -251,7 +253,7 @@ pub unsafe extern "C" fn uda_notify(
     icon: *const c_char,
     actions: *const c_char,
     out_id: *mut u32,
-) -> c_int {
+) -> i32 {
     if out_id.is_null() {
         util::set_last_message("`out_id` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -283,7 +285,7 @@ pub unsafe extern "C" fn uda_notify(
 ///
 /// `out_rgba` must point to four writable `uint8_t` values.
 #[no_mangle]
-pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> c_int {
+pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> i32 {
     if out_rgba.is_null() {
         util::set_last_message("`out_rgba` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -341,7 +343,7 @@ pub unsafe extern "C" fn uda_media_get_metadata(
     out_album: *mut *mut c_char,
     out_duration_ms: *mut u64,
     out_position_ms: *mut u64,
-) -> c_int {
+) -> i32 {
     if out_title.is_null()
         || out_artist.is_null()
         || out_album.is_null()
@@ -387,7 +389,7 @@ pub unsafe extern "C" fn uda_media_get_metadata(
 ///
 /// `out_status` must point to a writable, non-null `int32_t` location.
 #[no_mangle]
-pub unsafe extern "C" fn uda_media_get_status(out_status: *mut c_int) -> c_int {
+pub unsafe extern "C" fn uda_media_get_status(out_status: *mut i32) -> i32 {
     if out_status.is_null() {
         util::set_last_message("`out_status` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -418,7 +420,7 @@ pub unsafe extern "C" fn uda_media_get_status(out_status: *mut c_int) -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
+pub unsafe extern "C" fn uda_media_send_command(command: i32) -> i32 {
     util::catch_boundary(|| {
         let command = media::command_from_c(command)?;
         media::send_command(command)
@@ -445,7 +447,7 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 ///
 /// `out_capabilities` must point to a writable, non-null `uint32_t` location.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) -> c_int {
+pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) -> i32 {
     if out_capabilities.is_null() {
         util::set_last_message("`out_capabilities` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -473,7 +475,7 @@ pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) ->
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_lock() -> c_int {
+pub unsafe extern "C" fn uda_session_lock() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Lock))
 }
 
@@ -490,7 +492,7 @@ pub unsafe extern "C" fn uda_session_lock() -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_logout() -> c_int {
+pub unsafe extern "C" fn uda_session_logout() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Logout))
 }
 
@@ -506,7 +508,7 @@ pub unsafe extern "C" fn uda_session_logout() -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_suspend() -> c_int {
+pub unsafe extern "C" fn uda_session_suspend() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Suspend))
 }
 
@@ -524,7 +526,7 @@ pub unsafe extern "C" fn uda_session_suspend() -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_hibernate() -> c_int {
+pub unsafe extern "C" fn uda_session_hibernate() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Hibernate))
 }
 
@@ -543,7 +545,7 @@ pub unsafe extern "C" fn uda_session_hibernate() -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_reboot() -> c_int {
+pub unsafe extern "C" fn uda_session_reboot() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Reboot))
 }
 
@@ -561,7 +563,7 @@ pub unsafe extern "C" fn uda_session_reboot() -> c_int {
 ///
 /// This function takes no pointers; there is nothing to validate.
 #[no_mangle]
-pub unsafe extern "C" fn uda_session_shutdown() -> c_int {
+pub unsafe extern "C" fn uda_session_shutdown() -> i32 {
     util::catch_boundary(|| session::perform(SessionAction::Shutdown))
 }
 
@@ -592,7 +594,7 @@ pub extern "C" fn uda_last_error_message() -> *const c_char {
 /// **not** be freed. Useful for rendering a failure without a second FFI
 /// round-trip.
 #[no_mangle]
-pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
+pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
     STATUS_MESSAGES.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(pointer) = cache.get(&status) {
@@ -677,7 +679,7 @@ pub unsafe extern "C" fn uda_tray_create(
     name: *const c_char,
     tooltip: *const c_char,
     out_handle: *mut u64,
-) -> c_int {
+) -> i32 {
     if out_handle.is_null() {
         util::set_last_message("`out_handle` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -714,7 +716,7 @@ pub unsafe extern "C" fn uda_tray_create(
 /// `tooltip` must be a readable, null-terminated UTF-8 string, or NULL for
 /// the empty string.
 #[no_mangle]
-pub unsafe extern "C" fn uda_tray_set_tooltip(handle: u64, tooltip: *const c_char) -> c_int {
+pub unsafe extern "C" fn uda_tray_set_tooltip(handle: u64, tooltip: *const c_char) -> i32 {
     util::catch_boundary(|| {
         let tooltip = owned_or_empty(tooltip, "tooltip")?;
         tray::set_tooltip(handle, &tooltip)
@@ -731,7 +733,7 @@ pub unsafe extern "C" fn uda_tray_set_tooltip(handle: u64, tooltip: *const c_cha
 ///
 /// `path` must be a readable, null-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn uda_tray_set_icon_path(handle: u64, path: *const c_char) -> c_int {
+pub unsafe extern "C" fn uda_tray_set_icon_path(handle: u64, path: *const c_char) -> i32 {
     if path.is_null() {
         util::set_last_message("`path` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -762,7 +764,7 @@ pub unsafe extern "C" fn uda_tray_set_icon_rgba(
     stride: u32,
     data: *const u8,
     len: usize,
-) -> c_int {
+) -> i32 {
     if data.is_null() {
         util::set_last_message("`data` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -775,7 +777,7 @@ pub unsafe extern "C" fn uda_tray_set_icon_rgba(
 ///
 /// `visible` is a C boolean: 0 hides, any other value shows.
 #[no_mangle]
-pub extern "C" fn uda_tray_set_visible(handle: u64, visible: c_int) -> c_int {
+pub extern "C" fn uda_tray_set_visible(handle: u64, visible: i32) -> i32 {
     util::catch_boundary(|| tray::set_visible(handle, visible != 0))
 }
 
@@ -786,7 +788,7 @@ pub extern "C" fn uda_tray_set_visible(handle: u64, visible: c_int) -> c_int {
 /// `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live tray icon in
 /// this process.
 #[no_mangle]
-pub extern "C" fn uda_tray_destroy(handle: u64) -> c_int {
+pub extern "C" fn uda_tray_destroy(handle: u64) -> i32 {
     util::catch_boundary(|| tray::destroy_icon(handle))
 }
 
@@ -800,7 +802,7 @@ pub extern "C" fn uda_tray_destroy(handle: u64) -> c_int {
 ///
 /// `out_menu_handle` must point to a writable, non-null `uint64_t` slot.
 #[no_mangle]
-pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_int {
+pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> i32 {
     if out_menu_handle.is_null() {
         util::set_last_message("`out_menu_handle` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -833,10 +835,10 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_in
 pub unsafe extern "C" fn uda_tray_menu_add_text(
     menu_handle: u64,
     label: *const c_char,
-    callback: Option<UdaTrayTextCallback>,
+    callback: UdaTrayTextCallback,
     user_data: *mut c_void,
     out_item_id: *mut u64,
-) -> c_int {
+) -> i32 {
     if out_item_id.is_null() {
         util::set_last_message("`out_item_id` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -859,7 +861,7 @@ pub unsafe extern "C" fn uda_tray_menu_add_text(
 /// A separator has no label, no callback and no id, so there is no
 /// out-parameter.
 #[no_mangle]
-pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> c_int {
+pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> i32 {
     util::catch_boundary(|| tray::menu_add_separator(menu_handle))
 }
 
@@ -882,11 +884,11 @@ pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> c_int {
 pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
     menu_handle: u64,
     label: *const c_char,
-    checked: c_int,
-    callback: Option<UdaTrayCheckboxCallback>,
+    checked: i32,
+    callback: UdaTrayCheckboxCallback,
     user_data: *mut c_void,
     out_item_id: *mut u64,
-) -> c_int {
+) -> i32 {
     if out_item_id.is_null() {
         util::set_last_message("`out_item_id` must not be null");
         return UDA_ERR_INVALID_ARGUMENT;
@@ -913,7 +915,7 @@ pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
 /// reference, so destroying the menu afterwards is optional and does not
 /// clear the rows.
 #[no_mangle]
-pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int {
+pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> i32 {
     util::catch_boundary(|| tray::set_menu(tray_handle, menu_handle))
 }
 
@@ -924,7 +926,7 @@ pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int
 /// `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live menu in this
 /// process.
 #[no_mangle]
-pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> c_int {
+pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> i32 {
     util::catch_boundary(|| tray::destroy_menu(menu_handle))
 }
 
@@ -945,12 +947,12 @@ fn owned_or_empty(pointer: *const c_char, parameter: &str) -> Result<String, err
 thread_local! {
     /// Cache of the leaked status-message strings, so repeated calls with the
     /// same code reuse a single allocation instead of leaking one per call.
-    static STATUS_MESSAGES: std::cell::RefCell<std::collections::HashMap<c_int, *const c_char>> =
+    static STATUS_MESSAGES: std::cell::RefCell<std::collections::HashMap<i32, *const c_char>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Map a C fill-mode code onto the cross-platform [`FillMode`].
-fn fill_mode_from_c(code: c_int) -> Result<uda_core::wallpaper::FillMode, error::Failure> {
+fn fill_mode_from_c(code: i32) -> Result<uda_core::wallpaper::FillMode, error::Failure> {
     use uda_core::wallpaper::FillMode;
     let fill_mode = match code {
         UDA_FILL_CROP => FillMode::Crop,
@@ -967,7 +969,7 @@ fn fill_mode_from_c(code: c_int) -> Result<uda_core::wallpaper::FillMode, error:
 }
 
 /// Map a C wake-lock code onto the cross-platform [`WakeLockType`].
-fn wake_lock_type_from_c(code: c_int) -> Result<uda_core::wakelock::WakeLockType, error::Failure> {
+fn wake_lock_type_from_c(code: i32) -> Result<uda_core::wakelock::WakeLockType, error::Failure> {
     use uda_core::wakelock::WakeLockType;
     let lock_type = match code {
         UDA_WAKELOCK_DISPLAY => WakeLockType::PreventDisplaySleep,
@@ -1011,7 +1013,7 @@ mod tests {
 
     #[test]
     fn detect_theme_writes_into_the_out_parameter() {
-        let mut theme: c_int = -100;
+        let mut theme: i32 = -100;
         // SAFETY: `theme` is a live, writable `int32_t` on this stack frame.
         let status = unsafe { uda_detect_theme(&mut theme) };
         assert_eq!(status, UDA_OK);

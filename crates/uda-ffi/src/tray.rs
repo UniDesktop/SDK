@@ -341,7 +341,7 @@ pub(crate) fn create_menu() -> Result<u64, Failure> {
 pub(crate) fn menu_add_text(
     menu_handle: u64,
     label: &str,
-    callback: Option<UdaTrayTextCallback>,
+    callback: UdaTrayTextCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let menu = TrayRegistry::global().menu(menu_handle)?;
@@ -395,7 +395,7 @@ pub(crate) fn menu_add_checkbox(
     menu_handle: u64,
     label: &str,
     checked: bool,
-    callback: Option<UdaTrayCheckboxCallback>,
+    callback: UdaTrayCheckboxCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let menu = TrayRegistry::global().menu(menu_handle)?;
@@ -504,7 +504,7 @@ mod tests {
     fn registry_text(
         menu: u64,
         label: &str,
-        callback: Option<UdaTrayTextCallback>,
+        callback: UdaTrayTextCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_text(menu, label, callback, user_data)
@@ -515,7 +515,7 @@ mod tests {
         menu: u64,
         label: &str,
         checked: bool,
-        callback: Option<UdaTrayCheckboxCallback>,
+        callback: UdaTrayCheckboxCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_checkbox(menu, label, checked, callback, user_data)

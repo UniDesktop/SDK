@@ -54,7 +54,7 @@
 
 ## 🚀 三种语言快速上手
 
-三个入口：原生 Rust crate，以及可从 Python 与 Node.js 调用的稳定 C-ABI（`include/uda.h`）。
+三个入口：原生 Rust crate，以及可从 Python 与 Node.js 调用的稳定 C-ABI（`include/uda.h`，由 cbindgen 从 Rust 源码生成）。
 
 ```rust
 // Rust —— 直接用原生 Trait，无需 FFI 层
