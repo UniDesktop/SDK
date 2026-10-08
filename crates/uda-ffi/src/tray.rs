@@ -41,11 +41,11 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use uda_core::capability::Capability;
+use uda_core::capability::{Capability, SupportLevel};
 use uda_core::error::UdaError;
 use uda_core::tray::{
-    MenuItem, MenuItemId, TrayAction, TrayEvent, TrayIcon, TrayIconBuilder, TrayIconSource,
-    TrayMenu,
+    MenuItem, MenuItemId, TrayAction, TrayEvent, TrayFeature, TrayIcon, TrayIconBuilder,
+    TrayIconSource, TrayMenu,
 };
 // `capabilities` resolves through this trait on the targets that have a
 // backend; the placeholder branch below answers without it, so the import would
@@ -113,6 +113,19 @@ pub const UDA_TRAY_CAP_CHECKBOX: u32 = 1 << 13;
 /// Capability bit: menu rows can be added, removed or relabelled at runtime.
 pub const UDA_TRAY_CAP_DYNAMIC_MENU: u32 = 1 << 14;
 
+/// Support-level code: the backend never claimed a tray at all.
+///
+/// Unreachable through handles `uda_tray_create` handed out - every created
+/// icon publishes the backend's capability set - but the mapping stays total,
+/// so a fabricated or half-registered icon cannot be read as healthy.
+pub const UDA_TRAY_SUPPORT_LEVEL_NONE: i32 = 0;
+/// Support-level code: the icon is live, but registration recorded a
+/// degradation (on Linux: no `StatusNotifierWatcher`, so the shell may never
+/// display the item). `uda_tray_support_reason` explains it.
+pub const UDA_TRAY_SUPPORT_LEVEL_PARTIAL: i32 = 1;
+/// Support-level code: the icon is live and nothing degraded.
+pub const UDA_TRAY_SUPPORT_LEVEL_FULL: i32 = 2;
+
 /// Every tray capability bit the C ABI documents.
 ///
 /// Used by the drift tests in this module and in [`crate::tests`], so the list
@@ -148,6 +161,37 @@ pub(crate) fn capabilities() -> Capability {
     {
         Capability::empty()
     }
+}
+
+/// The per-icon support level, as one of the `UDA_TRAY_SUPPORT_LEVEL_*` codes.
+///
+/// The answer is the icon's own, not the platform's: a backend that registered
+/// this icon in a degraded form (Linux without a `StatusNotifierWatcher`) is
+/// reported as [`UDA_TRAY_SUPPORT_LEVEL_PARTIAL`] even though the capability
+/// bitmask above still looks complete. The codes are mapped from
+/// [`TrayIcon::support_level`] so the Rust and C hosts can never disagree.
+pub(crate) fn support_level(handle: u64) -> Result<i32, Failure> {
+    let icon = TrayRegistry::global().icon(handle)?;
+    // `SupportLevel` is `#[non_exhaustive]`: a future level maps onto NONE, the
+    // code that already means "no positive answer", instead of breaking here.
+    Ok(match icon.support_level(TrayFeature::Icon) {
+        SupportLevel::Partial(_) => UDA_TRAY_SUPPORT_LEVEL_PARTIAL,
+        SupportLevel::Full => UDA_TRAY_SUPPORT_LEVEL_FULL,
+        _ => UDA_TRAY_SUPPORT_LEVEL_NONE,
+    })
+}
+
+/// The per-icon degradation reason, or `None` when registration recorded none.
+///
+/// Mirrors [`support_level`]: `Some` exactly when the icon answers
+/// [`UDA_TRAY_SUPPORT_LEVEL_PARTIAL`], and the text is what a host can show a
+/// user to explain why the tray entry may never appear.
+pub(crate) fn support_reason(handle: u64) -> Result<Option<String>, Failure> {
+    let icon = TrayRegistry::global().icon(handle)?;
+    Ok(icon
+        .support_level(TrayFeature::Icon)
+        .reason()
+        .map(str::to_owned))
 }
 
 /// One live record in the registry.
@@ -625,7 +669,7 @@ pub(crate) fn destroy_menu(menu_handle: u64) -> Result<(), Failure> {
 mod tests {
     use super::*;
     use crate::util;
-    use std::os::raw::c_void;
+    use std::os::raw::{c_char, c_void};
     use uda_core::tray::TrayIconInner;
 
     /// Serialises every test that inspects the shared registry.
@@ -1285,5 +1329,107 @@ mod tests {
         }
 
         assert!(destroy_icon(icon_handle).is_ok());
+    }
+
+    /// Register a synthetic icon the way the tests above do - no shell needed,
+    /// only the shared state the registry hands out. `degraded` decides whether
+    /// the icon answers `PARTIAL` or `FULL`; the capability set mimics what a
+    /// real registration publishes, which is what `support_level` gates on.
+    fn synthetic_icon(name: &str, degraded: Option<String>) -> u64 {
+        let inner = Arc::new(TrayIconInner::new(name.to_string()));
+        inner.set_capabilities(Capability::SYSTEM_TRAY);
+        inner.set_degraded(degraded);
+        let icon = Arc::new(TrayIcon::from_inner(inner));
+        TrayRegistry::global().allocate(TrayEntry::Icon(icon))
+    }
+
+    #[test]
+    fn the_support_level_codes_match_the_documented_values() {
+        // The numbers are part of the C ABI (include/uda.h), so a drift here
+        // would silently renumber every binding that hard-codes them.
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_NONE, 0);
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_PARTIAL, 1);
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_FULL, 2);
+    }
+
+    #[test]
+    fn a_healthy_icon_reports_full_with_no_reason() {
+        let _guard = registry_guard();
+        let handle = synthetic_icon("healthy", None);
+
+        let mut level: i32 = -1;
+        // SAFETY: `level` is a live, writable `int32_t` on this stack frame.
+        let status = unsafe { crate::uda_tray_support_level(handle, &mut level) };
+        assert_eq!(status, crate::UDA_OK);
+        assert_eq!(level, UDA_TRAY_SUPPORT_LEVEL_FULL);
+
+        let mut reason: *mut c_char = std::ptr::null_mut();
+        // SAFETY: `reason` is a live, writable pointer slot.
+        let status = unsafe { crate::uda_tray_support_reason(handle, &mut reason) };
+        assert_eq!(status, crate::UDA_OK);
+        assert!(
+            reason.is_null(),
+            "a fully supported icon must hand back no reason, so the caller's `if (ptr)` check reads \"not degraded\""
+        );
+
+        assert!(destroy_icon(handle).is_ok());
+    }
+
+    #[test]
+    fn a_degraded_icon_reports_partial_and_hands_over_its_reason() {
+        let _guard = registry_guard();
+        let reason_text = "no StatusNotifierWatcher is reachable on the session bus";
+        let handle = synthetic_icon("degraded", Some(reason_text.to_string()));
+
+        let mut level: i32 = -1;
+        // SAFETY: `level` is a live, writable `int32_t` on this stack frame.
+        let status = unsafe { crate::uda_tray_support_level(handle, &mut level) };
+        assert_eq!(status, crate::UDA_OK);
+        assert_eq!(
+            level, UDA_TRAY_SUPPORT_LEVEL_PARTIAL,
+            "a recorded degradation must be visible to the C host"
+        );
+
+        let mut reason: *mut c_char = std::ptr::null_mut();
+        // SAFETY: `reason` is a live, writable pointer slot.
+        let status = unsafe { crate::uda_tray_support_reason(handle, &mut reason) };
+        assert_eq!(status, crate::UDA_OK);
+        assert!(!reason.is_null(), "a degraded icon must carry its reason");
+        // SAFETY: the pointer came from this library and has not been freed.
+        let text = unsafe { util::owned_string_from(reason, "out_reason") }
+            .expect("library strings are valid UTF-8");
+        assert_eq!(text, reason_text);
+        // SAFETY: same pointer, freed exactly once.
+        unsafe { crate::uda_free_string(reason) };
+
+        assert!(destroy_icon(handle).is_ok());
+    }
+
+    #[test]
+    fn support_level_rejects_a_menu_handle_and_an_unknown_handle() {
+        let _guard = registry_guard();
+        let menu = create_menu().expect("menu");
+
+        // A menu where an icon is expected is the established type-mismatch
+        // error, and so is a handle this process never issued. Neither may
+        // touch the caller's out slot on the way out.
+        let mut level: i32 = -1;
+        // SAFETY: `level` is a live, writable `int32_t`; the handle is wrong.
+        let status = unsafe { crate::uda_tray_support_level(menu, &mut level) };
+        assert_eq!(status, crate::UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+
+        // SAFETY: same slot; the handle is unknown.
+        let status = unsafe { crate::uda_tray_support_level(u64::MAX - 1, &mut level) };
+        assert_eq!(status, crate::UDA_ERR_INVALID_ARGUMENT);
+        assert_eq!(level, -1, "a rejected call must leave the slot untouched");
+
+        let mut reason: *mut c_char = std::ptr::null_mut();
+        // SAFETY: `reason` is a live pointer slot; the handle is a menu.
+        let status = unsafe { crate::uda_tray_support_reason(menu, &mut reason) };
+        assert_eq!(status, crate::UDA_ERR_INVALID_ARGUMENT);
+        assert!(reason.is_null(), "a rejected call writes no reason either");
+
+        assert!(destroy_menu(menu).is_ok());
     }
 }

@@ -1106,6 +1106,17 @@ pub struct TrayIconState {
     /// until the backend publishes it, so the accessors fall back to a
     /// conservative answer instead of claiming a feature.
     pub capabilities: Capability,
+    /// Why the backend registered this icon in a degraded form, when it did.
+    ///
+    /// The canonical case is a Linux session without a
+    /// `StatusNotifierWatcher` (`tray_specs.md` §1.6): the item is exported on
+    /// the bus and fully serviceable, but the desktop shell may never display
+    /// it. The backend writes the reason before the icon is handed to the host
+    /// and never clears it, so [`TrayIcon::support_level`] can always explain
+    /// the degradation instead of leaving the host to guess from a log line no
+    /// embedder reads. A backend without a degradation path (Windows) leaves
+    /// the field `None` for the icon's whole life.
+    pub degraded: Option<String>,
 }
 
 /// Shared state of a [`TrayIcon`]: the platform backends read it directly to
@@ -1126,6 +1137,7 @@ impl Default for TrayIconState {
             visible: true,
             shutdown: false,
             capabilities: Capability::empty(),
+            degraded: None,
         }
     }
 }
@@ -1144,6 +1156,7 @@ impl TrayIconInner {
                 visible: true,
                 shutdown: false,
                 capabilities: Capability::empty(),
+                degraded: None,
             }),
         }
     }
@@ -1153,6 +1166,14 @@ impl TrayIconInner {
     /// reports a stale or optimistic answer.
     pub fn set_capabilities(&self, capabilities: Capability) {
         self.lock_state().capabilities = capabilities;
+    }
+
+    /// Record why this icon registered in a degraded form, or clear a
+    /// previously recorded reason with `None`. Backend use only; called from
+    /// the registration path before the icon reaches the host, so a host can
+    /// never observe an undecided support level.
+    pub fn set_degraded(&self, reason: Option<String>) {
+        self.lock_state().degraded = reason;
     }
 
     /// Lock the shared state, recovering from a poisoned lock: the state is
@@ -1296,17 +1317,30 @@ impl TrayIcon {
     /// Answers from the capability set the backend published at registration, so
     /// the value always describes *this* icon's environment. Before a backend
     /// publishes, the answer stays [`SupportLevel::None`].
+    ///
+    /// A degradation the backend recorded at registration time
+    /// ([`TrayIconState::degraded`]) narrows the [`TrayFeature::Icon`] answer to
+    /// [`SupportLevel::Partial`] carrying the backend's reason: on Linux the
+    /// icon may be exported but never shown by the shell, and that is exactly
+    /// the "showing the icon" question this feature asks.
     #[must_use]
     pub fn support_level(&self, feature: TrayFeature) -> SupportLevel {
-        let capabilities = self.inner.lock_state().capabilities;
-        if !capabilities.contains(Capability::SYSTEM_TRAY) {
+        let state = self.inner.lock_state();
+        if !state.capabilities.contains(Capability::SYSTEM_TRAY) {
             return SupportLevel::None;
         }
         // `Icon` is the one feature every backend guarantees once an icon
         // exists; `Tooltip` rides along because every backend exposes hover text.
         match feature {
-            TrayFeature::Icon | TrayFeature::Tooltip => SupportLevel::Full,
-            other if capabilities.contains(feature_flag(other)) => SupportLevel::Full,
+            // A recorded degradation is a shell-side visibility problem, which
+            // is what `Icon` asks about; the exported properties and the menu
+            // keep working, so the other features stay `Full`.
+            TrayFeature::Icon => match &state.degraded {
+                Some(reason) => SupportLevel::Partial(reason.clone()),
+                None => SupportLevel::Full,
+            },
+            TrayFeature::Tooltip => SupportLevel::Full,
+            other if state.capabilities.contains(feature_flag(other)) => SupportLevel::Full,
             // An absent flag is a plain `None`; `Partial` is reserved for a
             // backend that publishes a degraded answer explicitly (e.g. Linux
             // double-click synthesis), together with the reason it is degraded.
@@ -1769,6 +1803,36 @@ mod tests {
             icon.support_level(TrayFeature::DoubleClick),
             SupportLevel::None
         );
+    }
+
+    #[test]
+    fn a_recorded_degradation_reports_partial_for_the_icon_feature() {
+        let inner = Arc::new(TrayIconInner::new("degraded".to_string()));
+        let icon = TrayIcon::from_inner(Arc::clone(&inner));
+        inner.set_capabilities(Capability::SYSTEM_TRAY);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // What the backend recorded must reach the host verbatim: a watcher-less
+        // Linux session leaves the item exported but possibly invisible, and
+        // "showing the icon" is precisely the `Icon` question.
+        let reason = "no StatusNotifierWatcher is reachable on the session bus".to_string();
+        inner.set_degraded(Some(reason.clone()));
+        assert_eq!(
+            icon.support_level(TrayFeature::Icon),
+            SupportLevel::Partial(reason)
+        );
+        assert_eq!(
+            icon.support_level(TrayFeature::Icon).reason().map(str::len),
+            Some("no StatusNotifierWatcher is reachable on the session bus".len())
+        );
+
+        // The degradation is about shell-side visibility: the other exported
+        // features keep working, so they stay `Full`.
+        assert_eq!(icon.support_level(TrayFeature::Tooltip), SupportLevel::Full);
+
+        // Clearing the reason (a backend that recovered) restores `Full`.
+        inner.set_degraded(None);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
     }
 
     #[test]

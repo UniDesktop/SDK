@@ -186,6 +186,24 @@ extern "C" {
 /** Menu rows can be added, removed, or relabelled at runtime. */
 #define UDA_TRAY_CAP_DYNAMIC_MENU 0x00004000u
 
+/* Support levels (uda_tray_support_level). These describe what actually      */
+/* happened to one icon's registration, where the UDA_TRAY_CAP_* bits above   */
+/* only describe which code paths the backend has.                            */
+
+/**
+ * The backend never claimed a tray at all (not reachable through handles this
+ * library issued).
+ */
+#define UDA_TRAY_SUPPORT_LEVEL_NONE 0
+/**
+ * The icon is live, but its registration recorded a degradation: on Linux, a
+ * session with no StatusNotifierWatcher, where the item is exported on the bus
+ * yet the shell may never display it. uda_tray_support_reason() explains it.
+ */
+#define UDA_TRAY_SUPPORT_LEVEL_PARTIAL 1
+/** The icon is live and nothing about its registration degraded. */
+#define UDA_TRAY_SUPPORT_LEVEL_FULL 2
+
 /* ------------------------------------------------------------------------- */
 /* Functions                                                                 */
 /* ------------------------------------------------------------------------- */
@@ -565,6 +583,16 @@ const char *uda_status_message(int32_t status);
  *
  * The callback may be NULL, which yields a silent row that still renders and
  * still reports its state in later calls.
+ *
+ * DEGRADED REGISTRATIONS
+ *
+ * A successful uda_tray_create() means the item is registered with the
+ * platform's tray service, not that the user will ever see it. On Linux the
+ * shell learns about tray items from a StatusNotifierWatcher; when the session
+ * has none, the icon is exported but may stay invisible. Such an icon reports
+ * UDA_TRAY_SUPPORT_LEVEL_PARTIAL from uda_tray_support_level() with a
+ * human-readable explanation from uda_tray_support_reason(). Windows has no
+ * watcher step and always reports FULL for a live icon.
  */
 
 /**
@@ -777,6 +805,50 @@ int32_t uda_tray_menu_destroy(uint64_t menu_handle);
  * @return UDA_OK on success, otherwise a negative status code.
  */
 int32_t uda_tray_capabilities(uint32_t *out_capabilities);
+
+/**
+ * Report how completely one icon's tray registration succeeded.
+ *
+ * Writes one of the UDA_TRAY_SUPPORT_LEVEL_* codes to `*out_level`:
+ * UDA_TRAY_SUPPORT_LEVEL_FULL when nothing degraded,
+ * UDA_TRAY_SUPPORT_LEVEL_PARTIAL when the icon is live but its registration
+ * recorded a degradation (on Linux: no StatusNotifierWatcher, so the item is
+ * exported yet the shell may never display it), and
+ * UDA_TRAY_SUPPORT_LEVEL_NONE only when the backend never claimed a tray at
+ * all - not reachable through handles this library issued.
+ *
+ * The answer is per icon, not per platform: uda_tray_capabilities() reports
+ * which code paths exist, this reports what actually happened to THIS icon,
+ * and uda_tray_support_reason() explains a PARTIAL answer.
+ *
+ * On Windows the answer is always UDA_TRAY_SUPPORT_LEVEL_FULL for a live icon:
+ * the Win32 worker has no watcher step, so there is no degradation path.
+ *
+ * @param handle     A handle from uda_tray_create().
+ * @param out_level  Receives one of the UDA_TRAY_SUPPORT_LEVEL_* codes. Must
+ *                   not be null. Left untouched on failure.
+ * @return UDA_OK on success; UDA_ERR_INVALID_ARGUMENT when the handle is not a
+ *         live tray icon in this process; otherwise a negative status code.
+ */
+int32_t uda_tray_support_level(uint64_t handle, int32_t *out_level);
+
+/**
+ * Explain why one icon's tray support level is partial.
+ *
+ * On success `*out_reason` receives a heap C string the caller must release
+ * with uda_free_string(), or NULL when the icon is not degraded - check the
+ * pointer rather than the status. A degraded icon (see
+ * uda_tray_support_level()) always carries a non-empty, human-readable reason
+ * naming what is missing, e.g. a session with no StatusNotifierWatcher; a
+ * fully supported icon reports NULL.
+ *
+ * @param handle      A handle from uda_tray_create().
+ * @param out_reason  Receives the newly allocated reason string, or NULL. Must
+ *                    not be null itself. Left untouched on failure.
+ * @return UDA_OK on success; UDA_ERR_INVALID_ARGUMENT when the handle is not a
+ *         live tray icon in this process; otherwise a negative status code.
+ */
+int32_t uda_tray_support_reason(uint64_t handle, char **out_reason);
 
 #ifdef __cplusplus
 }

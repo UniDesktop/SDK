@@ -65,11 +65,12 @@ pub use session::{
 };
 
 // Part of the C ABI, so a caller can ask what the tray backend offers *before*
-// registering an icon.
+// registering an icon, and what an icon's registration actually achieved after.
 pub use tray::{
     UDA_TRAY_CAP_CHECKBOX, UDA_TRAY_CAP_CLICK, UDA_TRAY_CAP_CONTEXT_MENU,
     UDA_TRAY_CAP_DOUBLE_CLICK, UDA_TRAY_CAP_DYNAMIC_MENU, UDA_TRAY_CAP_ICON,
-    UDA_TRAY_CAP_SYSTEM_TRAY, UDA_TRAY_CAP_TOOLTIP,
+    UDA_TRAY_CAP_SYSTEM_TRAY, UDA_TRAY_CAP_TOOLTIP, UDA_TRAY_SUPPORT_LEVEL_FULL,
+    UDA_TRAY_SUPPORT_LEVEL_NONE, UDA_TRAY_SUPPORT_LEVEL_PARTIAL,
 };
 
 /// Status code for "success".
@@ -644,6 +645,78 @@ pub unsafe extern "C" fn uda_tray_capabilities(out_capabilities: *mut u32) -> c_
         // SAFETY: null was rejected above, and the caller guarantees a writable
         // `uint32_t` at this address.
         unsafe { *out_capabilities = tray::capabilities().bits() };
+        Ok(())
+    })
+}
+
+/// Report how completely this icon's tray registration succeeded.
+///
+/// Writes one of the `UDA_TRAY_SUPPORT_LEVEL_*` codes to `*out_level`:
+/// `UDA_TRAY_SUPPORT_LEVEL_FULL` when nothing degraded,
+/// `UDA_TRAY_SUPPORT_LEVEL_PARTIAL` when the icon is live but its registration
+/// recorded a degradation - on Linux, a session without a
+/// `StatusNotifierWatcher`, where the item is exported yet the shell may never
+/// display it - and `UDA_TRAY_SUPPORT_LEVEL_NONE` only when the backend never
+/// claimed a tray at all (not reachable through handles this library issued).
+///
+/// The answer is per icon, not per platform: `uda_tray_capabilities()` reports
+/// which code paths exist, this reports what actually happened to *this* icon,
+/// and `uda_tray_support_reason()` explains a `PARTIAL` answer.
+///
+/// On Windows the answer is always `UDA_TRAY_SUPPORT_LEVEL_FULL` for a live
+/// icon: the Win32 worker has no watcher step, so there is no degradation path.
+///
+/// # Safety
+///
+/// `out_level` must point at a writable `int32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_support_level(handle: u64, out_level: *mut i32) -> c_int {
+    if out_level.is_null() {
+        util::set_last_message("`out_level` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let level = tray::support_level(handle)?;
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `int32_t` at this address.
+        unsafe { *out_level = level };
+        Ok(())
+    })
+}
+
+/// Explain why a tray icon's support level is partial.
+///
+/// On success `*out_reason` receives a heap C string the caller must release
+/// with [`uda_free_string`], or NULL when the icon is not degraded - check the
+/// pointer, not the status. A degraded icon (see `uda_tray_support_level`)
+/// always carries a non-empty reason naming what is missing, e.g. a session
+/// with no `StatusNotifierWatcher`; a fully supported icon reports NULL.
+///
+/// # Safety
+///
+/// `out_reason` must point at a writable pointer location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_support_reason(
+    handle: u64,
+    out_reason: *mut *mut c_char,
+) -> c_int {
+    if out_reason.is_null() {
+        util::set_last_message("`out_reason` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let reason = tray::support_reason(handle)?;
+
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // pointer slot at this address.
+        unsafe {
+            *out_reason = match &reason {
+                Some(text) => util::c_string_from(text),
+                None => std::ptr::null_mut(),
+            };
+        }
         Ok(())
     })
 }
@@ -1245,6 +1318,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tray_support_level_rejects_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_support_level(1, std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn tray_support_reason_rejects_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_support_reason(1, std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
     /// The exports the C ABI presents as plain `extern "C"` (no `unsafe`).
     /// Every argument they take is a value - a numeric handle, a status code -
     /// that the library handles as data: a garbage value produces an error,
@@ -1313,7 +1402,7 @@ mod tests {
         assert!(unsafe_exports.iter().all(|name| !plain.contains(name)));
         assert_eq!(
             unsafe_exports.len() + plain.len(),
-            33,
+            35,
             "the export count changed; the classification list must follow"
         );
     }

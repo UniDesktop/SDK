@@ -1591,14 +1591,45 @@ async fn register_with_watcher(connection: &Connection, service: &str) -> Result
 
 /// The Linux tray manager. Cheap to construct: no connection is opened until
 /// [`TrayManager::create`] runs, so probing capabilities never touches the bus.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LinuxTrayManager;
+///
+/// A manager remembers - weakly - every icon it created, so
+/// [`TrayManager::support_level`] can relay a degradation those icons recorded
+/// (a session without a `StatusNotifierWatcher`, for one). The references are
+/// `Weak`, so remembering never keeps an icon alive, and a dropped icon leaves
+/// the answer on its own; a manager that created nothing answers statically.
+#[derive(Debug, Default, Clone)]
+pub struct LinuxTrayManager {
+    /// Weak handles to the icons this manager created, pruned on access.
+    icons: Arc<Mutex<Vec<std::sync::Weak<uda_core::tray::TrayIconInner>>>>,
+}
 
 impl LinuxTrayManager {
     /// A new manager.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Remember an icon this manager created, dropping the entries whose icon
+    /// is already gone. The lock mirrors [`lock_or_recover`]: the vector is
+    /// pure data, so a poisoned lock is recovered rather than propagated.
+    fn remember(&self, inner: &Arc<uda_core::tray::TrayIconInner>) {
+        let mut icons = lock_or_recover(&self.icons, "tray manager icons");
+        icons.retain(|weak| weak.strong_count() > 0);
+        icons.push(Arc::downgrade(inner));
+    }
+
+    /// The degradation reason of the first live icon that recorded one, if any.
+    ///
+    /// Lock order note: this takes the registry lock and, per candidate, the
+    /// icon's own state lock. No path ever takes the registry lock while
+    /// holding an icon state lock, so the order cannot invert.
+    fn recorded_degradation(&self) -> Option<String> {
+        let mut icons = lock_or_recover(&self.icons, "tray manager icons");
+        icons.retain(|weak| weak.strong_count() > 0);
+        icons
+            .iter()
+            .find_map(|weak| weak.upgrade()?.lock_state().degraded.clone())
     }
 
     /// The capability set this backend publishes for a registered item.
@@ -1647,10 +1678,15 @@ impl LinuxTrayManager {
     /// registered, and handing back a fully capable icon whose worker died at
     /// `Connection::session()` is exactly the dishonest success the readiness
     /// handshake exists to prevent.
+    ///
+    /// The readiness verdict travels back with the sender: `Ok(None)` - live
+    /// and healthy; `Ok(Some(reason))` - live but degraded, with the reason to
+    /// record on the icon before it reaches the host; `Err` - no icon to hand
+    /// over at all.
     fn spawn_worker(
         shared: Arc<Mutex<TrayShared>>,
         bus_name: String,
-    ) -> Result<std::sync::mpsc::Sender<()>, UdaError> {
+    ) -> Result<(std::sync::mpsc::Sender<()>, Option<String>), UdaError> {
         let revision = Arc::new(Mutex::new(0u32));
         let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -1676,37 +1712,40 @@ impl LinuxTrayManager {
         // Returning `Err` here drops the shutdown sender, which disconnects the
         // command channel and stops a worker that is still coming up; the icon
         // handle the caller built is dropped with the failed `create`.
-        let report = ready_receiver.recv_timeout(READY_TIMEOUT);
-        if let Some(error) = readiness_error(report) {
-            return Err(error);
-        }
-        Ok(sender)
+        let degraded = readiness_outcome(ready_receiver.recv_timeout(READY_TIMEOUT))?;
+        Ok((sender, degraded))
     }
 }
 
-/// Translate a readiness report into the error [`LinuxTrayManager::create`]
-/// must surface; `None` means the worker is live and the icon may be handed
-/// over. A degraded worker is not an error: the item answers on the bus, only
-/// its discoverability is reduced, and that is reported with its reason.
-fn readiness_error(
+/// Translate a readiness report into what [`LinuxTrayManager::create`] must
+/// act on: `Ok(None)` - ready; `Ok(Some(reason))` - live but degraded with the
+/// reason to surface to the host; `Err` - the item never made it onto the bus
+/// and there is no icon to hand over.
+///
+/// A degraded worker is not an error: the item answers on the bus, only its
+/// discoverability is reduced. The reason is therefore *returned* rather than
+/// dropped, so `create` can record it on the icon and `support_level` can
+/// relay it - a degradation that only ever reaches `log::warn!` is invisible
+/// to a host that embeds this library.
+fn readiness_outcome(
     report: Result<WorkerReady, std::sync::mpsc::RecvTimeoutError>,
-) -> Option<UdaError> {
+) -> Result<Option<String>, UdaError> {
     match report {
-        Ok(WorkerReady::Ready) => None,
+        Ok(WorkerReady::Ready) => Ok(None),
         Ok(WorkerReady::Degraded(reason)) => {
             log::warn!("tray item is live but degraded: {reason}");
-            None
+            Ok(Some(reason))
         }
         // The worker could not put the item on the bus. There is no fallback
         // tier for a tray, so this is the graceful tier-4 error, carrying the
         // reason verbatim.
-        Ok(WorkerReady::Failed(reason)) => Some(UdaError::NotSupported(format!(
+        Ok(WorkerReady::Failed(reason)) => Err(UdaError::NotSupported(format!(
             "system tray is unavailable: {reason}"
         ))),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(UdaError::Internal(format!(
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(UdaError::Internal(format!(
             "the tray worker did not report readiness within {READY_TIMEOUT:?}"
         ))),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Some(UdaError::Internal(
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(UdaError::Internal(
             "the tray worker exited before reporting readiness".to_string(),
         )),
     }
@@ -1751,10 +1790,18 @@ impl TrayManager for LinuxTrayManager {
 
         // Blocks until the worker has exported the item on the session bus, so
         // the capabilities published below describe a live icon, never a dead
-        // one. On failure this returns before any capability is published.
-        let shutdown = Self::spawn_worker(Arc::clone(&shared), bus_name)?;
+        // one. On failure this returns before any capability is published. A
+        // degradation travels back with the readiness verdict.
+        let (shutdown, degraded) = Self::spawn_worker(Arc::clone(&shared), bus_name)?;
 
         inner.set_capabilities(Self::advertised_capabilities());
+        // The handshake has completed by now, so the degradation - if any - is
+        // already decided: a host can never observe the icon claiming `Full`
+        // while the worker's verdict is still in flight.
+        inner.set_degraded(degraded);
+        // Remember the icon weakly, so this manager's `support_level` can
+        // relay the recorded degradation for as long as the icon lives.
+        self.remember(&inner);
 
         // The sender is deliberately leaked: dropping it would shut the worker
         // down immediately. The worker exits on its own once the host drops the
@@ -1772,6 +1819,19 @@ impl TrayManager for LinuxTrayManager {
         let capabilities = Self::advertised_capabilities();
         if !capabilities.contains(Capability::SYSTEM_TRAY) {
             return SupportLevel::None;
+        }
+        // `TrayFeature` has no separate "will the shell display it" question:
+        // `Icon` is where shell-side visibility is answered. A watcher-less
+        // registration does not change what the code can do - the item stays
+        // exported and serviceable (`tray_specs.md` §1.6) - it degrades
+        // whether the shell will ever show the icon, and that is session state
+        // the static capability set cannot know. The manager therefore relays
+        // the degradation an icon it created has recorded; a manager that
+        // created no icon answers statically, exactly as before.
+        if feature == TrayFeature::Icon {
+            if let Some(reason) = self.recorded_degradation() {
+                return SupportLevel::Partial(reason);
+            }
         }
         let flag = match feature {
             TrayFeature::Icon => Capability::TRAY_ICON,
@@ -2828,20 +2888,137 @@ mod tests {
         // A worker-reported failure means there is no icon to hand over; it
         // surfaces as the graceful tier-4 error with the reason attached.
         assert!(matches!(
-            readiness_error(Ok(WorkerReady::Failed(
+            readiness_outcome(Ok(WorkerReady::Failed(
                 "no session bus: refused".to_string()
             ))),
-            Some(UdaError::NotSupported(_))
+            Err(UdaError::NotSupported(_))
         ));
         // Timing out is a failure too: the worker never confirmed anything.
-        assert!(readiness_error(Err(std::sync::mpsc::RecvTimeoutError::Timeout)).is_some());
+        assert!(readiness_outcome(Err(std::sync::mpsc::RecvTimeoutError::Timeout)).is_err());
         assert!(
-            readiness_error(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)).is_some(),
+            readiness_outcome(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)).is_err(),
             "a worker that died before reporting is an error, not a success"
         );
-        // Live workers are handed over, degraded or not.
-        assert!(readiness_error(Ok(WorkerReady::Ready)).is_none());
-        assert!(readiness_error(Ok(WorkerReady::Degraded("no watcher".to_string()))).is_none());
+        // Live workers are handed over, degraded or not - but a degraded one
+        // must carry its reason out, or it would be invisible to the host.
+        assert!(
+            readiness_outcome(Ok(WorkerReady::Ready)).is_ok_and(|degraded| degraded.is_none()),
+            "a healthy worker reports no degradation"
+        );
+        assert_eq!(
+            readiness_outcome(Ok(WorkerReady::Degraded("no watcher".to_string())))
+                .expect("a degraded worker is not an error"),
+            Some("no watcher".to_string())
+        );
+    }
+
+    #[test]
+    fn a_recorded_degradation_flips_manager_support_level_to_partial() {
+        let manager = LinuxTrayManager::new();
+        // No icon, no degradation: the static answer stands.
+        assert_eq!(manager.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // Inject the state without touching any bus: the manager only reads
+        // what the registration path would have recorded.
+        let inner = Arc::new(uda_core::tray::TrayIconInner::new("degraded".to_string()));
+        manager.remember(&inner);
+        assert_eq!(
+            manager.support_level(TrayFeature::Icon),
+            SupportLevel::Full,
+            "a remembered icon without a degradation answers statically"
+        );
+
+        inner.set_degraded(Some(
+            "no StatusNotifierWatcher is reachable on the session bus".to_string(),
+        ));
+        assert_eq!(
+            manager.support_level(TrayFeature::Icon),
+            SupportLevel::Partial(
+                "no StatusNotifierWatcher is reachable on the session bus".to_string()
+            )
+        );
+        // The degradation is about shell-side visibility only: the other
+        // features keep their static answers.
+        assert_eq!(
+            manager.support_level(TrayFeature::Tooltip),
+            SupportLevel::Full
+        );
+        assert!(
+            manager
+                .support_level(TrayFeature::DoubleClick)
+                .reason()
+                .is_some(),
+            "the synthesised double click keeps its own Partial reason"
+        );
+
+        // Dropping the icon must return the answer to the static one: the
+        // manager holds the icon weakly, so a gone icon cannot haunt the query.
+        drop(inner);
+        assert_eq!(manager.support_level(TrayFeature::Icon), SupportLevel::Full);
+    }
+
+    #[test]
+    fn a_watcherless_session_records_the_degradation_on_the_created_icon() {
+        // This is the transport-level half of the story: on the mock harness's
+        // isolated bus (test-linux-mock.sh runs the suite inside
+        // dbus-run-session) no StatusNotifierWatcher exists, so `create` takes
+        // the degraded path deterministically. A real desktop session usually
+        // owns the watcher name - and a host with no session bus at all fails
+        // `create` for a different reason entirely - so the test stands down
+        // in both cases instead of failing for the wrong environment.
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            log::debug!("no session bus; the watcher-less transport test is skipped");
+            return;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::debug!("no test runtime: {error}");
+                return;
+            }
+        };
+        let watcher_absent = runtime.block_on(async {
+            let Ok(connection) = Connection::session().await else {
+                return None;
+            };
+            let Ok(proxy) = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+            )
+            .await
+            else {
+                return None;
+            };
+            let owned: Result<bool, _> = proxy.call("NameHasOwner", &WATCHER_SERVICE).await;
+            owned.ok().map(|owned| !owned)
+        });
+        if watcher_absent != Some(true) {
+            log::debug!("a watcher owns the tray name; the transport test is skipped");
+            return;
+        }
+
+        let manager = LinuxTrayManager::new();
+        let icon = manager
+            .create(TrayIconConfig::new("uda-tray-degraded-probe"))
+            .expect("the item must register even without a watcher");
+        match icon.support_level(TrayFeature::Icon) {
+            SupportLevel::Partial(reason) => {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "a degradation must carry a readable reason"
+                );
+                assert!(
+                    reason.contains("StatusNotifierWatcher"),
+                    "the reason must name what is missing: {reason}"
+                );
+            }
+            other => panic!("a watcher-less session must degrade the icon, got {other:?}"),
+        }
     }
 
     #[test]

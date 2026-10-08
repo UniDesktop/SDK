@@ -17,7 +17,9 @@ use crate::COMMAND_TIMEOUT;
 ///    - `Read("org.freedesktop.appearance", "color-scheme")`
 /// 2. **GNOME** (`gsettings`):
 ///    - `org.gnome.desktop.interface color-scheme`
-///    - `org.gnome.desktop.interface gtk-theme`
+///    - `org.gnome.desktop.interface gtk-theme`, trusted for `Light` only when
+///      `dconf` shows the key was explicitly set (see
+///      `parse_theme_from_gtk_theme`)
 /// 3. **KDE Plasma** (`kreadconfig5`):
 ///    - `kdeglobals` -> `General` -> `ColorScheme`
 /// 4. **XFCE** (`xfconf-query`):
@@ -177,17 +179,65 @@ impl LinuxAppearanceManager {
         }
     }
 
-    fn parse_theme_from_gtk_theme(value: &str) -> Option<Theme> {
-        let v = value
+    /// The bare theme name inside a `gsettings get` value.
+    ///
+    /// gsettings wraps string values in single quotes and callers may hand the
+    /// value through with surrounding whitespace; both are stripped. Pure so
+    /// the quote rules are testable without gsettings.
+    fn gtk_theme_name(value: &str) -> &str {
+        value
             .trim()
             .trim_start_matches('\'')
             .trim_end_matches('\'')
-            .trim();
-        if v.to_lowercase().ends_with("-dark") {
-            Some(Theme::Dark)
-        } else {
-            Some(Theme::Light)
+            .trim()
+    }
+
+    /// Whether a raw `gtk-theme` value names a dark theme.
+    ///
+    /// GNOME marks dark themes with a `-dark` suffix in any casing
+    /// (`Adwaita-dark`, `Yaru-DARK`). Pure so the matching rule is testable
+    /// without gsettings.
+    fn gtk_theme_name_is_dark(value: &str) -> bool {
+        Self::gtk_theme_name(value)
+            .to_lowercase()
+            .ends_with("-dark")
+    }
+
+    /// Decide the theme from the `gtk-theme` key alone.
+    ///
+    /// A `-dark` suffix answers [`Theme::Dark`] on its own. Any other name is
+    /// only [`Theme::Light`] when `key_explicitly_set` proves the key was
+    /// actually written: `gsettings get` reports the schema default just the
+    /// same as a stored value, so in an environment without the settings
+    /// portal there is no way to tell "the user chose a light theme" from
+    /// "nobody ever chose anything" without that proof. A never-configured
+    /// key therefore yields `None`, which lets the cascade end in the honest
+    /// [`Theme::Unknown`] instead of a guessed `Light` - the case that
+    /// motivated this rule is a WSL host whose GTK wrapper exports the schema
+    /// with its untouched `'Adwaita'` default.
+    fn parse_theme_from_gtk_theme(value: &str, key_explicitly_set: bool) -> Option<Theme> {
+        if Self::gtk_theme_name_is_dark(value) {
+            return Some(Theme::Dark);
         }
+        let name = Self::gtk_theme_name(value);
+        if key_explicitly_set && !name.is_empty() {
+            return Some(Theme::Light);
+        }
+        None
+    }
+
+    /// Whether the `gtk-theme` key holds an explicitly stored value.
+    ///
+    /// `dconf read` prints exactly what is stored in the user's dconf
+    /// database, so a non-empty answer is proof the key was written by the
+    /// user (or by a tool acting for them), while empty output means it was
+    /// never set. A missing `dconf` binary reads the same way through the
+    /// tool runner: without the database there is no proof of an explicit
+    /// choice either.
+    async fn gtk_theme_key_explicitly_set() -> bool {
+        Self::run_command("dconf", &["read", "/org/gnome/desktop/interface/gtk-theme"])
+            .await
+            .is_some()
     }
 
     async fn detect_gnome_theme() -> Option<Theme> {
@@ -205,8 +255,16 @@ impl LinuxAppearanceManager {
             "gsettings",
             &["get", "org.gnome.desktop.interface", "gtk-theme"],
         )
-        .await;
-        gtk_theme.and_then(|value| Self::parse_theme_from_gtk_theme(&value))
+        .await?;
+        if Self::gtk_theme_name_is_dark(&gtk_theme) {
+            return Some(Theme::Dark);
+        }
+        // Not a dark name: only an explicitly chosen light theme may be
+        // reported as `Light`. The dconf lookup is what keeps a
+        // never-configured schema default (WSL's untouched `'Adwaita'`) from
+        // being read as an answer.
+        let key_explicitly_set = Self::gtk_theme_key_explicitly_set().await;
+        Self::parse_theme_from_gtk_theme(&gtk_theme, key_explicitly_set)
     }
 
     async fn detect_kde_theme() -> Option<Theme> {
@@ -504,5 +562,89 @@ mod tests {
             LinuxAppearanceManager::parse_theme_from_gsettings("'default'"),
             None
         );
+    }
+
+    #[test]
+    fn a_gtk_theme_dark_suffix_answers_dark_on_its_own() {
+        // The suffix is a positive signal, so it decides without provenance and
+        // in any casing or quoting.
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("'Adwaita-dark'", false),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("Yaru-DARK", false),
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme(
+                "' Flat-Remix-GTK-Blue-Dark '",
+                true
+            ),
+            Some(Theme::Dark)
+        );
+    }
+
+    #[test]
+    fn a_gtk_theme_light_answer_requires_proof_the_key_was_set() {
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("'Adwaita'", true),
+            Some(Theme::Light)
+        );
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("Ambiance", true),
+            Some(Theme::Light)
+        );
+    }
+
+    #[test]
+    fn a_never_set_gtk_theme_key_is_unknown_not_light() {
+        // The maintainer's WSL report: the schema default 'Adwaita' leaked
+        // through `gsettings get` and was reported as `Light` although nobody
+        // had ever chosen anything. Without dconf proof there is no answer.
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("'Adwaita'", false),
+            None
+        );
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("Adwaita", false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_missing_dconf_reads_as_unproven_light() {
+        // `dconf read` missing and empty output both collapse to `false` by the
+        // tool runner's contract (a failed run is `None`, so `is_some()` is
+        // `false`); this pins that "cannot prove" and "unset" get the same
+        // treatment: no `Light` answer.
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("'Ambiance'", false),
+            None
+        );
+    }
+
+    #[test]
+    fn an_empty_gtk_theme_name_is_not_an_answer_even_if_set() {
+        // `''` survives the tool runner (two quote characters are non-empty
+        // stdout), but a nameless theme says nothing about light or dark.
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("''", true),
+            None
+        );
+        assert_eq!(
+            LinuxAppearanceManager::parse_theme_from_gtk_theme("", false),
+            None
+        );
+    }
+
+    #[test]
+    fn gtk_theme_name_strips_quotes_and_whitespace() {
+        assert_eq!(
+            LinuxAppearanceManager::gtk_theme_name("' Adwaita '"),
+            "Adwaita"
+        );
+        assert_eq!(LinuxAppearanceManager::gtk_theme_name("Yaru"), "Yaru");
+        assert_eq!(LinuxAppearanceManager::gtk_theme_name("''"), "");
     }
 }

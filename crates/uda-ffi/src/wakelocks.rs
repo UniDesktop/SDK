@@ -20,7 +20,12 @@
 //! - **Tier 3 (CLI fallback):** `systemd-inhibit --mode=block` holds the lock
 //!   only for as long as its child process lives, so the entry owns the child
 //!   and releasing means killing it. A child that already exited on its own is
-//!   not an error: the lock was already gone.
+//!   not an error: the lock was already gone. The tier is also refused
+//!   outright when `org.freedesktop.login1` is not on the system bus:
+//!   `systemd-inhibit` does not hold a lock by itself - systemd-logind does -
+//!   so with no logind (a WSL host, for one) nothing would receive the
+//!   inhibit, the screen would still sleep, and returning success would hand
+//!   the caller a lock that is pure fiction.
 //!
 //! # Lazy reaping
 //!
@@ -101,7 +106,10 @@ fn next_valid_handle() -> Result<WakeLockHandle, Failure> {
 ///
 /// Tries the platform's native IPC first (Tier 1/2) and falls back to the CLI
 /// tier (Tier 3) when the session cannot provide it - for example a Linux box
-/// with neither a ScreenSaver service nor an XDG portal.
+/// whose session bus has no ScreenSaver service but whose system bus still has
+/// systemd-logind. A box with neither tier refuses instead: the CLI tier
+/// verifies its receiver before spawning, so a lock nobody would honour is
+/// never reported as held.
 pub(crate) fn acquire(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
     match acquire_native(lock_type, reason) {
         Ok(guard) => register(next_valid_handle()?, LockEntry::Native(guard)),
@@ -165,6 +173,11 @@ fn cli_what_flag(lock_type: WakeLockType) -> &'static str {
 
 /// Acquire the lock through the CLI tier (`systemd-inhibit`).
 fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
+    // The lock only exists because systemd-logind receives it; refuse rather
+    // than spawn an inhibit nobody would honour (see the verifier).
+    #[cfg(target_os = "linux")]
+    verify_someone_receives_the_lock()?;
+
     let child = Command::new("systemd-inhibit")
         .arg("--who=UDA")
         .arg(format!("--why={reason}"))
@@ -190,6 +203,37 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
         expires_at: Instant::now() + Duration::from_secs(CLI_LOCK_SECONDS),
     };
     register(next_valid_handle()?, entry)
+}
+
+/// Verify that somebody will actually receive the CLI tier's inhibit lock.
+///
+/// `systemd-inhibit --mode=block` does not hold a lock by itself: it asks
+/// systemd-logind (`org.freedesktop.login1` on the system bus) to take one.
+/// On a system without logind - the maintainer's WSL was the reported case -
+/// no component receives it, the screen still sleeps, and a success return
+/// from [`acquire_cli`] would be a lie the host cannot detect. The probe runs
+/// through the FFI's shared blocking bridge [`crate::notify::run_sync`], which
+/// is safe with and without an ambient tokio runtime; the platform side owns
+/// the bus work and its `DBUS_TIMEOUT` bounds.
+///
+/// Both "probe says absent" and "probe failed" refuse: an unprovable receiver
+/// is not a receiver, so failing closed is the only honest answer.
+#[cfg(target_os = "linux")]
+fn verify_someone_receives_the_lock() -> Result<(), Failure> {
+    // `run_sync` yields `Result<Result<bool, UdaError>, UdaError>`: the outer
+    // layer is the bridge's own failure, the inner one is the probe's verdict.
+    // Both "probe says absent" and "probe failed" refuse (see the module doc),
+    // so every arm below closes the gate.
+    match crate::notify::run_sync(uda_platform_linux::wakelock::logind_present()) {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => Err(Failure::Uda(UdaError::NotSupported(
+            "no systemd-logind on the system bus: an inhibition lock would not be honored"
+                .to_string(),
+        ))),
+        // The bridge failing and the probe failing both mean "cannot prove a
+        // receiver": the error text differs, the verdict does not.
+        Ok(Err(error)) | Err(error) => Err(Failure::Uda(error)),
+    }
 }
 
 /// Kill and reap a CLI child so it never lingers as a zombie.
@@ -407,10 +451,12 @@ mod tests {
     #[test]
     fn acquire_and_release_round_trip_through_the_registry() {
         let _guard = registry_guard();
-        // On this host the session bus has no ScreenSaver service, so this
-        // exercises the CLI tier end to end; on a full desktop it exercises the
-        // native tier. A host with neither tier legitimately refuses, and the
-        // synthetic-entry tests below still cover the registry mechanics there.
+        // On a host with a ScreenSaver service this exercises the native tier;
+        // on one without but with systemd-logind it exercises the CLI tier -
+        // whose acquire now refuses when logind is absent, the WSL shape. A
+        // host with neither tier legitimately refuses (the `None` early
+        // return), and the synthetic-entry tests below still cover the
+        // registry mechanics there.
         let Some(handle) = acquire_any_tier("uda-ffi test") else {
             return;
         };

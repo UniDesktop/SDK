@@ -11,7 +11,9 @@
  *     uda.dispose();
  *
  * 调用方看不到 `koffi.alloc` 出参槽、`BigInt` 句柄或十六进制状态码：指针槽位分配、
- * 字符串内存释放、函数指针保活全部封装在本模块内，失败时抛出带诊断消息的 `Error`。
+ * 字符串内存释放、函数指针保活全部封装在本模块内，失败时抛出携带状态码与诊断
+ * 消息的 `UdaError` —— 与 Python SDK（`examples/python/uda.py`）的异常语义一致，
+ * 宿主可按 `err.status` 分流（-1 参数错 / -2 不支持 / -5 内部错等）。
  *
  * `createTrayIcon()` 接受 `.png` 文件路径，SDK 内部读文件、解码成 RGBA、降采样后
  * 提交 —— Linux 的 `StatusNotifierItem` 把 `Path` 当作 freedesktop 图标主题名而不是
@@ -29,6 +31,45 @@ const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
+
+// ---------------------------------------------------------------------------
+// C-ABI 状态码与错误类型（与 include/uda.h 及 Python SDK 保持一致）
+// ---------------------------------------------------------------------------
+
+/** 调用成功。 */
+const OK = 0;
+/** 空指针、非法 UTF-8 或未知枚举值。 */
+const ERR_INVALID_ARGUMENT = -1;
+/** 当前平台或会话不支持该特性。 */
+const ERR_NOT_SUPPORTED = -2;
+/** 环境检测失败。 */
+const ERR_DETECTION_FAILED = -3;
+/** I/O 错误。 */
+const ERR_IO = -4;
+/** 内部错误。 */
+const ERR_INTERNAL = -5;
+/** panic 在 FFI 边界被捕获（正常不应出现）。 */
+const ERR_PANIC = -6;
+
+/**
+ * UDA 调用失败时抛出，携带状态码与诊断消息。
+ *
+ * 与 Python SDK（`examples/python/uda.py` 的 `UdaError(status, message)`）字段
+ * 语义一致：`status` 是上方 `ERR_*` 之一的 C-ABI 状态码，`message` 是诊断消息
+ * 本身（不含状态码前缀，对应 Python 的 `.message` 字段）。宿主按 `err.status`
+ * 分流，例如把 -2 渲染成"当前环境不支持"、-1 归为调用方参数错。
+ */
+class UdaError extends Error {
+  /**
+   * @param {number} status C-ABI 状态码，与 `include/uda.h` 的 UDA_ERR_* 一致。
+   * @param {string} message 诊断消息。
+   */
+  constructor(status, message) {
+    super(message);
+    this.name = 'UdaError';
+    this.status = status;
+  }
+}
 
 /** 主题名映射：C 状态码 -> SDK 字符串。 */
 const THEME_NAMES = { 0: 'unknown', 1: 'dark', 2: 'light' };
@@ -144,14 +185,18 @@ function candidateLibraries() {
  * 加载 UDA 动态库并声明全部函数原型。
  *
  * @param {string} [libraryPath] 显式指定的动态库路径；省略时按默认候选顺序查找。
- * @throws {Error} 当 koffi 未安装、指定路径加载失败或所有候选都不可用时。
+ * @throws {UdaError} 当 koffi 未安装、指定路径加载失败或所有候选都不可用时
+ *   （状态码 `ERR_NOT_SUPPORTED`，与 Python 侧加载失败同码）。
  */
 function loadUda(libraryPath) {
   let koffi;
   try {
     koffi = require('koffi');
   } catch {
-    throw new Error('未找到 koffi 依赖，请先执行 `npm install koffi`（koffi 为零编译 C-ABI 绑定库）');
+    throw new UdaError(
+      ERR_NOT_SUPPORTED,
+      '未找到 koffi 依赖，请先执行 `npm install koffi`（koffi 为零编译 C-ABI 绑定库）'
+    );
   }
 
   let library = null;
@@ -162,7 +207,7 @@ function loadUda(libraryPath) {
     try {
       library = koffi.load(libraryPath);
     } catch (error) {
-      throw new Error(`无法加载指定的动态库 ${libraryPath}: ${error.message}`);
+      throw new UdaError(ERR_NOT_SUPPORTED, `无法加载指定的动态库 ${libraryPath}: ${error.message}`);
     }
   } else {
     const failures = [];
@@ -182,7 +227,8 @@ function loadUda(libraryPath) {
     }
 
     if (!library) {
-      throw new Error(
+      throw new UdaError(
+        ERR_NOT_SUPPORTED,
         '无法加载 libuda_ffi；请先在仓库根目录执行 `cargo build -p uda-ffi`，' +
           `或设置 UDA_LIBRARY 指向动态库。已尝试：${failures.join('; ')}`
       );
@@ -310,6 +356,11 @@ function loadUda(libraryPath) {
 
 // ---------------------------------------------------------------------------
 // PNG 解码（纯 Node 内置 zlib，无第三方依赖）
+//
+// 本节的抛错刻意**不**用 `UdaError`：解码发生在进入 FFI 之前，不携带任何
+// C-ABI 状态码，与 Python SDK 的独立 `PngError`（`examples/python/_png.py`）
+// 同类。宿主用 `err instanceof UdaError` 即可把"库调用失败"与本节的"图片
+// 文件本身有问题"区分开。
 // ---------------------------------------------------------------------------
 
 /** PNG 文件签名。 */
@@ -612,12 +663,21 @@ class Uda {
     return `${action} 失败`;
   }
 
-  /** 状态码非 0 时抛出带诊断的异常。 */
+  /**
+   * 状态码非 0 时抛出携带状态码与诊断的 `UdaError`。
+   *
+   * 与 Python 侧 `_check` 同一语义：宿主可按 `error.status` 分流，例如
+   * -2（不支持）降级隐藏入口、-1（参数错）记为调用方 bug。
+   *
+   * @param {number} status C 导出返回的状态码。
+   * @param {string} action 动作名，仅在库未记录诊断消息时用于兜底文案。
+   * @throws {UdaError} 状态码非 0。
+   */
   _check(status, action) {
-    if (status === 0) {
+    if (status === OK) {
       return;
     }
-    throw new Error(this._lastErrorMessage(action));
+    throw new UdaError(status, this._lastErrorMessage(action));
   }
 
   /** @returns {'dark' | 'light' | 'unknown'} 系统深浅色。 */
@@ -673,7 +733,11 @@ class Uda {
   setWallpaper(wallpaperPath, fillMode = 'fill') {
     const code = FILL_CODES[fillMode];
     if (code === undefined) {
-      throw new Error(`未知填充模式 ${fillMode}；可选：${Object.keys(FILL_CODES).join(', ')}`);
+      // 与 Python 侧一致：本地参数校验失败用状态码 -1 抛 UdaError。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
+        `未知填充模式 ${fillMode}；可选：${Object.keys(FILL_CODES).join(', ')}`
+      );
     }
     this._check(this._lib.setWallpaper(wallpaperPath, code), `set_wallpaper(${wallpaperPath})`);
   }
@@ -774,14 +838,19 @@ class Uda {
   _acquireLock(type, reason) {
     const code = WAKELOCK_CODES[type];
     if (code === undefined) {
-      throw new Error(`未知常亮锁类型 ${type}；可选：${Object.keys(WAKELOCK_CODES).join(', ')}`);
+      // 与 Python 侧一致：未知类型是参数错（-1）。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
+        `未知常亮锁类型 ${type}；可选：${Object.keys(WAKELOCK_CODES).join(', ')}`
+      );
     }
     const slot = this._lib.outSlot(this._types.uint64);
     this._check(this._lib.wakelockAcquire(code, reason, slot), `wakelock_acquire(${type})`);
 
     const handle = BigInt(this._lib.readSlot(this._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('wakelock_acquire 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'wakelock_acquire 返回了空句柄（违反 ABI 契约）');
     }
     this._locks.push(handle);
     return handle;
@@ -919,12 +988,15 @@ class MediaController {
    * 发送一条播控指令。
    *
    * @param {'play' | 'pause' | 'toggle' | 'next' | 'previous' | 'stop'} command
-   * @throws {Error} 指令名无法识别，或没有播放器可接收、播放器拒绝执行。
+   * @throws {UdaError} 指令名无法识别（-1），或没有播放器可接收、播放器拒绝
+   *   执行（-2）。
    */
   send(command) {
     const code = MEDIA_COMMAND_CODES[command];
     if (code === undefined) {
-      throw new Error(
+      // 与 Python 侧一致：未知指令是参数错（-1）。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
         `未知播控指令 ${command}；可选：${Object.keys(MEDIA_COMMAND_CODES).join(', ')}`
       );
     }
@@ -1015,7 +1087,7 @@ class SessionController {
    * @param {string} action 动作名：`lock` / `logout` / `suspend` /
    *   `hibernate` / `reboot` / `shutdown`。
    * @returns {boolean} `true` 表示后端存在该动作的代码路径。
-   * @throws {Error} 动作名无法识别时抛出（状态码 -1）。
+   * @throws {UdaError} 动作名无法识别时抛出（状态码 -1）。
    */
   supports(action) {
     const capability = this._capabilityOf(action);
@@ -1035,8 +1107,9 @@ class SessionController {
   _capabilityOf(action) {
     const capability = SESSION_ACTION_CAPABILITY[action];
     if (capability === undefined) {
+      // 与 Python 侧一致：未知动作名是参数错（-1），直接拒绝而不是猜一个。
       const known = Object.keys(SESSION_ACTION_CAPABILITY).join('、');
-      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+      throw new UdaError(ERR_INVALID_ARGUMENT, `未知的会话动作 '${action}'；可用动作：${known}`);
     }
     return capability;
   }
@@ -1049,8 +1122,9 @@ class SessionController {
    */
   _perform(action) {
     if (!SESSION_ACTIONS.includes(action)) {
+      // 与 Python 侧一致：未知动作名是参数错（-1）。
       const known = SESSION_ACTIONS.join('、');
-      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+      throw new UdaError(ERR_INVALID_ARGUMENT, `未知的会话动作 '${action}'；可用动作：${known}`);
     }
     const entry = this._uda._lib[`session${action[0].toUpperCase()}${action.slice(1)}`];
     this._uda._check(entry(), `session_${action}`);
@@ -1190,7 +1264,8 @@ class TrayMenu {
 
     const handle = BigInt(uda._lib.readSlot(uda._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('uda_tray_menu_create 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_create 返回了空句柄（违反 ABI 契约）');
     }
 
     /** @type {bigint} */
@@ -1219,7 +1294,8 @@ class TrayMenu {
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
-      throw new Error('uda_tray_menu_add_text 返回了空 item id（违反 ABI 契约）');
+      // 与空句柄同一纪律：契约被破坏归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_add_text 返回了空 item id（违反 ABI 契约）');
     }
     return itemId;
   }
@@ -1250,7 +1326,8 @@ class TrayMenu {
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
-      throw new Error('uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
+      // 与空句柄同一纪律：契约被破坏归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
     }
     return itemId;
   }
@@ -1362,7 +1439,8 @@ class TrayIcon {
 
     const handle = BigInt(uda._lib.readSlot(uda._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('uda_tray_create 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_create 返回了空句柄（违反 ABI 契约）');
     }
 
     /** @type {bigint} */
@@ -1502,6 +1580,16 @@ class TrayIcon {
 
 module.exports = {
   Uda,
+  UdaError,
+  // 状态码常量随 UdaError 一并导出：宿主按 `error.status === ERR_NOT_SUPPORTED`
+  // 分流时不必硬编码 -1/-2/-5（与 Python 侧 `from uda import ERR_*` 对齐）。
+  OK,
+  ERR_INVALID_ARGUMENT,
+  ERR_NOT_SUPPORTED,
+  ERR_DETECTION_FAILED,
+  ERR_IO,
+  ERR_INTERNAL,
+  ERR_PANIC,
   WakeLock,
   TrayIcon,
   TrayMenu,
