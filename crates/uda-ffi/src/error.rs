@@ -13,7 +13,8 @@
 //! | `-6` | [`UDA_ERR_PANIC`] | A panic was caught at the FFI boundary |
 //!
 //! Human-readable diagnostics for the failing call are available through
-//! `uda_last_error_message()` until the next UDA call on the same thread.
+//! `uda_last_error_message()`. Reading it consumes the message: the next
+//! call returns null until a new failure is recorded on the same thread.
 
 use uda_core::error::UdaError;
 

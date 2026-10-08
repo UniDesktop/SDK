@@ -61,6 +61,8 @@ header = """/*
  *   - Strings RETURNED by UDA are allocated by the library and must be
  *     released with `uda_free_string()`. Passing NULL to
  *     `uda_free_string()` is a no-op, so callers may free unconditionally.
+ *     The one exception is `uda_status_message()`, whose static return must
+ *     not be freed.
  *   - Strings PASSED IN are borrowed for the duration of the call only; the
  *     caller keeps ownership and must keep them alive until the call
  *     returns.
@@ -75,11 +77,11 @@ header = """/*
  *
  * Thread safety
  * -------------
- * All functions are free of global state apart from the wake-lock registry
- * (internally synchronised) and the thread-local last-error slot, so they
- * may be called concurrently from several threads. The last-error message
- * is per-thread: one thread's failure never overwrites another's
- * diagnosis.
+ * All functions are free of global state apart from the wake-lock registry,
+ * the tray handle registry (both internally synchronised) and the
+ * thread-local last-error slot, so they may be called concurrently from
+ * several threads. The last-error message is per-thread: one thread's
+ * failure never overwrites another's diagnosis.
  *
  * ABI stability
  * -------------

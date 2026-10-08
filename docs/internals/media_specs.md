@@ -139,10 +139,10 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 | 函数 | 出参 | 说明 |
 |---|---|---|
 | `uda_media_get_status(out_status: *mut i32)` | `0..3` 状态码 | 无会话时写 `3`（`Unknown`）并返回 `UDA_OK` |
-| `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms: *mut u64)` | 三个字符串 + 时长 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据时写 NULL；`out_duration_ms` 写 0 表示未知 |
-| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；播放器拒绝仍返回 `UDA_OK` |
+| `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms, out_position_ms: *mut u64)` | 三个字符串 + 时长/进度槽 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据或字段未发布时写 NULL；`out_duration_ms` 写 0 表示未知；仅 `out_position_ms` 允许传 `NULL` 跳过 |
+| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；无播放器返回 `UDA_ERR_NOT_SUPPORTED` |
 
-`out_title` 等三个指针都允许传 `NULL`，此时跳过该字段，方便只要歌名的调用方。
+`out_title` / `out_artist` / `out_album` / `out_duration_ms` 四个出参指针必须非空（传 `NULL` 返回 `UDA_ERR_INVALID_ARGUMENT`）；未发布的字段以 NULL 指针（字符串）/ 0（数值）回填，而非空字符串。
 
 ## 5. 能力与降级
 

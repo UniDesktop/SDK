@@ -4,8 +4,8 @@
 //! [`MediaManager`](uda_core::media::MediaManager) trait does: read what is
 //! playing, read the playback status, and send a transport command. The status is
 //! an `int32_t` code (see [`PlaybackStatus::code`](uda_core::media::PlaybackStatus));
-//! the metadata crosses the boundary as three separately-owned strings plus an
-//! out duration, because a C caller cannot allocate a Rust struct.
+//! the metadata crosses the boundary as three separately-owned strings plus out
+//! duration and position slots, because a C caller cannot allocate a Rust struct.
 //!
 //! # Why an out-code instead of an out-pointer for the status
 //!

@@ -17,7 +17,8 @@
 //! # Memory ownership
 //!
 //! - Strings **returned** by UDA are allocated by Rust and must be freed with
-//!   [`uda_free_string`].
+//!   [`uda_free_string`]. The one exception is [`status_message`], whose
+//!   static return must **not** be freed.
 //! - Strings **passed in** are borrowed for the duration of the call only.
 //! - Wake-lock handles are `uint64_t` values owned by this process; release each
 //!   exactly once with [`uda_wakelock_release`].
@@ -32,8 +33,8 @@
 //! # Thread safety
 //!
 //! The exports are free functions with no global mutable state except the
-//! wake-lock registry (internally synchronised) and the thread-local
-//! last-error slot.
+//! wake-lock registry, the tray handle registry (both internally
+//! synchronised) and the thread-local last-error slot.
 
 pub mod abi;
 
@@ -325,7 +326,9 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> i32 {
 /// none is running, which this function turns into: `*out_title`,
 /// `*out_artist` and `*out_album` set to NULL, and `*out_duration_ms` /
 /// `*out_position_ms` set to 0 - with a `UDA_OK` status. A now-playing card
-/// therefore renders as empty rather than as a failure.
+/// therefore renders as empty rather than as a failure. If the platform has
+/// no media backend at all, a negative status code is returned instead and
+/// the out-parameters are left untouched.
 ///
 /// The three strings are allocated by the library and must each be released
 /// with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
@@ -654,10 +657,10 @@ pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
 /// valid in another process: each handle indexes a table owned by the shared
 /// library.
 ///
-/// - A handle is single-use. Destroying it removes the table entry, so a
-///   successful destroy followed by another call with the same value is
-///   reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a stale
-///   resource.
+/// - A handle can be destroyed exactly once. Destroying it removes the table
+///   entry, so a successful destroy followed by another call with the same
+///   value is reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a
+///   stale resource.
 /// - Handle 0 is never a live resource. A zeroed out-parameter therefore
 ///   unambiguously means "the call failed".
 /// - A menu handle stays valid after `uda_tray_set_menu()`: the icon holds

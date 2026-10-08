@@ -23,6 +23,8 @@
  *   - Strings RETURNED by UDA are allocated by the library and must be
  *     released with `uda_free_string()`. Passing NULL to
  *     `uda_free_string()` is a no-op, so callers may free unconditionally.
+ *     The one exception is `uda_status_message()`, whose static return must
+ *     not be freed.
  *   - Strings PASSED IN are borrowed for the duration of the call only; the
  *     caller keeps ownership and must keep them alive until the call
  *     returns.
@@ -37,11 +39,11 @@
  *
  * Thread safety
  * -------------
- * All functions are free of global state apart from the wake-lock registry
- * (internally synchronised) and the thread-local last-error slot, so they
- * may be called concurrently from several threads. The last-error message
- * is per-thread: one thread's failure never overwrites another's
- * diagnosis.
+ * All functions are free of global state apart from the wake-lock registry,
+ * the tray handle registry (both internally synchronised) and the
+ * thread-local last-error slot, so they may be called concurrently from
+ * several threads. The last-error message is per-thread: one thread's
+ * failure never overwrites another's diagnosis.
  *
  * ABI stability
  * -------------
@@ -397,7 +399,9 @@ int32_t uda_get_accent_color(uint8_t *out_rgba);
  * none is running, which this function turns into: `*out_title`,
  * `*out_artist` and `*out_album` set to NULL, and `*out_duration_ms` /
  * `*out_position_ms` set to 0 - with a `UDA_OK` status. A now-playing card
- * therefore renders as empty rather than as a failure.
+ * therefore renders as empty rather than as a failure. If the platform has
+ * no media backend at all, a negative status code is returned instead and
+ * the out-parameters are left untouched.
  *
  * The three strings are allocated by the library and must each be released
  * with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
@@ -610,10 +614,10 @@ const char *uda_status_message(int32_t status);
  * valid in another process: each handle indexes a table owned by the shared
  * library.
  *
- * - A handle is single-use. Destroying it removes the table entry, so a
- *   successful destroy followed by another call with the same value is
- *   reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a stale
- *   resource.
+ * - A handle can be destroyed exactly once. Destroying it removes the table
+ *   entry, so a successful destroy followed by another call with the same
+ *   value is reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a
+ *   stale resource.
  * - Handle 0 is never a live resource. A zeroed out-parameter therefore
  *   unambiguously means "the call failed".
  * - A menu handle stays valid after `uda_tray_set_menu()`: the icon holds
