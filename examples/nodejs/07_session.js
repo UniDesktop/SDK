@@ -150,8 +150,10 @@ async function main() {
 }
 
 // 顶层 await 需要 Node 14.8+ / ESM；这里用 IIFE 保持 CommonJS 兼容，与
-// 仓库里其它 demo 一致。
+// 仓库里其它 demo 一致。探测调用本身失败（如无会话总线）属于环境不可用：
+// 与 Python 示例的 `_bootstrap.run` 同一退出语义，打印一行诊断并以退出码 1
+// 结束；能力位全未置位则只是正常输出，仍以 0 退出。
 main().catch((error) => {
-  console.error(`演示失败: ${error.message}`);
+  console.error(`UDA 调用失败: ${error.message}`);
   process.exitCode = 1;
 });

@@ -112,7 +112,11 @@ async fn screensaver_present() -> Result<bool, UdaError> {
 /// `zbus::Error`, so that one call cannot go through
 /// [`crate::internal_dbus`]; it gets its own `DBUS_TIMEOUT` and the same
 /// mapping instead.
-async fn bus_has_service(
+///
+/// `pub(crate)` so the session backend's `screen_saver_present` probe reuses
+/// the exact same ListNames machinery instead of growing a second copy; the
+/// name-matching semantics are pinned by the tests below.
+pub(crate) async fn bus_has_service(
     connection: &Connection,
     step: &str,
     service: &str,

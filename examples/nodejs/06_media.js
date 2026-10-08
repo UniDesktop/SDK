@@ -44,4 +44,12 @@ function main() {
   }
 }
 
-main();
+// 与 Python 示例的 `_bootstrap.run` 同一退出语义：上面 try/catch 捕获的播控
+// 失败是演示的一部分（打印后照常以 0 退出）；其余失败（如无媒体后端）属于
+// 环境不可用，打印一行诊断并以退出码 1 结束，而不是留下未捕获异常的调用栈。
+try {
+  main();
+} catch (error) {
+  console.error(`UDA 调用失败: ${error.message}`);
+  process.exitCode = 1;
+}

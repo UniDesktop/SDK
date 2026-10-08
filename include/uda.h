@@ -419,10 +419,11 @@ int32_t uda_media_send_command(int32_t command);
  * power state - so a host may call it freely to decide which menu entries to
  * draw, and *must* call it before drawing one that could shut the machine down.
  *
- * A set bit means "the code path exists", not "the account is allowed": a
- * machine with hibernation switched off still reports UDA_SESSION_CAP_HIBERNATE,
- * and the attempt then fails with UDA_ERR_NOT_SUPPORTED. Likewise, Windows
- * reboot and shutdown need the SeShutdownPrivilege, which is a runtime answer.
+ * A set bit means a receiver for the action was reachable when the
+ * capabilities were queried; the attempt can still fail (hibernation switched
+ * off, polkit refusal) and then fails with UDA_ERR_NOT_SUPPORTED. Windows
+ * reboot and shutdown can likewise fail at attempt time when the caller lacks
+ * the SeShutdownPrivilege.
  *
  * @param out_capabilities  Receives the bitmask. Must not be null.
  * @return UDA_OK on success, otherwise a negative status code.
