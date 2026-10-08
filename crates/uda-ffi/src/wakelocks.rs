@@ -176,7 +176,7 @@ fn register(handle: WakeLockHandle, entry: LockEntry) -> Result<WakeLockHandle, 
 ///
 /// The entry is removed first so the release path never holds the table lock.
 /// Releasing an unknown or already-released handle is reported as
-/// [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT): the
+/// [`UDA_ERR_INVALID_ARGUMENT`](crate::abi::UDA_ERR_INVALID_ARGUMENT): the
 /// caller passed a handle this process does not own.
 pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
     let raw = handle.raw();

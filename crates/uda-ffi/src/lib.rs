@@ -87,10 +87,11 @@ pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut i32) -> i32 {
 
 /// Set the desktop wallpaper.
 ///
-/// `path` is a null-terminated UTF-8 filesystem path; a `file://` URI is also
-/// accepted. An empty path is rejected as an invalid argument rather than
-/// being sent to the backend. `fill_mode` is one of the `UDA_FILL_*` codes;
-/// anything else is rejected.
+/// `path` is a null-terminated UTF-8 filesystem path; on Linux a `file://`
+/// URI is also accepted, while Windows requires a plain filesystem path. An
+/// empty path is rejected as an invalid argument rather than being sent to
+/// the backend. `fill_mode` is one of the `UDA_FILL_*` codes; anything else
+/// is rejected.
 ///
 /// On failure a negative status code is returned and no wallpaper is changed.
 ///
@@ -108,6 +109,11 @@ pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: i32) 
         // SAFETY: null was rejected above; the conversion walks to the null
         // terminator and rejects invalid UTF-8 instead of reading past it.
         let path = unsafe { util::owned_string_from(path, "path") }?;
+        if path.is_empty() {
+            return Err(error::Failure::InvalidArgument(
+                "`path` must not be empty".to_string(),
+            ));
+        }
         let fill_mode = fill_mode_from_c(fill_mode)?;
         dispatch::set_wallpaper(&path, fill_mode)
     })
@@ -202,8 +208,10 @@ pub unsafe extern "C" fn uda_wakelock_acquire(
 
 /// Release a wake lock previously obtained from `uda_wakelock_acquire()`.
 ///
-/// Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live lock in
-/// this process (already released, or never issued here).
+/// `handle` must be a value returned by `uda_wakelock_acquire()`; 0 is
+/// rejected with `UDA_ERR_INVALID_ARGUMENT`, and so is any handle that is
+/// not a live lock in this process (already released, or never issued
+/// here).
 #[no_mangle]
 pub extern "C" fn uda_wakelock_release(handle: u64) -> i32 {
     util::catch_boundary(|| {
@@ -276,10 +284,10 @@ pub unsafe extern "C" fn uda_notify(
 
 /// Read the system accent colour as four channels.
 ///
-/// Writes R, G, B, A (each 0..=255) to the four bytes at `out_rgba`. A
-/// platform that exposes no accent colour - most Linux desktops - leaves the
-/// bytes untouched and still returns `UDA_OK`, so a zeroed slot means "no
-/// accent", not failure.
+/// Writes R, G, B, A (each in the 0-255 range) to the four bytes at
+/// `out_rgba`. A platform that exposes no accent colour - most Linux
+/// desktops - leaves the bytes untouched and still returns `UDA_OK`, so a
+/// zeroed slot means "no accent", not failure.
 ///
 /// # Safety
 ///
@@ -570,9 +578,10 @@ pub unsafe extern "C" fn uda_session_shutdown() -> i32 {
 /// Return the message describing the most recent failure on the calling
 /// thread.
 ///
-/// The returned string is owned by the library and stays valid until the next
-/// UDA call on the same thread; copy it if it must outlive that. Returns NULL
-/// when no failure has been recorded yet.
+/// Returns a newly allocated, null-terminated string that the caller must
+/// release with `uda_free_string()`, or NULL when no failure has been
+/// recorded yet. Reading consumes the message: the next call returns NULL
+/// until a new failure is recorded on the same thread.
 #[no_mangle]
 pub extern "C" fn uda_last_error_message() -> *const c_char {
     let Some(message) = util::take_last_message() else {
@@ -591,7 +600,7 @@ pub extern "C" fn uda_last_error_message() -> *const c_char {
 /// Describe a status code with a static string.
 ///
 /// The returned pointer is valid for the lifetime of the library and must
-/// **not** be freed. Useful for rendering a failure without a second FFI
+/// not be freed. Useful for rendering a failure without a second FFI
 /// round-trip.
 #[no_mangle]
 pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
@@ -661,9 +670,9 @@ pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
 /// ARGUMENTS
 ///
 /// `name` is the application name used for registration (the D-Bus bus name
-/// on Linux, the window class on Windows); a NULL `name` selects the library
-/// default. `tooltip` may be NULL or empty; text longer than 127 characters
-/// is clamped, and the call still succeeds.
+/// on Linux, the window class on Windows); a NULL or empty `name` selects
+/// the library default. `tooltip` may be NULL or empty; text longer than
+/// 127 characters is clamped, and the call still succeeds.
 ///
 /// On success `*out_handle` receives a non-zero handle for every other
 /// `uda_tray_*` call. On failure it is left untouched. The icon has no image
@@ -726,7 +735,7 @@ pub unsafe extern "C" fn uda_tray_set_tooltip(handle: u64, tooltip: *const c_cha
 /// Replace a tray icon's image from a file or icon-theme name.
 ///
 /// `path` is a null-terminated UTF-8 path. Linux also accepts a freedesktop
-/// icon-theme name here; Windows requires a file path (`.ico`, `.png`,
+/// icon-theme name here; Windows requires a file path (`.ico`, `.cur`,
 /// `.bmp`).
 ///
 /// # Safety
@@ -1051,7 +1060,7 @@ mod tests {
         let path = CString::new("").expect("empty string is valid");
         // SAFETY: `path` is a valid, empty C string.
         let status = unsafe { uda_set_wallpaper(path.as_ptr(), UDA_FILL_FILL) };
-        assert!(status < 0, "an empty path must fail, got {status}");
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
     }
 
     #[test]

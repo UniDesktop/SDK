@@ -15,7 +15,7 @@
 //! - [`session_capabilities`], a side-effect-free query returning a bitmask, so
 //!   a UI can be built *before* the user asks for anything; and
 //! - the six action functions, each of which performs an irreversible operation
-//!   the moment it returns [`UDA_OK`](crate::error::UDA_OK).
+//!   the moment it returns [`UDA_OK`](crate::abi::UDA_OK).
 //!
 //! Only [`uda_session_lock`] is safe to automate. Everything else must be gated
 //! behind a confirmation in the host application - the same rule the demo under

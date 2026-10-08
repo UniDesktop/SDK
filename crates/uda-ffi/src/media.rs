@@ -13,7 +13,7 @@
 //! returning the code, so the return value stays free to report *hard* failures
 //! (status `-2` when the platform has no media backend at all). A "no player is
 //! running" is **not** a failure: it is reported as `UDA_MEDIA_UNKNOWN` (3) with
-//! status [`UDA_OK`](crate::error::UDA_OK). A caller must therefore treat code 3
+//! status [`UDA_OK`](crate::abi::UDA_OK). A caller must therefore treat code 3
 //! as "nothing playing", never as a paused track.
 //!
 //! # Ownership
@@ -24,7 +24,7 @@
 //! for a player that publishes only a title.
 //!
 //! A refused command (an app that disables `Next`, for example) returns
-//! [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) so a caller can
+//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED) so a caller can
 //! tell "there was nobody to command" from "the player declined it".
 
 use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
