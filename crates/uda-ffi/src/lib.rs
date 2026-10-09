@@ -285,8 +285,12 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 /// A set bit means a receiver for the action was reachable when the
 /// capabilities were queried; the attempt can still fail (hibernation
 /// switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
-/// Windows reboot and shutdown can likewise fail at attempt time when the
-/// caller lacks the SeShutdownPrivilege.
+/// On Linux the session-management bits additionally require a live seat
+/// session: the logind daemon runs on every systemd host, but lock-session
+/// and logout speak to the per-session objects that only exist once a real
+/// seat session is established, so a manager without sessions answers with
+/// the power bits alone. Windows reboot and shutdown can likewise fail at
+/// attempt time when the caller lacks the SeShutdownPrivilege.
 ///
 /// # Safety
 ///
@@ -1011,7 +1015,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Map a C fill-mode code onto the cross-platform [`FillMode`].
+/// Map a C fill-mode code onto the cross-platform [`FillMode`](uda_core::wallpaper::FillMode).
 fn fill_mode_from_c(code: c_int) -> Result<uda_core::wallpaper::FillMode, error::Failure> {
     use uda_core::wallpaper::FillMode;
     let fill_mode = match code {
@@ -1028,7 +1032,7 @@ fn fill_mode_from_c(code: c_int) -> Result<uda_core::wallpaper::FillMode, error:
     Ok(fill_mode)
 }
 
-/// Map a C wake-lock code onto the cross-platform [`WakeLockType`].
+/// Map a C wake-lock code onto the cross-platform [`WakeLockType`](uda_core::wakelock::WakeLockType).
 fn wake_lock_type_from_c(code: c_int) -> Result<uda_core::wakelock::WakeLockType, error::Failure> {
     use uda_core::wakelock::WakeLockType;
     let lock_type = match code {

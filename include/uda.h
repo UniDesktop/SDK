@@ -422,9 +422,13 @@ int32_t uda_media_send_command(int32_t command);
  *
  * A set bit means a receiver for the action was reachable when the
  * capabilities were queried; the attempt can still fail (hibernation switched
- * off, polkit refusal) and then fails with UDA_ERR_NOT_SUPPORTED. Windows
- * reboot and shutdown can likewise fail at attempt time when the caller lacks
- * the SeShutdownPrivilege.
+ * off, polkit refusal) and then fails with UDA_ERR_NOT_SUPPORTED. On Linux
+ * the session-management bits additionally require a live seat session: the
+ * logind daemon runs on every systemd host, but lock-session and logout speak
+ * to the per-session objects that only exist once a real seat session is
+ * established, so a manager without sessions answers with the power bits
+ * alone. Windows reboot and shutdown can likewise fail at attempt time when
+ * the caller lacks the SeShutdownPrivilege.
  *
  * @param out_capabilities  Receives the bitmask. Must not be null.
  * @return UDA_OK on success, otherwise a negative status code.

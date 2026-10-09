@@ -9,7 +9,7 @@
 //!
 //! # Why an out-code instead of an out-pointer for the status
 //!
-//! [`uda_media_get_status`] writes into a caller-supplied `int32_t` rather than
+//! `uda_media_get_status` writes into a caller-supplied `int32_t` rather than
 //! returning the code, so the return value stays free to report *hard* failures
 //! (status `-2` when the platform has no media backend at all). A "no player is
 //! running" is **not** a failure: it is reported as `UDA_MEDIA_UNKNOWN` (3) with
@@ -18,7 +18,7 @@
 //!
 //! # Ownership
 //!
-//! The three strings written by [`uda_media_get_metadata`] are allocated by Rust
+//! The three strings written by `uda_media_get_metadata` are allocated by Rust
 //! and must be released with [`uda_free_string`](crate::uda_free_string); they
 //! may be null when the corresponding field is empty, which is the normal case
 //! for a player that publishes only a title.

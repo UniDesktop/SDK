@@ -664,7 +664,7 @@ fn menus_are_the_same(
 }
 
 /// The state the D-Bus worker serves, copied out of the host's
-/// [`TrayIconInner`] on every mutation and answered from this mirror.
+/// `TrayIconInner` on every mutation and answered from this mirror.
 struct TrayShared {
     /// Application name; also the dbusmenu `Id`.
     name: String,

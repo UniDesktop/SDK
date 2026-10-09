@@ -23,9 +23,10 @@
 //!   not an error: the lock was already gone. The tier is also refused
 //!   outright when `org.freedesktop.login1` is not on the system bus:
 //!   `systemd-inhibit` does not hold a lock by itself - systemd-logind does -
-//!   so with no logind (a WSL host, for one) nothing would receive the
-//!   inhibit, the screen would still sleep, and returning success would hand
-//!   the caller a lock that is pure fiction.
+//!   so on a host with no logind on the system bus (a container or
+//!   `dbus-run-session` sandbox, or WSL with systemd disabled) nothing would
+//!   receive the inhibit, the screen would still sleep, and returning success
+//!   would hand the caller a lock that is pure fiction.
 //!
 //! # Lazy reaping
 //!
@@ -209,9 +210,10 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
 ///
 /// `systemd-inhibit --mode=block` does not hold a lock by itself: it asks
 /// systemd-logind (`org.freedesktop.login1` on the system bus) to take one.
-/// On a system without logind - the maintainer's WSL was the reported case -
-/// no component receives it, the screen still sleeps, and a success return
-/// from [`acquire_cli`] would be a lie the host cannot detect. The probe runs
+/// On a system whose system bus has no logind - WSL with systemd disabled was
+/// the reported case - no component receives it, the screen still sleeps, and
+/// a success return from [`acquire_cli`] would be a lie the host cannot
+/// detect. The probe runs
 /// through the FFI's shared blocking bridge [`crate::notify::run_sync`], which
 /// is safe with and without an ambient tokio runtime; the platform side owns
 /// the bus work and its `DBUS_TIMEOUT` bounds.
@@ -456,9 +458,9 @@ mod tests {
         let _guard = registry_guard();
         // On a host with a ScreenSaver service this exercises the native tier;
         // on one without but with systemd-logind it exercises the CLI tier -
-        // whose acquire now refuses when logind is absent, the WSL shape. A
-        // host with neither tier legitimately refuses (the `None` early
-        // return), and the synthetic-entry tests below still cover the
+        // whose acquire now refuses when logind is absent (a host with systemd
+        // disabled). A host with neither tier legitimately refuses (the `None`
+        // early return), and the synthetic-entry tests below still cover the
         // registry mechanics there.
         let Some(handle) = acquire_any_tier("uda-ffi test") else {
             return;

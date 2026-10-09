@@ -42,11 +42,13 @@
 //! # Capabilities are probed, not assumed
 //!
 //! [`LinuxSessionManager::capabilities`] asks the buses which receivers are
-//! actually there before advertising anything: the full set only when
-//! `org.freedesktop.login1` answers on the system bus, `LOCK` alone when only
-//! `org.freedesktop.ScreenSaver` answers on the session bus, and nothing when
-//! neither does (a WSL host exports neither). The probe runs once per process
-//! and is cached, the same trade the wake-lock backend makes.
+//! actually there before advertising anything: the full set when logind
+//! answers on the system bus *and* reports a live seat session, the power
+//! actions alone when logind runs without any session object (the
+//! systemd-enabled WSL2 shape), `LOCK` alone when only the session bus's
+//! ScreenSaver answers, and nothing when neither bus answers (a
+//! `dbus-run-session` sandbox). The probe runs once per process and is
+//! cached, the same trade the wake-lock backend makes.
 //!
 //! Whatever the probe said, an action that is attempted and then not delivered
 //! (logind refusing or timing out, `loginctl` exiting nonzero) reports
@@ -506,23 +508,63 @@ fn not_delivered(detail: impl std::fmt::Display) -> UdaError {
 
 /// Which session receivers are reachable, probed once per process.
 ///
-/// Returns `(logind, screen_saver)`, cached in a process-wide [`OnceLock`]:
-/// receivers are not installed mid-session, while `capabilities()` sits on the
-/// hot path (the core `perform` guard consults it before *every* action), so
-/// one bounded probe pair per process beats a bus round trip per query. A
-/// receiver that appears later is only noticed after a restart, which errs in
-/// the honest direction: something unadvertised stays unavailable, never the
-/// reverse. A probe failure caches as "absent"; see [`probe_reachable`].
-fn session_reachability() -> (bool, bool) {
-    static REACHABLE: OnceLock<(bool, bool)> = OnceLock::new();
+/// Returns `(logind, logind_session, screen_saver)`, cached in a
+/// process-wide [`OnceLock`]: receivers are not installed mid-session, while
+/// `capabilities()` sits on the hot path (the core `perform` guard consults
+/// it before *every* action), so one bounded probe triple per process beats a
+/// bus round trip per query. A receiver that appears later is only noticed
+/// after a restart, which errs in the honest direction: something
+/// unadvertised stays unavailable, never the reverse. A probe failure caches
+/// as "absent"; see [`probe_reachable`].
+fn session_reachability() -> (bool, bool, bool) {
+    static REACHABLE: OnceLock<(bool, bool, bool)> = OnceLock::new();
     *REACHABLE.get_or_init(|| {
         let logind = probe_reachable(crate::sync::run_async(logind_present()), "logind");
+        let logind_session = if logind {
+            // Only worth asking while the manager owns the name; without it
+            // the session probe cannot succeed, so skip the round trip.
+            probe_reachable(
+                crate::sync::run_async(logind_session_present()),
+                "logind sessions",
+            )
+        } else {
+            false
+        };
         let screen_saver = probe_reachable(
             crate::sync::run_async(screensaver_present()),
             "screen saver",
         );
-        (logind, screen_saver)
+        (logind, logind_session, screen_saver)
     })
+}
+
+/// Does logind currently have a live seat session to act on?
+///
+/// Owning `org.freedesktop.login1` on the system bus only proves the daemon
+/// runs: systemd starts it on every booted host, including a systemd-enabled
+/// WSL2 install where no seat session is ever established. The
+/// session-management actions speak to `/org/freedesktop/login1/session/auto`
+/// and its siblings, objects that only exist once a real seat session exists,
+/// so this probe asks the manager to list its sessions and insists on at
+/// least one. Same collapse as the reachability probes: bounded by
+/// [`DBUS_TIMEOUT`], and any error means "not proven present".
+async fn logind_session_present() -> Result<bool, UdaError> {
+    let connection = LinuxSessionManager::system_connection().await?;
+    let proxy = zbus::Proxy::new(&connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE)
+        .await
+        .map_err(|e| not_delivered(format!("the logind manager proxy: {e}")))?;
+    let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
+        match tokio::time::timeout(DBUS_TIMEOUT, proxy.call("ListSessions", &())).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(e)) => return Err(not_delivered(format!("ListSessions failed: {e}"))),
+            Err(_) => {
+                return Err(not_delivered(format!(
+                    "ListSessions timed out after {:?}",
+                    DBUS_TIMEOUT
+                )))
+            }
+        };
+    Ok(!sessions.is_empty())
 }
 
 /// Collapse a bridged probe into a plain bool.
@@ -544,23 +586,29 @@ fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &s
 
 /// Turn probe answers into the honest capability set.
 ///
-/// Pure so the whole matrix is testable without a bus. With logind reachable,
-/// the full set is honest: logind receives every power and session-management
-/// action, and its presence is also what the `loginctl` CLI tier needs, so
-/// `LOCK` is covered twice. With only the screen saver answering, `LOCK` alone
-/// is claimable: no receiver exists for the power actions, and the desktop
-/// logout managers are tried opportunistically rather than probed, so `LOGOUT`
-/// stays unadvertised. With neither reachable - the WSL case - nothing is
-/// claimed.
-fn session_capability_set(logind: bool, screen_saver: bool) -> Capability {
-    if logind {
+/// Pure so the whole matrix is testable without a bus. With a live logind
+/// seat session, the full set is honest: the manager receives every power
+/// action, the session objects receive the session-management ones, and the
+/// `loginctl` CLI tier has a session to talk about, so `LOCK` is covered
+/// twice. With logind reachable but no session object (the systemd-enabled
+/// WSL2 shape, where the daemon runs but no seat session is ever
+/// established), only the power actions have a receiver, so only they are
+/// claimed. With only the screen saver answering, `LOCK` alone is claimable:
+/// no receiver exists for the power actions, and the desktop logout managers
+/// are tried opportunistically rather than probed, so `LOGOUT` stays
+/// unadvertised. With neither bus answering (a `dbus-run-session` sandbox),
+/// nothing is claimed.
+fn session_capability_set(logind: bool, logind_session: bool, screen_saver: bool) -> Capability {
+    let power_actions =
+        Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
+    if logind_session {
         return Capability::SESSION_MANAGEMENT
             | Capability::LOCK
             | Capability::LOGOUT
-            | Capability::SUSPEND
-            | Capability::HIBERNATE
-            | Capability::REBOOT
-            | Capability::SHUTDOWN;
+            | power_actions;
+    }
+    if logind {
+        return power_actions;
     }
     if screen_saver {
         return Capability::LOCK;
@@ -604,11 +652,13 @@ impl SessionManager for LinuxSessionManager {
     }
 
     fn capabilities(&self) -> Capability {
-        // Probed, not hardcoded: a WSL host exports neither receiver. Whether
-        // logind *authorises* the caller remains a runtime question for the
-        // methods above, not a capability question.
-        let (logind, screen_saver) = session_reachability();
-        session_capability_set(logind, screen_saver)
+        // Probed, not hardcoded: a sandbox without a system manager answers
+        // with nothing, and a manager without a seat session (systemd-enabled
+        // WSL2) answers with the power actions alone. Whether logind
+        // *authorises* the caller remains a runtime question for the methods
+        // above, not a capability question.
+        let (logind, logind_session, screen_saver) = session_reachability();
+        session_capability_set(logind, logind_session, screen_saver)
     }
 }
 
@@ -825,16 +875,16 @@ mod tests {
     }
 
     #[test]
-    fn logind_reachability_advertises_the_full_set() {
-        // Logind receives every power and session-management action, and its
-        // presence is what the loginctl CLI tier needs, so both quadrants with
-        // logind reachable claim all seven bits.
-        for (logind, screen_saver) in [(true, true), (true, false)] {
-            let capabilities = session_capability_set(logind, screen_saver);
+    fn a_live_logind_session_advertises_the_full_set() {
+        // Logind receives every power action, and with a live seat session
+        // the session objects receive the session-management ones, so both
+        // quadrants with a live session claim all seven bits.
+        for screen_saver in [true, false] {
+            let capabilities = session_capability_set(true, true, screen_saver);
 
             assert!(
                 capabilities.contains(Capability::SESSION_MANAGEMENT),
-                "logind reachable (screen saver: {screen_saver}) must claim \
+                "a live logind session (screen saver: {screen_saver}) must claim \
                  SESSION_MANAGEMENT"
             );
             for action in [
@@ -847,10 +897,43 @@ mod tests {
             ] {
                 assert!(
                     capabilities.contains(action.capability()),
-                    "{action:?} is not advertised behind logind (screen saver: \
-                     {screen_saver})"
+                    "{action:?} is not advertised behind a live logind session (screen \
+                     saver: {screen_saver})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn logind_without_a_session_advertises_the_power_actions_alone() {
+        // Owning the bus name only proves the daemon runs: a systemd-enabled
+        // WSL2 install never establishes a seat session, so the
+        // `/org/freedesktop/login1/session/auto` object `lock-session` and
+        // `TerminateSession` speak to does not exist and the session
+        // bits stay unadvertised. The manager-level power actions keep their
+        // receiver.
+        let capabilities = session_capability_set(true, false, false);
+
+        for action in [
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                capabilities.contains(action.capability()),
+                "{action:?} is manager-level and must stay advertised without a session"
+            );
+        }
+        assert!(
+            !capabilities.contains(Capability::SESSION_MANAGEMENT),
+            "no session object exists to manage"
+        );
+        for action in [SessionAction::Lock, SessionAction::Logout] {
+            assert!(
+                !capabilities.contains(action.capability()),
+                "{action:?} needs a seat session and must not be advertised"
+            );
         }
     }
 
@@ -860,7 +943,7 @@ mod tests {
         // loginctl CLI tier is gone with it; the desktop logout managers are
         // tried opportunistically, never probed. Only the screen-saver lock is
         // honestly claimable.
-        let capabilities = session_capability_set(false, true);
+        let capabilities = session_capability_set(false, false, true);
 
         assert_eq!(capabilities, Capability::LOCK);
         for action in [
@@ -879,9 +962,10 @@ mod tests {
 
     #[test]
     fn without_any_receiver_nothing_is_advertised() {
-        // The WSL case: no logind, no screen saver, so the answer is the empty
-        // set rather than a full house nothing can deliver.
-        assert!(session_capability_set(false, false).is_empty());
+        // No system manager, no screen saver - a `dbus-run-session` sandbox or
+        // a container - so the answer is the empty set rather than a full
+        // house nothing can deliver.
+        assert!(session_capability_set(false, false, false).is_empty());
     }
 
     #[test]

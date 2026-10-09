@@ -78,9 +78,13 @@ impl LinuxWakeLockManager {
 /// The CLI wake-lock tier spawns `systemd-inhibit`, whose lock only exists
 /// because logind receives it: with no logind on the system bus nothing
 /// answers the inhibit, the screen still sleeps, and reporting success would
-/// hand the host a lock that is pure fiction (observed on WSL, which exports
-/// no logind). Every step is bounded by `crate::DBUS_TIMEOUT` and mapped per
-/// the crate's D-Bus error style; any error means "not proven present", and
+/// hand the host a lock that is pure fiction (any host without a system
+/// manager qualifies - a container or a `dbus-run-session` sandbox, or WSL
+/// with systemd disabled). The granularity is deliberately manager-level:
+/// `Inhibit` needs the daemon, not a seat session, so a systemd-enabled WSL2
+/// (which runs logind but never establishes a seat session) answers honestly
+/// here. Every step is bounded by `crate::DBUS_TIMEOUT` and mapped per the
+/// crate's D-Bus error style; any error means "not proven present", and
 /// callers must refuse the CLI tier rather than spawn a lock nobody honours.
 pub async fn logind_present() -> Result<bool, UdaError> {
     let connection = internal_dbus("connecting to the system bus", Connection::system()).await?;

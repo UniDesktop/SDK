@@ -138,7 +138,7 @@ pub(crate) unsafe fn free_c_string(pointer: *mut c_char) {
 ///
 /// The closure returns a `Result<(), Failure>`; a `panic!` inside it is caught
 /// and reported as
-/// [`UDA_ERR_PANIC`](crate::error::UDA_ERR_PANIC) so it can never unwind into
+/// [`UDA_ERR_PANIC`] so it can never unwind into
 /// foreign frames, where unwinding across an `extern "C"` boundary is undefined
 /// behaviour.
 pub(crate) fn catch_boundary<F>(body: F) -> UdaStatus

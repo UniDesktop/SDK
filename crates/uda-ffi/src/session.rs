@@ -12,18 +12,18 @@
 //! Five of the six actions end the user's session or stop the machine. This
 //! module therefore exposes:
 //!
-//! - [`session_capabilities`], a side-effect-free query returning a bitmask, so
+//! - `session_capabilities`, a side-effect-free query returning a bitmask, so
 //!   a UI can be built *before* the user asks for anything; and
 //! - the six action functions, each of which performs an irreversible operation
 //!   the moment it returns [`UDA_OK`](crate::error::UDA_OK).
 //!
-//! Only [`uda_session_lock`] is safe to automate. Everything else must be gated
+//! Only `uda_session_lock` is safe to automate. Everything else must be gated
 //! behind a confirmation in the host application - the same rule the demo under
 //! `examples/` follows.
 //!
 //! # Capability bitmask
 //!
-//! [`session_capabilities`] reports the flags the platform's backend
+//! `session_capabilities` reports the flags the platform's backend
 //! advertises. `0` means "no session backend exists here", which is also what a
 //! non-Linux, non-Windows target answers.
 
@@ -49,7 +49,7 @@ pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1 << 22;
 
 /// The actions the current platform's backend can deliver, as a bitmask.
 ///
-/// The bitmask is made of the [`UDA_SESSION_CAP_*`] constants and never
+/// The bitmask is made of the `UDA_SESSION_CAP_*` constants and never
 /// includes an action the backend cannot perform, so a caller can test
 /// "is shutdown offered?" before drawing a button for it.
 pub(crate) fn capabilities() -> Capability {
@@ -321,15 +321,21 @@ mod tests {
             // APIs, so the full matrix is unconditional there.
             assert_eq!(capabilities, full_set);
         } else if cfg!(target_os = "linux") {
-            // The Linux answer is probed, not hardcoded: logind reachable ->
-            // the full set, screen saver alone -> LOCK (its receiver lives on
-            // the session bus, no logind involved), neither -> empty (the WSL
-            // case). Anything else means the probe and the matrix disagree.
+            // The Linux answer is probed, not hardcoded: a live logind seat
+            // session -> the full set, logind without any session object
+            // (systemd-enabled WSL2) -> the power actions alone, screen saver
+            // alone -> LOCK, neither bus -> empty. Anything else means the
+            // probe and the matrix disagree.
+            let power_actions = Capability::SUSPEND
+                | Capability::HIBERNATE
+                | Capability::REBOOT
+                | Capability::SHUTDOWN;
             assert!(
                 capabilities == full_set
+                    || capabilities == power_actions
                     || capabilities == Capability::LOCK
                     || capabilities.is_empty(),
-                "Linux must answer one of the three probe states, got {capabilities:?}"
+                "Linux must answer one of the four probe states, got {capabilities:?}"
             );
         } else {
             // No backend on an exotic target: "nothing at all".
