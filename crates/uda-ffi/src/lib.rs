@@ -285,12 +285,12 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 /// A set bit means a receiver for the action was reachable when the
 /// capabilities were queried; the attempt can still fail (hibernation
 /// switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
-/// On Linux the session-management bits additionally require a live seat
-/// session: the logind daemon runs on every systemd host, but lock-session
-/// and logout speak to the per-session objects that only exist once a real
-/// seat session is established, so a manager without sessions answers with
-/// the power bits alone. Windows reboot and shutdown can likewise fail at
-/// attempt time when the caller lacks the SeShutdownPrivilege.
+/// On Linux the session-management bits additionally require the *calling*
+/// session to be resolvable: lock-session and logout speak to the caller's
+/// own logind session object, so a daemon that runs sessionless (or can only
+/// see other users' sessions, as on a systemd-enabled WSL2 host) answers
+/// with the power bits alone. Windows reboot and shutdown can likewise fail
+/// at attempt time when the caller lacks the SeShutdownPrivilege.
 ///
 /// # Safety
 ///

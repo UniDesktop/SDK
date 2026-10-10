@@ -912,7 +912,7 @@ checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
 name = "uda-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "tokio",
  "uda-core",
@@ -921,7 +921,7 @@ dependencies = [
 
 [[package]]
 name = "uda-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -932,7 +932,7 @@ dependencies = [
 
 [[package]]
 name = "uda-ffi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "log",
  "tokio",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "uda-platform-linux"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "log",
@@ -956,7 +956,7 @@ dependencies = [
 
 [[package]]
 name = "uda-platform-windows"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "async-trait",
  "log",

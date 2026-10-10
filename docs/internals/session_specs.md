@@ -215,13 +215,17 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
   `UdaError::NotSupported`。这与 Linux 的 polkit、Windows 的 1314 完全对称。
 - Linux 后端按运行时探测上报（结果按进程缓存一次，探测失败按不可达处理）。
   探测分两层：`org.freedesktop.login1` 在系统总线上可达（manager 级），以及
-  logind `ListSessions()` 非空（会话对象级——systemd 一启动 logind 就 own 该
-  名字，但 `session/auto` 对象只在真实 seat 会话建立后才存在，启用了
-  systemd 的 WSL2 恰好落在这一夹缝）。据此渲染矩阵：有活跃会话 → 全部七位；
-  logind 可达但无会话 → 仅四个电源位（SUSPEND/HIBERNATE/REBOOT/SHUTDOWN，
-  它们是 manager 级动作，不依赖 seat 会话）；仅 `org.freedesktop.ScreenSaver`
-  可达 → 只有 `Capability::LOCK`；两条总线皆不可达（如容器、
-  `dbus-run-session` 沙箱）→ 空集。
+  **调用者会话可解析**（会话对象级——`lock-session` 与 `TerminateSession("")`
+  都解析调用者自己的会话，即 logind 的特殊 `session/auto` 对象）。"名字被
+  own" 只证明 daemon 在跑（systemd 一启动 logind 就 own 该名字），
+  `ListSessions` 非空也只证明机器上存在会话对象（启用了 systemd 的 WSL2 会为
+  SSH/PTY 建立会话，却仍解析不出调用者的 seat 会话）——所以探测先列会话、再
+  调 `GetSession("auto")` 做对象级校验，二者皆过才算"调用者有会话"。据此渲染
+  矩阵：调用者会话可解析 → 全部七位；logind 可达但调用者无会话 → 仅四个电源
+  位（SUSPEND/HIBERNATE/REBOOT/SHUTDOWN，manager 级动作，不依赖会话），若此
+  时 ScreenSaver 也可达则再加 LOCK（lock 的 Tier-2 就是它）；仅
+  `org.freedesktop.ScreenSaver` 可达 → 只有 `Capability::LOCK`；两条总线皆
+  不可达（如容器、`dbus-run-session` 沙箱）→ 空集。
 - Windows 后端仍无条件上报全部七位：Win10/11 都有这四个 API，接收方恒可达；
   权限是运行时问题（1300/1314），不是能力问题。
 - 非 Linux / 非 Windows 目标：`capabilities()` 返回空集，六个动作一律

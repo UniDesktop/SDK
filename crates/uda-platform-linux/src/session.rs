@@ -43,10 +43,11 @@
 //!
 //! [`LinuxSessionManager::capabilities`] asks the buses which receivers are
 //! actually there before advertising anything: the full set when logind
-//! answers on the system bus *and* reports a live seat session, the power
-//! actions alone when logind runs without any session object (the
-//! systemd-enabled WSL2 shape), `LOCK` alone when only the session bus's
-//! ScreenSaver answers, and nothing when neither bus answers (a
+//! answers on the system bus *and* can resolve the calling session (the
+//! `session/auto` object `loginctl lock-session` speaks to), the power
+//! actions alone when the daemon runs without a caller-attributable session
+//! (the systemd-enabled WSL2 shape), `LOCK` alone when only the session
+//! bus's ScreenSaver answers, and nothing when neither bus answers (a
 //! `dbus-run-session` sandbox). The probe runs once per process and is
 //! cached, the same trade the wake-lock backend makes.
 //!
@@ -538,16 +539,20 @@ fn session_reachability() -> (bool, bool, bool) {
     })
 }
 
-/// Does logind currently have a live seat session to act on?
+/// Does logind have a session the *caller* can act on?
 ///
 /// Owning `org.freedesktop.login1` on the system bus only proves the daemon
-/// runs: systemd starts it on every booted host, including a systemd-enabled
-/// WSL2 install where no seat session is ever established. The
-/// session-management actions speak to `/org/freedesktop/login1/session/auto`
-/// and its siblings, objects that only exist once a real seat session exists,
-/// so this probe asks the manager to list its sessions and insists on at
-/// least one. Same collapse as the reachability probes: bounded by
-/// [`DBUS_TIMEOUT`], and any error means "not proven present".
+/// runs, and a non-empty `ListSessions` only proves session objects exist
+/// somewhere on the machine: systemd-enabled WSL2 keeps a PTY/SSH session in
+/// the list while `loginctl lock-session` still fails, because both it and
+/// `TerminateSession("")` resolve the **calling** session - the special
+/// `session/auto` object, which logind only materialises when the caller can
+/// be attributed to a session. So the probe lists first (management is
+/// meaningless with no session anywhere), then asks the manager to resolve
+/// `auto`, the exact object the actions target. Any resolution error means
+/// the caller has no session, which is a `false` verdict rather than a probe
+/// failure; everything upstream (bus, timeouts) still folds to "absent" via
+/// [`probe_reachable`]. Bounded by [`DBUS_TIMEOUT`] throughout.
 async fn logind_session_present() -> Result<bool, UdaError> {
     let connection = LinuxSessionManager::system_connection().await?;
     let proxy = zbus::Proxy::new(&connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE)
@@ -564,7 +569,28 @@ async fn logind_session_present() -> Result<bool, UdaError> {
                 )))
             }
         };
-    Ok(!sessions.is_empty())
+    if sessions.is_empty() {
+        return Ok(false);
+    }
+    // `GetSession("auto")` is the object-level check: it resolves the calling
+    // session or answers NoSuchSession. A resolution failure is the probe's
+    // honest "no session for this caller" answer, not an error.
+    match tokio::time::timeout(
+        DBUS_TIMEOUT,
+        proxy.call::<_, (&str,), zbus::zvariant::OwnedObjectPath>("GetSession", &("auto",)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(error)) => {
+            log::debug!("logind cannot resolve the calling session (auto): {error}");
+            Ok(false)
+        }
+        Err(_) => Err(not_delivered(format!(
+            "GetSession timed out after {:?}",
+            DBUS_TIMEOUT
+        ))),
+    }
 }
 
 /// Collapse a bridged probe into a plain bool.
@@ -586,34 +612,32 @@ fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &s
 
 /// Turn probe answers into the honest capability set.
 ///
-/// Pure so the whole matrix is testable without a bus. With a live logind
-/// seat session, the full set is honest: the manager receives every power
-/// action, the session objects receive the session-management ones, and the
-/// `loginctl` CLI tier has a session to talk about, so `LOCK` is covered
-/// twice. With logind reachable but no session object (the systemd-enabled
-/// WSL2 shape, where the daemon runs but no seat session is ever
-/// established), only the power actions have a receiver, so only they are
-/// claimed. With only the screen saver answering, `LOCK` alone is claimable:
-/// no receiver exists for the power actions, and the desktop logout managers
-/// are tried opportunistically rather than probed, so `LOGOUT` stays
-/// unadvertised. With neither bus answering (a `dbus-run-session` sandbox),
-/// nothing is claimed.
+/// Pure so the whole matrix is testable without a bus. The bits compose
+/// independently, mirroring which receiver each action actually speaks to:
+/// the power actions go straight to the manager, so any reachable logind
+/// claims them; the session-management actions resolve the **calling**
+/// session (`TerminateSession("")`, the `session/auto` object behind
+/// `loginctl lock-session`), so they need the caller-session probe, not just
+/// the daemon; and `LOCK` has two receivers - the screen saver on the
+/// session bus and the caller-session logind path - so either one claims it.
+/// With neither receiver answering (a `dbus-run-session` sandbox), nothing
+/// is claimed. The desktop logout managers are tried opportunistically
+/// rather than probed, so `LOGOUT` never rides on them.
 fn session_capability_set(logind: bool, logind_session: bool, screen_saver: bool) -> Capability {
-    let power_actions =
-        Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
-    if logind_session {
-        return Capability::SESSION_MANAGEMENT
-            | Capability::LOCK
-            | Capability::LOGOUT
-            | power_actions;
-    }
+    let mut capabilities = Capability::empty();
+
     if logind {
-        return power_actions;
+        capabilities |=
+            Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
     }
-    if screen_saver {
-        return Capability::LOCK;
+    if logind_session {
+        capabilities |= Capability::SESSION_MANAGEMENT | Capability::LOGOUT;
     }
-    Capability::empty()
+    if logind_session || screen_saver {
+        capabilities |= Capability::LOCK;
+    }
+
+    capabilities
 }
 
 impl SessionManager for LinuxSessionManager {
@@ -905,13 +929,12 @@ mod tests {
     }
 
     #[test]
-    fn logind_without_a_session_advertises_the_power_actions_alone() {
+    fn logind_without_a_caller_session_advertises_the_power_actions_alone() {
         // Owning the bus name only proves the daemon runs: a systemd-enabled
-        // WSL2 install never establishes a seat session, so the
-        // `/org/freedesktop/login1/session/auto` object `lock-session` and
-        // `TerminateSession` speak to does not exist and the session
-        // bits stay unadvertised. The manager-level power actions keep their
-        // receiver.
+        // WSL2 install keeps a PTY/SSH session in the list while neither
+        // `loginctl lock-session` nor `TerminateSession("")` can resolve the
+        // calling session, so the session bits stay unadvertised. The
+        // manager-level power actions keep their receiver.
         let capabilities = session_capability_set(true, false, false);
 
         for action in [
@@ -927,14 +950,38 @@ mod tests {
         }
         assert!(
             !capabilities.contains(Capability::SESSION_MANAGEMENT),
-            "no session object exists to manage"
+            "no calling session exists to manage"
         );
         for action in [SessionAction::Lock, SessionAction::Logout] {
             assert!(
                 !capabilities.contains(action.capability()),
-                "{action:?} needs a seat session and must not be advertised"
+                "{action:?} resolves the calling session and must not be advertised"
             );
         }
+    }
+
+    #[test]
+    fn logind_without_a_caller_session_still_honours_a_screen_saver_lock() {
+        // The bits compose: `lock()` tries the screen saver before any
+        // `loginctl` call, so a reachable screen saver claims LOCK even when
+        // logind has no session for the caller.
+        let capabilities = session_capability_set(true, false, true);
+
+        for action in [
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+            SessionAction::Lock,
+        ] {
+            assert!(
+                capabilities.contains(action.capability()),
+                "{action:?} has a receiver (manager or screen saver) and must be \
+                 advertised"
+            );
+        }
+        assert!(!capabilities.contains(Capability::SESSION_MANAGEMENT));
+        assert!(!capabilities.contains(Capability::LOGOUT));
     }
 
     #[test]

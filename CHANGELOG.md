@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 > 完整文档见 [unidesktop.github.io](https://unidesktop.github.io/)。
 > Full documentation lives at [unidesktop.github.io](https://unidesktop.github.io/).
 
-## [Unreleased] - Cross-Review Hardening · 未发布
+## [v0.2.2] - Cross-Review Hardening · 2026-10-10
 
 > 对应 PR：交叉审查清单（issue #4，50 项）中 v0.2.1 未覆盖的 48 项全部在本节落地。
 > Corresponds to the cross-review checklist (issue #4): the 48 findings not already
@@ -53,8 +53,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - 🧰 **Build gate and media contract**: `cargo check --workspace` failed outright on non-Linux/Windows targets such as macOS (incomplete cfg fallbacks); and a player explicitly refusing a media command reported `-5` instead of the `-2` promised by `uda.h`.
 - 🧰 **无头环境的诚实答案（第二轮复审）**：主题检测不再把从未设置过的 `gtk-theme` schema 默认值（如 WSL 的 'Adwaita'）当成浅色答案——`-dark` 后缀才判深色，浅色需要 `dconf read` 证明显式设置，否则落到 `Theme::Unknown`；wakelock 的 Tier-3 `systemd-inhibit` 兜底在系统总线无 `org.freedesktop.login1` 时诚实地返回 `NotSupported`（锁无人受理就不再假装成功），wakelock 的能力位与 `support_level` 改由 logind / ScreenSaver 实际可达性驱动，可达性受限时报 `Partial(reason)`。
 - 🧰 **Honest answers on headless environments (second review round)**: theme detection no longer treats a never-configured `gtk-theme` schema default (WSL's 'Adwaita') as a light-theme answer - only a `-dark` suffix answers Dark, a Light answer requires `dconf read` to prove the key was explicitly set, and everything else falls to `Theme::Unknown`; the wakelock Tier-3 `systemd-inhibit` fallback now fails with `NotSupported` when `org.freedesktop.login1` is absent from the system bus (an unlockable lock is no longer reported as success), and the wake-lock capability bits plus `support_level` are driven by real logind / ScreenSaver reachability, reporting `Partial(reason)` when only a degraded tier is reachable.
-- 🧰 **会话能力改为运行时探测**：`LinuxSessionManager::capabilities` 不再硬编码 7 个能力位——现在按 `org.freedesktop.login1`（系统总线）与 `org.freedesktop.ScreenSaver`（会话总线）的实际可达性渲染矩阵（logind 有活跃 seat 会话 → 全集；logind 可达但 `ListSessions()` 为空——systemd 已启用的 WSL2 形态——→ 仅四个电源位；仅 ScreenSaver → 仅 LOCK；两者皆无 → 空集），探测结果进程级缓存；`include/uda.h` 的能力位语义说明同步改写。
-- 🧰 **Session capabilities are probed at runtime**: `LinuxSessionManager::capabilities` no longer hardcodes the seven capability bits - the matrix is rendered from the actual reachability of `org.freedesktop.login1` (system bus) and `org.freedesktop.ScreenSaver` (session bus) (a live logind seat session → full set; logind reachable but `ListSessions()` empty - the systemd-enabled WSL2 shape - → power actions alone; ScreenSaver only → LOCK only; neither → empty), with the probe cached per process; the capability-bit wording in `include/uda.h` was rewritten to match.
+- 🧰 **会话能力改为运行时探测**：`LinuxSessionManager::capabilities` 不再硬编码 7 个能力位——现在按 `org.freedesktop.login1`（系统总线）与 `org.freedesktop.ScreenSaver`（会话总线）的实际可达性渲染矩阵：探测分两层，manager 可达给电源位，**调用者会话可解析**（`ListSessions` 非空 + `GetSession("auto")` 对象级校验，即 `lock-session`/`TerminateSession("")` 实际解析的那个对象）才给会话管理位；systemd 已启用的 WSL2 有 daemon 和 PTY 会话但解析不出调用者会话，因此只报电源位；ScreenSaver 可达时 LOCK 独立置位（lock 的 Tier-2）。探测结果进程级缓存；`include/uda.h` 的能力位语义说明同步改写。
+- 🧰 **Session capabilities are probed at runtime**: `LinuxSessionManager::capabilities` no longer hardcodes the seven capability bits - the matrix is rendered from the actual reachability of `org.freedesktop.login1` (system bus) and `org.freedesktop.ScreenSaver` (session bus): a reachable manager claims the power actions, and the session-management bits additionally require the **calling** session to be resolvable (`ListSessions` non-empty plus an object-level `GetSession("auto")` check - the exact object `lock-session` / `TerminateSession("")` resolve); a systemd-enabled WSL2 host runs the daemon with a PTY session in the list yet cannot resolve the caller's session, so it answers with the power bits alone; LOCK is claimed independently whenever the screen saver is reachable (lock's Tier 2). The probe is cached per process; the capability-bit wording in `include/uda.h` was rewritten to match.
 - 🧰 **会话动作失败回归 `-2` 契约**：`loginctl`/login1/ScreenSaver 各层的尝试失败（命令非零退出、polkit 拒绝、服务不应答、CLI 缺失）现在全部映射为 `UDA_ERR_NOT_SUPPORTED`（诊断信息保留在消息里），不再以 `CommandFailed` 报 `-5`——`include/uda.h` 承诺的"按 `-2` 降级"从此真实成立。
 - 🧰 **Session attempt failures honour the `-2` contract**: attempt failures across the `loginctl` / login1 / ScreenSaver tiers (non-zero exits, polkit refusals, silent services, missing CLIs) now map to `UDA_ERR_NOT_SUPPORTED` with the diagnostic kept in the message, instead of `CommandFailed` reporting `-5` - `include/uda.h`'s "degrade on `-2`" promise now holds.
 - 🧰 **示例不再无条件宣称成功**：`07_session`（Python 与 Node）改为先经 `uda_session_capabilities` 实时探测再渲染六项动作的支持矩阵，探测不支持的动作为明确标注"当前环境不支持（探测结果）"并不调用；Node 绑定新增 `UdaError` 类（携带 `status` 状态码）与全部状态码常量导出，宿主可按 `-1 / -2 / -5` 分流，与 Python 绑定的错误语义对齐。
@@ -170,7 +170,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - feat: 新增 Capability 位标志体系（DETECT_THEME / SET_WALLPAPER / GET_WALLPAPER / READ_ACCENT_COLOR / FOLLOW_SYSTEM_THEME / SEND_NOTIFICATION / WAKE_LOCK）
 - feat: added the capability bit-flag set (DETECT_THEME / SET_WALLPAPER / GET_WALLPAPER / READ_ACCENT_COLOR / FOLLOW_SYSTEM_THEME / SEND_NOTIFICATION / WAKE_LOCK)
 
-[Unreleased]: https://github.com/UniDesktop/SDK/compare/v0.2.1...HEAD
+[v0.2.2]: https://github.com/UniDesktop/SDK/compare/v0.2.1...HEAD
 [v0.2.1]: https://github.com/UniDesktop/SDK/releases/tag/v0.2.1
 [v0.2.0]: https://github.com/UniDesktop/SDK/releases/tag/v0.2.0
 [v1-alpha1]: https://github.com/UniDesktop/SDK/releases/tag/v1-alpha1
