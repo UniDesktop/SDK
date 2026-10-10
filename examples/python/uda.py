@@ -1036,9 +1036,10 @@ class _MediaController:
             artist_text = _decode_or_empty(artist)
             album_text = _decode_or_empty(album)
 
-            # 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个
-            # NULL + 时长 0），SDK 必须同样归一成 None：否则调用方拿到一个空壳
-            # 对象，无法与"没有播放器"区分，示例里就会打印出一堆"(未发布)"。
+            # "无播放器"与"所有字段都未发布"在库端都是三个 NULL + 时长 0；
+            # 播放器把每个字段都发布成空串时，库端会保留空 C 串（与 NULL 可
+            # 区分），绑定层同样把它归一成 None：示例只关心"有没有可展示的
+            # 元数据"，否则调用方拿到一个空壳对象，打印出一堆"(未发布)"。
             if (
                 not title_text
                 and not artist_text

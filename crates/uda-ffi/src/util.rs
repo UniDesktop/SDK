@@ -10,7 +10,7 @@
 //!    turned into owned Rust values (`&str`, `String`) by the helpers here, and
 //!    the conversion functions never assume the buffer is well formed: they walk
 //!    to a null terminator and bail out with
-//!    [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT) when
+//!    [`UDA_ERR_INVALID_ARGUMENT`](crate::abi::UDA_ERR_INVALID_ARGUMENT) when
 //!    the bytes are not valid UTF-8.
 //! 3. **Errors survive the return.** Rust's error type cannot be represented in
 //!    C, so the message is parked in a thread-local slot that
@@ -19,7 +19,8 @@
 use std::cell::RefCell;
 use std::os::raw::c_char;
 
-use crate::error::{Failure, UdaStatus, UDA_ERR_PANIC};
+use crate::abi::{UDA_ERR_PANIC, UDA_OK};
+use crate::error::{Failure, UdaStatus};
 
 thread_local! {
     /// Message of the most recent failure on the calling thread.
@@ -106,7 +107,7 @@ pub(crate) unsafe fn free_c_string(pointer: *mut c_char) {
 ///
 /// The closure returns a `Result<(), Failure>`; a `panic!` inside it is caught
 /// and reported as
-/// [`UDA_ERR_PANIC`](crate::error::UDA_ERR_PANIC) so it can never unwind into
+/// [`UDA_ERR_PANIC`](crate::abi::UDA_ERR_PANIC) so it can never unwind into
 /// foreign frames, where unwinding across an `extern "C"` boundary is undefined
 /// behaviour.
 pub(crate) fn catch_boundary<F>(body: F) -> UdaStatus
@@ -119,7 +120,7 @@ where
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
 
     match outcome {
-        Ok(Ok(())) => crate::error::UDA_OK,
+        Ok(Ok(())) => UDA_OK,
         Ok(Err(failure)) => {
             set_last_message(&failure.message());
             failure.status()
@@ -168,7 +169,7 @@ fn panic_description(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::{UDA_ERR_INVALID_ARGUMENT, UDA_ERR_NOT_SUPPORTED, UDA_OK};
+    use crate::abi::{UDA_ERR_INVALID_ARGUMENT, UDA_ERR_NOT_SUPPORTED, UDA_OK};
     use std::ffi::CString;
 
     #[test]

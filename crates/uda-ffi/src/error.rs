@@ -13,33 +13,18 @@
 //! | `-6` | [`UDA_ERR_PANIC`] | A panic was caught at the FFI boundary |
 //!
 //! Human-readable diagnostics for the failing call are available through
-//! `uda_last_error_message()` until the next UDA call on the same thread.
+//! `uda_last_error_message()`. Reading it consumes the message: the next
+//! call returns null until a new failure is recorded on the same thread.
 
 use uda_core::error::UdaError;
 
+use crate::abi::{
+    UDA_ERR_DETECTION_FAILED, UDA_ERR_INTERNAL, UDA_ERR_INVALID_ARGUMENT, UDA_ERR_IO,
+    UDA_ERR_NOT_SUPPORTED, UDA_ERR_PANIC, UDA_OK,
+};
+
 /// Status code returned by every exported C function.
 pub type UdaStatus = i32;
-
-/// The call succeeded.
-pub const UDA_OK: UdaStatus = 0;
-
-/// A caller-supplied argument was null, not UTF-8, or out of range.
-pub const UDA_ERR_INVALID_ARGUMENT: UdaStatus = -1;
-
-/// The current platform or session cannot provide the requested feature.
-pub const UDA_ERR_NOT_SUPPORTED: UdaStatus = -2;
-
-/// Detecting the environment or OS release failed.
-pub const UDA_ERR_DETECTION_FAILED: UdaStatus = -3;
-
-/// An I/O or process-spawn error occurred.
-pub const UDA_ERR_IO: UdaStatus = -4;
-
-/// An unexpected internal failure occurred.
-pub const UDA_ERR_INTERNAL: UdaStatus = -5;
-
-/// A panic escaped the Rust implementation and was contained by the boundary.
-pub const UDA_ERR_PANIC: UdaStatus = -6;
 
 /// A failure that the C ABI can describe without borrowing [`UdaError`].
 ///

@@ -74,6 +74,17 @@ jobs:
       - name: Type-check whole workspace for x86_64-pc-windows-gnu
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
 
+      - name: Install cbindgen (pinned, generates the C header)
+        run: cargo install cbindgen --locked --version 0.29.4
+
+      # include/uda.h is generated from crates/uda-ffi by cbindgen; the Rust
+      # sources are the single source of truth. Regenerating here and diffing
+      # catches a Rust change whose header update was forgotten: this step
+      # fails until scripts/gen-header.sh has been run and its output
+      # committed. The version must stay in sync with scripts/gen-header.sh.
+      - name: Check the generated C header is up to date
+        run: ./scripts/gen-header.sh --check
+
   # ==========================================================================
   # 3. Linux: unit tests, D-Bus mock fixtures, FFI build and Python example.
   # ==========================================================================
@@ -175,10 +186,11 @@ jobs:
           # guard; these variables force UTF-8 for any child process too.
           PYTHONIOENCODING: utf-8
           PYTHONUTF8: "1"
-        # `include/uda.h` is the single source of truth for the exported surface:
-        # every function it declares must be present in the DLL, so a missing
-        # `#[no_mangle]` fails the build. Hard-coding a symbol count here instead
-        # broke every release once Phase 2 added exports past the stale number.
+        # The generated `include/uda.h` is the reference for the exported
+        # surface: every function it declares must be present in the DLL, so a
+        # missing `#[no_mangle]` fails the build. Hard-coding a symbol count
+        # here instead broke every release once Phase 2 added exports past the
+        # stale number.
         run: python scripts/pe_exports.py target/debug/uda_ffi.dll --expect include/uda.h
 
       - name: Run Python example against the freshly built DLL
@@ -254,12 +266,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip
 
-      # `include/uda.h` is the source of truth for the exported surface. Both
-      # platforms are checked against it, so the expected symbol set can never
-      # drift from what the crate actually declares: a new `#[no_mangle]`
-      # export is picked up automatically, and a *missing* one fails the build.
-      # Hard-coding a symbol count here instead is what broke the release check
-      # once Phase 2 pushed the export list past the stale number.
+      # The generated `include/uda.h` is the reference for the exported
+      # surface. Both platforms are checked against it, so the expected symbol
+      # set can never drift from what the crate actually declares: a new
+      # `#[no_mangle]` export is picked up automatically, and a *missing* one
+      # fails the build. Hard-coding a symbol count here instead is what broke
+      # the release check once Phase 2 pushed the export list past the stale
+      # number.
       - name: Verify exported ABI symbols (Linux)
         run: |
           set -euo pipefail

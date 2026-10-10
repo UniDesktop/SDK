@@ -58,14 +58,20 @@ impl PlaybackStatus {
 /// Every field is owned and pre-joined for display: an MPRIS `xesam:artist` is a
 /// list, but a UI wants one string, so the backend does the join and the struct
 /// stays free of the wire types.
+///
+/// A string field is `None` when the player does not publish it at all, and
+/// `Some("")` when the player publishes it as an empty string, so the two stay
+/// distinguishable all the way to the C-ABI (which hands out NULL versus an
+/// empty string). On Windows SMTC cannot tell an absent property from an empty
+/// one, so the Windows backend maps an empty read to `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaMetadata {
-    /// Track title. Empty when the player publishes none.
-    pub title: String,
-    /// Artist(s), already joined for display.
-    pub artist: String,
-    /// Album name.
-    pub album: String,
+    /// Track title; `None` when the player publishes none.
+    pub title: Option<String>,
+    /// Artist(s), already joined for display; `None` when unpublished.
+    pub artist: Option<String>,
+    /// Album name; `None` when unpublished.
+    pub album: Option<String>,
     /// Track length in milliseconds, or `None` when unknown or unbounded
     /// (a live stream).
     pub duration_ms: Option<u64>,
@@ -79,9 +85,9 @@ impl MediaMetadata {
     /// player answered but said nothing" into the same `Ok(None)` a host with no
     /// player gets.
     pub fn is_empty(&self) -> bool {
-        self.title.is_empty()
-            && self.artist.is_empty()
-            && self.album.is_empty()
+        self.title.is_none()
+            && self.artist.is_none()
+            && self.album.is_none()
             && self.duration_ms.is_none()
             && self.position_ms.is_none()
     }
@@ -225,7 +231,7 @@ mod tests {
     #[test]
     fn a_title_alone_is_enough_to_be_non_empty() {
         let metadata = MediaMetadata {
-            title: "Song".to_string(),
+            title: Some("Song".to_string()),
             ..MediaMetadata::default()
         };
         assert!(!metadata.is_empty());

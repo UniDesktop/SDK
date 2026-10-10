@@ -863,9 +863,10 @@ class MediaController {
     const durationMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, durationSlot));
     const positionMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, positionSlot));
 
-    // 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个 NULL +
-    // 时长 0），SDK 必须同样归一成 null：否则调用方拿到一个空壳对象，无法与
-    // "没有播放器"区分，示例里就会打印出一堆"(未发布)"。
+    // "无播放器"与"所有字段都未发布"在库端都是三个 NULL + 时长 0；播放器把
+    // 每个字段都发布成空串时，库端会保留空 C 串（与 NULL 可区分），绑定层
+    // 同样把它归一成 null：示例只关心"有没有可展示的元数据"，否则调用方拿
+    // 到一个空壳对象，打印出一堆"(未发布)"。
     if (!title && !artist && !album && durationMs === 0) {
       return null;
     }

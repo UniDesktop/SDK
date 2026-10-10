@@ -34,12 +34,15 @@ use uda_core::wakelock::{WakeLockGuard, WakeLockType};
 use crate::dispatch::WakeLockHandle;
 use crate::error::Failure;
 
+/// cbindgen:ignore
 /// Lifetime, in seconds, granted to a CLI-tier lock.
 ///
 /// `systemd-inhibit --mode=block` returns as soon as its child exits, so the
 /// child is a `sleep` bounded by this value. The lock is therefore *not*
 /// indefinite, which the C caller is told about through
-/// `uda_last_error_message()` when the tier is used.
+/// `uda_last_error_message()` when the tier is used. Implementation detail,
+/// not C-ABI surface: the ignore annotation keeps cbindgen from scanning (and
+/// warning about) a private constant it would otherwise visit.
 const CLI_LOCK_SECONDS: u64 = 3600;
 
 /// How a live entry must be released.
@@ -176,7 +179,7 @@ fn register(handle: WakeLockHandle, entry: LockEntry) -> Result<WakeLockHandle, 
 ///
 /// The entry is removed first so the release path never holds the table lock.
 /// Releasing an unknown or already-released handle is reported as
-/// [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT): the
+/// [`UDA_ERR_INVALID_ARGUMENT`](crate::abi::UDA_ERR_INVALID_ARGUMENT): the
 /// caller passed a handle this process does not own.
 pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
     let raw = handle.raw();

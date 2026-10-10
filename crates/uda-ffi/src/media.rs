@@ -4,8 +4,8 @@
 //! [`MediaManager`](uda_core::media::MediaManager) trait does: read what is
 //! playing, read the playback status, and send a transport command. The status is
 //! an `int32_t` code (see [`PlaybackStatus::code`](uda_core::media::PlaybackStatus));
-//! the metadata crosses the boundary as three separately-owned strings plus an
-//! out duration, because a C caller cannot allocate a Rust struct.
+//! the metadata crosses the boundary as three separately-owned strings plus out
+//! duration and position slots, because a C caller cannot allocate a Rust struct.
 //!
 //! # Why an out-code instead of an out-pointer for the status
 //!
@@ -13,45 +13,23 @@
 //! returning the code, so the return value stays free to report *hard* failures
 //! (status `-2` when the platform has no media backend at all). A "no player is
 //! running" is **not** a failure: it is reported as `UDA_MEDIA_UNKNOWN` (3) with
-//! status [`UDA_OK`](crate::error::UDA_OK). A caller must therefore treat code 3
+//! status [`UDA_OK`](crate::abi::UDA_OK). A caller must therefore treat code 3
 //! as "nothing playing", never as a paused track.
 //!
 //! # Ownership
 //!
 //! The three strings written by [`uda_media_get_metadata`] are allocated by Rust
 //! and must be released with [`uda_free_string`](crate::uda_free_string); they
-//! may be null when the corresponding field is empty, which is the normal case
-//! for a player that publishes only a title.
+//! are null when the player does not publish the corresponding field, which is
+//! the normal case for a player that publishes only a title.
 //!
-//! A refused command (an app that disables `Next`, for example) returns
-//! [`UDA_ERR_NOT_SUPPORTED`](crate::error::UDA_ERR_NOT_SUPPORTED) so a caller can
-//! tell "there was nobody to command" from "the player declined it".
+//! A machine with nobody to command reports
+//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED); any other
+//! non-`UDA_OK` status means the command was not delivered.
 
 use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
 
 use crate::error::Failure;
-
-/// Playback-status code for "audio or video is actively progressing".
-pub const UDA_MEDIA_PLAYING: i32 = 0;
-/// Playback-status code for "a track is selected and halted".
-pub const UDA_MEDIA_PAUSED: i32 = 1;
-/// Playback-status code for "nothing is loaded".
-pub const UDA_MEDIA_STOPPED: i32 = 2;
-/// Playback-status code for "cannot tell" (includes "no player").
-pub const UDA_MEDIA_UNKNOWN: i32 = 3;
-
-/// Command code for "start or resume playback".
-pub const UDA_MEDIA_CMD_PLAY: i32 = 0;
-/// Command code for "halt playback but keep the track".
-pub const UDA_MEDIA_CMD_PAUSE: i32 = 1;
-/// Command code for "play/pause".
-pub const UDA_MEDIA_CMD_TOGGLE: i32 = 2;
-/// Command code for "next track".
-pub const UDA_MEDIA_CMD_NEXT: i32 = 3;
-/// Command code for "previous track".
-pub const UDA_MEDIA_CMD_PREVIOUS: i32 = 4;
-/// Command code for "stop playback".
-pub const UDA_MEDIA_CMD_STOP: i32 = 5;
 
 /// Resolve a command code into the core enum.
 ///
@@ -139,6 +117,11 @@ pub(crate) fn send_command(command: MediaCommand) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::abi::{
+        UDA_MEDIA_CMD_NEXT, UDA_MEDIA_CMD_PAUSE, UDA_MEDIA_CMD_PLAY, UDA_MEDIA_CMD_PREVIOUS,
+        UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
+        UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
+    };
 
     #[test]
     fn command_codes_match_the_c_header() {

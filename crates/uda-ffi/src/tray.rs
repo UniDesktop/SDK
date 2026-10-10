@@ -43,20 +43,9 @@ use uda_core::tray::{
     MenuItem, TrayAction, TrayEvent, TrayIcon, TrayIconBuilder, TrayIconSource, TrayMenu,
 };
 
+use crate::abi::{UdaTrayCheckboxCallback, UdaTrayTextCallback};
 use crate::dispatch;
 use crate::error::Failure;
-
-/// Raw C callback invoked when a plain text row is activated.
-///
-/// Arguments are the row's item id as returned by `uda_tray_menu_add_text` and
-/// the `user_data` pointer registered alongside it.
-pub type TextCallback = extern "C" fn(u64, *mut c_void);
-
-/// Raw C callback invoked when a checkbox row is toggled.
-///
-/// Arguments are the row's item id, the **new** checked state (`0` or `1`) after
-/// the toggle has been applied, and the `user_data` pointer.
-pub type CheckboxCallback = extern "C" fn(u64, i32, *mut c_void);
 
 /// A `*mut c_void` opaque payload that may cross a thread boundary.
 ///
@@ -352,7 +341,7 @@ pub(crate) fn create_menu() -> Result<u64, Failure> {
 pub(crate) fn menu_add_text(
     menu_handle: u64,
     label: &str,
-    callback: Option<TextCallback>,
+    callback: UdaTrayTextCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let menu = TrayRegistry::global().menu(menu_handle)?;
@@ -406,7 +395,7 @@ pub(crate) fn menu_add_checkbox(
     menu_handle: u64,
     label: &str,
     checked: bool,
-    callback: Option<CheckboxCallback>,
+    callback: UdaTrayCheckboxCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let menu = TrayRegistry::global().menu(menu_handle)?;
@@ -515,7 +504,7 @@ mod tests {
     fn registry_text(
         menu: u64,
         label: &str,
-        callback: Option<TextCallback>,
+        callback: UdaTrayTextCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_text(menu, label, callback, user_data)
@@ -526,7 +515,7 @@ mod tests {
         menu: u64,
         label: &str,
         checked: bool,
-        callback: Option<CheckboxCallback>,
+        callback: UdaTrayCheckboxCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_checkbox(menu, label, checked, callback, user_data)

@@ -186,15 +186,13 @@ async fn active_metadata_async() -> Result<Option<MediaMetadata>, UdaError> {
         .map_err(|e| UdaError::DetectionFailed(format!("SMTC media properties: {e}")))?;
 
     // `Artist` is a single string on Windows (MPRIS publishes a list, which is
-    // joined on the Linux side); no post-processing is needed here.
-    let title = string_from_hstring(properties.Title());
-    let artist = string_from_hstring(properties.Artist());
-    let album = string_from_hstring(properties.AlbumTitle());
-
+    // joined on the Linux side); no post-processing is needed here. An absent
+    // property arrives as an empty string - the wire has no separate "unset"
+    // value - so an empty read maps to `None` ("not published").
     let mut metadata = MediaMetadata {
-        title,
-        artist,
-        album,
+        title: published_or_none(string_from_hstring(properties.Title())),
+        artist: published_or_none(string_from_hstring(properties.Artist())),
+        album: published_or_none(string_from_hstring(properties.AlbumTitle())),
         duration_ms: None,
         position_ms: None,
     };
@@ -218,6 +216,19 @@ fn string_from_hstring(value: windows::core::Result<windows::core::HSTRING>) -> 
         .ok()
         .map(|text| text.to_string_lossy())
         .unwrap_or_default()
+}
+
+/// Map an SMTC string property onto the core's published/unpublished model.
+///
+/// SMTC has no "unset" marker: a property the session does not publish reads
+/// back as an empty string, so empty is the wire's only spelling of "not
+/// published" and maps to `None`.
+fn published_or_none(text: String) -> Option<String> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
 }
 
 /// Read the tick count of a timeline value, tolerating a failed read.
