@@ -12,7 +12,9 @@
 //! 1. **Every `Try*Async()` command returns `bool`, not a `Result`.** `false`
 //!    means the session *refused* the command; `true` only means the app
 //!    *accepted* it and can still fail afterwards. UDA maps `false` to
-//!    [`UdaError::CommandFailed`] so a caller can tell "sent" from "refused".
+//!    [`UdaError::NotSupported`] — the same contract as the Linux backend and
+//!    the C header's promise that a player refusal surfaces as
+//!    "not supported" (`-2`), not as an internal failure (`-5`).
 //! 2. **`TimeSpan` is in 100-nanosecond ticks.** `Duration / 10_000` converts to
 //!    milliseconds, and a zero `Duration` means "unknown" (a live stream), so it
 //!    is reported as `None` rather than `Some(0)`.
@@ -143,6 +145,11 @@ pub(crate) async fn send_smtc_command(command: MediaCommand) -> Result<(), UdaEr
 }
 
 /// Invoke one transport method and report a refusal as an error.
+///
+/// A `false` return is the *player's* decision, so it surfaces as
+/// [`UdaError::NotSupported`]: `uda.h` promises that a refused command maps to
+/// `UDA_ERR_NOT_SUPPORTED` (`-2`), matching the Linux backend, while a failed
+/// SMTC call stays a [`UdaError::CommandFailed`] (`-5`).
 async fn run_command(
     session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession,
     command: MediaCommand,
@@ -161,12 +168,21 @@ async fn run_command(
 
     match accepted {
         Ok(true) => Ok(()),
-        Ok(false) => Err(UdaError::CommandFailed(format!(
-            "the media session refused the command {:?}",
-            command.code()
-        ))),
+        Ok(false) => Err(command_refused(command)),
         Err(e) => Err(UdaError::CommandFailed(format!("SMTC {e}"))),
     }
+}
+
+/// The error for a command the player itself declined.
+///
+/// The `Ok(false)` branch is the SMTC-specific quirk: the WinRT call succeeded
+/// but the session refused. `uda.h` promises a player refusal maps to
+/// `UDA_ERR_NOT_SUPPORTED` (`-2`) — the same contract the Linux backend honours
+/// — so bindings can treat it as graceful degradation instead of an internal
+/// fault (`-5`). One function so the test asserts the mapping `run_command`
+/// really uses.
+fn command_refused(command: MediaCommand) -> UdaError {
+    UdaError::NotSupported(format!("player refused the command {:?}", command.code()))
 }
 
 /// Read the metadata of the current session.
@@ -362,19 +378,18 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_command_is_reported_as_a_failure() {
-        // The `Ok(false)` branch is the SMTC-specific quirk: the WinRT call
-        // succeeded but the session declined. A caller must be able to tell that
-        // apart from "sent", which is why it maps to `CommandFailed`.
-        let outcome: Result<(), UdaError> = Err(UdaError::CommandFailed(
-            "the media session refused the command 2".to_string(),
-        ));
-
-        match outcome {
-            Err(UdaError::CommandFailed(message)) => {
-                assert!(message.contains("refused"), "message: {message}");
+    fn a_refused_command_is_reported_as_not_supported() {
+        // Exercises the mapping `run_command` uses for `Ok(false)`, so a change
+        // that silently turned a player refusal into an internal failure would
+        // fail here.
+        match command_refused(MediaCommand::TogglePlayPause) {
+            UdaError::NotSupported(message) => {
+                assert!(
+                    message.contains("player refused the command"),
+                    "message: {message}"
+                );
             }
-            other => panic!("expected a CommandFailed, got {other:?}"),
+            other => panic!("expected a NotSupported, got {other:?}"),
         }
     }
 

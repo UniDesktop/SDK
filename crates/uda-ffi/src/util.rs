@@ -17,6 +17,7 @@
 //!    `uda_last_error_message()` reads back as a C string.
 
 use std::cell::RefCell;
+use std::ffi::CString;
 use std::os::raw::c_char;
 
 use crate::error::{Failure, UdaStatus, UDA_ERR_PANIC};
@@ -44,6 +45,28 @@ pub(crate) fn take_last_message() -> Option<String> {
         .try_with(|slot| slot.borrow_mut().take())
         .ok()
         .flatten()
+}
+
+/// Turn the recorded failure message into a fresh, caller-owned C allocation.
+///
+/// The returned pointer is heap-allocated by this call and the caller becomes
+/// its owner: it must be released with `uda_free_string()` and stays valid
+/// until then, no matter how many other UDA calls run in between. `null` is
+/// returned when no failure is recorded, or when the message cannot be
+/// represented as a C string (an interior null byte, which real diagnostics do
+/// not produce).
+pub(crate) fn last_error_pointer() -> *const c_char {
+    let Some(message) = take_last_message() else {
+        return std::ptr::null();
+    };
+
+    // An interior null byte has no C representation. Real diagnostics never
+    // contain one, so that case reports "no message" rather than a truncated
+    // string.
+    match CString::new(message) {
+        Ok(rendered) => rendered.into_raw().cast_const(),
+        Err(_) => std::ptr::null(),
+    }
 }
 
 /// Borrow a C string as an owned Rust `String`.
@@ -80,8 +103,17 @@ pub(crate) unsafe fn owned_string_from(
 /// returned when the text contains an interior null byte (which cannot happen
 /// for values produced by the backends, but a foreign path could in theory
 /// supply one).
+///
+/// An **empty** string also yields `null`, honouring the C ABI's "empty means
+/// absent" convention: `uda_media_get_metadata` documents an unpublished field
+/// as NULL, and a binding's `if (!ptr)` check must not be defeated by a
+/// zero-length allocation. `uda_free_string(NULL)` is a no-op, so callers stay
+/// safe either way.
 pub(crate) fn c_string_from(text: &str) -> *mut c_char {
-    match std::ffi::CString::new(text) {
+    if text.is_empty() {
+        return std::ptr::null_mut();
+    }
+    match CString::new(text) {
         Ok(c_string) => c_string.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
@@ -106,7 +138,7 @@ pub(crate) unsafe fn free_c_string(pointer: *mut c_char) {
 ///
 /// The closure returns a `Result<(), Failure>`; a `panic!` inside it is caught
 /// and reported as
-/// [`UDA_ERR_PANIC`](crate::error::UDA_ERR_PANIC) so it can never unwind into
+/// [`UDA_ERR_PANIC`] so it can never unwind into
 /// foreign frames, where unwinding across an `extern "C"` boundary is undefined
 /// behaviour.
 pub(crate) fn catch_boundary<F>(body: F) -> UdaStatus
@@ -144,10 +176,6 @@ where
 /// dropping the message would make a contained panic indistinguishable from a
 /// silent failure and leave the caller with no diagnosis at all.
 fn panic_description(payload: &(dyn std::any::Any + Send)) -> String {
-    // `panic!` can store the message as `&'static str`, as an owned `String`, or
-    // - depending on the toolchain and panic settings - wrapped in a
-    // `Box<dyn Any + Send>`. Every shape is unwrapped here, because losing the
-    // message would make a contained panic indistinguishable from a silent one.
     if let Some(text) = payload.downcast_ref::<&'static str>() {
         return (*text).to_string();
     }
@@ -170,6 +198,20 @@ mod tests {
     use super::*;
     use crate::error::{UDA_ERR_INVALID_ARGUMENT, UDA_ERR_NOT_SUPPORTED, UDA_OK};
     use std::ffi::CString;
+
+    /// Read a NUL-terminated C string the way a C caller would.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must come from [`c_string_from`] or [`last_error_pointer`]. The
+    /// helper only reads the string; the pointer keeps its owner.
+    fn read_c_string(pointer: *const c_char) -> String {
+        // SAFETY: the caller guarantees a readable, null-terminated buffer.
+        unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("library strings are valid UTF-8")
+            .to_owned()
+    }
 
     #[test]
     fn null_pointer_is_an_invalid_argument() {
@@ -206,6 +248,59 @@ mod tests {
         let back = unsafe { owned_string_from(pointer, "path") }.expect("round trip");
         assert_eq!(back, "/tmp/wallpaper.png");
         unsafe { free_c_string(pointer) };
+    }
+
+    #[test]
+    fn an_empty_string_yields_null_not_a_zero_length_allocation() {
+        // `uda.h` documents an unpublished metadata field as NULL; an empty
+        // string must not defeat a binding's `if (!ptr)` check.
+        assert!(c_string_from("").is_null());
+    }
+
+    #[test]
+    fn each_last_error_pointer_is_a_fresh_caller_owned_allocation() {
+        let _ = take_last_message();
+        assert!(last_error_pointer().is_null(), "no failure recorded yet");
+
+        set_last_message("the backend refused the request");
+        let pointer = last_error_pointer();
+        assert!(!pointer.is_null());
+        assert_eq!(read_c_string(pointer), "the backend refused the request");
+
+        // Every render allocates its own storage and hands the ownership to the
+        // caller, so the pointer stays valid across any number of subsequent
+        // calls, including further renders. The message slot is consumed
+        // exactly once.
+        assert_eq!(take_last_message(), None);
+        set_last_message("a newer failure");
+        let next = last_error_pointer();
+        assert!(!next.is_null());
+        assert_eq!(read_c_string(next), "a newer failure");
+        assert_ne!(pointer, next, "each render must allocate fresh storage");
+        assert_eq!(
+            read_c_string(pointer),
+            "the backend refused the request",
+            "an earlier render must stay readable past later ones"
+        );
+
+        // Both pointers are independent live allocations at this point; the
+        // caller releases each one with the same `uda_free_string` used for
+        // every other returned string.
+        unsafe {
+            free_c_string(pointer.cast_mut());
+            free_c_string(next.cast_mut());
+        }
+    }
+
+    #[test]
+    fn an_unrenderable_error_message_yields_null_and_the_next_one_still_works() {
+        set_last_message("broken\0message");
+        assert!(last_error_pointer().is_null());
+        set_last_message("recovered");
+        let pointer = last_error_pointer();
+        assert!(!pointer.is_null());
+        assert_eq!(read_c_string(pointer), "recovered");
+        unsafe { free_c_string(pointer.cast_mut()) };
     }
 
     #[test]

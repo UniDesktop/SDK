@@ -160,7 +160,7 @@ compatibility layer exists (older Ubuntu, some XFCE/LXDE setups, XEmbed trays).
 ### 1.7 linux capability matrix
 | Capability | Full when | Partial when | None when |
 |---|---|---|---|
-| Show icon | SNI or AppIndicator reachable | - | no watcher, no D-Bus session |
+| Show icon | SNI or AppIndicator reachable | watcher absent: the item is exported and the shell may pick it up late, but UDA reports `Partial(reason)` via `TrayIcon::support_level` / `uda_tray_support_level` | no D-Bus session (`create` fails) |
 | Tooltip | `ToolTip` accepted | shell ignores `ToolTip` (still shows `Title`) | - |
 | `on_click` | `Activate` delivered | shell never sends `Activate` | - |
 | `on_double_click` | **never Full on Linux** - SNI has no double-click event | UDA synthesises it from two `Activate` calls within ~500 ms | - |

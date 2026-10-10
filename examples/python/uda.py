@@ -53,6 +53,15 @@ __all__ = [
     "WakeLockType",
     "TrayIcon",
     "TrayMenu",
+    # 状态码常量也纳入 `from uda import *`：Node 侧 module.exports 已显式导出
+    # 同名值，两侧宿主的分流体验应当一致。
+    "OK",
+    "ERR_INVALID_ARGUMENT",
+    "ERR_NOT_SUPPORTED",
+    "ERR_DETECTION_FAILED",
+    "ERR_IO",
+    "ERR_INTERNAL",
+    "ERR_PANIC",
 ]
 
 # --------------------------------------------------------------------------
@@ -173,8 +182,8 @@ class SessionAction:
 class SessionCapability:
     """会话能力位常量，与 ``include/uda.h`` 的 UDA_SESSION_CAP_* 一致。
 
-    能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器仍置位
-    ``HIBERNATE``，真正拒绝发生在调用时（抛 :class:`UdaError` 状态码 -2）。
+    能力位表达"查询时有接收方可达"，**不是**"当前账户被允许"：关掉休眠的机器
+    仍置位 ``HIBERNATE``，真正拒绝发生在调用时（抛 :class:`UdaError` 状态码 -2）。
     """
 
     MANAGEMENT: Final[int] = 0x00010000
@@ -460,7 +469,10 @@ class Uda:
         self._lib.uda_get_wallpaper.argtypes = [c_char_p_p]
         self._lib.uda_get_wallpaper.restype = ctypes.c_int32
 
-        self._lib.uda_free_string.argtypes = [ctypes.c_char_p]
+        # 形参用 c_void_p 而不是 c_char_p：调用方既传 `c_char_p` 出参槽位（壁纸、
+        # 媒体元数据），也传 `uda_last_error_message` 返回的裸地址整数；c_void_p
+        # 两者都收，c_char_p 遇到整数地址会直接抛 ArgumentError。
+        self._lib.uda_free_string.argtypes = [ctypes.c_void_p]
         self._lib.uda_free_string.restype = None
 
         self._lib.uda_wakelock_acquire.argtypes = [
@@ -473,9 +485,13 @@ class Uda:
         self._lib.uda_wakelock_release.argtypes = [ctypes.c_uint64]
         self._lib.uda_wakelock_release.restype = ctypes.c_int32
 
+        # restype 用 c_void_p 而不是 c_char_p：c_char_p 会自动转 bytes 并丢失
+        # 指针，无法释放这次调用新分配的内存（见 _last_error_message）。
         self._lib.uda_last_error_message.argtypes = []
-        self._lib.uda_last_error_message.restype = ctypes.c_char_p
+        self._lib.uda_last_error_message.restype = ctypes.c_void_p
 
+        # 对照：status_message 返回库内静态字符串（头文件明示绝不可 free），
+        # c_char_p 自动转 bytes 丢失指针正合适——我们本来就不该释放它。
         self._lib.uda_status_message.argtypes = [ctypes.c_int32]
         self._lib.uda_status_message.restype = ctypes.c_char_p
 
@@ -609,15 +625,26 @@ class Uda:
         """状态码非 0 时读取诊断消息并抛出 :class:`UdaError`。"""
         if status == OK:
             return
-        raise UdaError(status, self._last_error_message(action))
+        raise UdaError(status, self._last_error_message(status, action))
 
-    def _last_error_message(self, action: str) -> str:
+    def _last_error_message(self, status: int, action: str) -> str:
         """读取库记录的失败原因，读取失败时退回状态码描述。"""
-        raw = self._lib.uda_last_error_message()
-        if raw:
-            return raw.decode("utf-8", errors="replace")
-        # 库未记录消息（或记录失败）时，用静态描述兜底。
-        raw = self._lib.uda_status_message(0)
+        # 返回值是本次调用新分配的字符串，所有权归调用方；且库侧记录的失败消息
+        # 已被本次调用消费，所以只能调用一次，第二次只会拿到 NULL。读取用
+        # ``string_at`` 把 NUL 之前的字节复制成 ``bytes``，随后按壁纸读取同样的
+        # try/finally 范式释放；uda_free_string(NULL) 是空操作。
+        pointer = self._lib.uda_last_error_message()
+        if pointer:
+            try:
+                raw = ctypes.string_at(pointer)
+            finally:
+                # 无论解码成功与否都必须释放。
+                self._lib.uda_free_string(pointer)
+            if raw:
+                return raw.decode("utf-8", errors="replace")
+        # 库未记录消息（或记录失败）时，用静态描述兜底。必须透传真实失败状态码：
+        # 写死 0（success）会把错误文本渲染成"…失败（success）"，毫无诊断价值。
+        raw = self._lib.uda_status_message(status)
         if raw:
             return f"{action} 失败（{raw.decode('utf-8', errors='replace')}）"
         return f"{action} 失败"
@@ -706,12 +733,17 @@ class Uda:
         self._check(
             self._lib.uda_get_wallpaper(ctypes.byref(out)), "get_wallpaper"
         )
-        if not out.value:
-            return None
         try:
-            return out.value.decode("utf-8", errors="replace")
+            # 判空必须用 ``is None``：ctypes 对 NULL 返回 None，对非 NULL 空串
+            # 返回 b""（假值）。用 ``not out.value`` 会把非 NULL 空串当成
+            # "未设置"，既漏返回也漏释放（泄漏 CString）。
+            raw = out.value
+            if raw is None:
+                return None
+            return raw.decode("utf-8", errors="replace")
         finally:
-            # 无论解码是否成功都必须释放，避免泄漏。
+            # 无论是否提前返回、解码是否成功都必须释放；uda_free_string(NULL)
+            # 是空操作。
             self._lib.uda_free_string(out)
 
     @wallpaper.setter
@@ -812,6 +844,11 @@ class Uda:
 
             with uda.wakelock() as lock:
                 ...          # 这三秒屏幕不会休眠
+
+        Linux 上若原生 IPC 不可用而走了 CLI 兜底（``systemd-inhibit``），该锁
+        约有 1 小时的上界：到期由库回收退役，此后调用
+        :meth:`WakeLock.release` 会以 ``UDA_ERR_INVALID_ARGUMENT``（-1）失败；
+        需要更久的锁请在到期后重新申请。
 
         Args:
             lock_type: ``"display"`` 或 ``"system"``。
@@ -1151,11 +1188,11 @@ class _SessionController:
             {"lock": True, "logout": True, "suspend": True,
              "hibernate": False, "reboot": True, "shutdown": True}
 
-        该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调
-        用来决定界面上画哪些按钮——也必须在画出"关机"这类按钮之前调用。
+        该查询探测一次后缓存且无副作用：不会触碰机器的电源状态，因此可以随意
+        调用来决定界面上画哪些按钮——也必须在画出"关机"这类按钮之前调用。
 
-        能力位表达"代码路径存在"，**不是**"当前账户被允许"：关掉休眠的机器依
-        然 ``hibernate: True``，真正拒绝发生在调用时。Windows 的 reboot /
+        能力位表达"查询时有接收方可达"，**不是**"当前账户被允许"：关掉休眠的机
+        器依然 ``hibernate: True``，真正拒绝发生在调用时。Windows 的 reboot /
         shutdown 还需要 `SeShutdownPrivilege`，同样是运行时答案。
         """
         slot = _UInt32Slot()

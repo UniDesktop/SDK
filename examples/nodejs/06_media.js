@@ -44,4 +44,11 @@ function main() {
   }
 }
 
-main();
+// 与 Python 示例的 `_bootstrap.run` 同一退出语义：环境不可用属于可预期的
+// 失败，打印一行诊断并以退出码 1 结束，而不是留下未捕获异常的调用栈。
+try {
+  main();
+} catch (error) {
+  console.error(`UDA 调用失败: ${error.message}`);
+  process.exitCode = 1;
+}

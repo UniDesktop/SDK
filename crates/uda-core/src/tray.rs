@@ -509,7 +509,10 @@ impl TrayMenu {
     fn validate(item: &MenuItem) -> Result<(), UdaError> {
         if let Some(label) = item.label() {
             if label.trim().is_empty() {
-                return Err(UdaError::NotSupported(
+                // A caller input error, not a platform gap: reporting it as
+                // `NotSupported` would make a typo look like "tray is
+                // unavailable" to a host that degrades on `NotSupported`.
+                return Err(UdaError::InvalidArgument(
                     "tray menu items must have a non-empty label".to_string(),
                 ));
             }
@@ -1103,6 +1106,18 @@ pub struct TrayIconState {
     /// until the backend publishes it, so the accessors fall back to a
     /// conservative answer instead of claiming a feature.
     pub capabilities: Capability,
+    /// Why the backend registered this icon in a degraded form, when it did.
+    ///
+    /// The canonical case is a Linux session without a
+    /// `StatusNotifierWatcher` (`tray_specs.md` §1.6): the item is exported on
+    /// the bus and fully serviceable, but the desktop shell may never display
+    /// it. The backend writes the reason before the icon is handed to the host,
+    /// so [`TrayIcon::support_level`] can always explain the degradation
+    /// instead of leaving the host to guess from a log line no embedder reads;
+    /// a later `set_degraded(None)` clears it again. A backend without a
+    /// degradation path (Windows) leaves the field `None` for the icon's whole
+    /// life.
+    pub degraded: Option<String>,
 }
 
 /// Shared state of a [`TrayIcon`]: the platform backends read it directly to
@@ -1123,6 +1138,7 @@ impl Default for TrayIconState {
             visible: true,
             shutdown: false,
             capabilities: Capability::empty(),
+            degraded: None,
         }
     }
 }
@@ -1141,6 +1157,7 @@ impl TrayIconInner {
                 visible: true,
                 shutdown: false,
                 capabilities: Capability::empty(),
+                degraded: None,
             }),
         }
     }
@@ -1150,6 +1167,19 @@ impl TrayIconInner {
     /// reports a stale or optimistic answer.
     pub fn set_capabilities(&self, capabilities: Capability) {
         self.lock_state().capabilities = capabilities;
+    }
+
+    /// Record why this icon registered in a degraded form, or clear a
+    /// previously recorded reason with `None`. Backend use only; called from
+    /// the registration path before the icon reaches the host, so a host can
+    /// never observe an undecided support level.
+    pub fn set_degraded(&self, reason: Option<String>) {
+        // A blank reason is not a reason: `uda.h` promises that PARTIAL always
+        // carries a non-empty explanation and `uda_tray_support_reason` maps an
+        // empty string to NULL, which would surface as PARTIAL with no answer.
+        // Normalising here keeps every consumer - the trait, the C exports and
+        // the tests - on one side of that promise.
+        self.lock_state().degraded = reason.filter(|text| !text.trim().is_empty());
     }
 
     /// Lock the shared state, recovering from a poisoned lock: the state is
@@ -1222,9 +1252,11 @@ impl TrayIcon {
     /// Replace the icon. The source is validated first, so an invalid value
     /// leaves the previous icon in place and returns a typed error.
     pub fn set_icon(&self, icon: TrayIconSource) -> Result<(), UdaError> {
+        // A malformed caller input is an argument error, not a platform gap:
+        // `NotSupported` here would hide a typo behind "tray is unavailable".
         icon.validate().map_err(|error| {
             log::warn!("tray '{}' rejected an icon: {error}", self.inner.name);
-            UdaError::NotSupported(format!("invalid tray icon: {error}"))
+            UdaError::InvalidArgument(format!("invalid tray icon: {error}"))
         })?;
         self.inner.lock_state().icon = Some(icon);
         log::debug!("tray '{}' icon updated", self.inner.name);
@@ -1241,6 +1273,24 @@ impl TrayIcon {
     pub fn clear_menu(&self) {
         self.inner.lock_state().menu = None;
         log::debug!("tray '{}' menu cleared", self.inner.name);
+    }
+
+    /// Drop the context menu only if it is still `menu`; report whether it was.
+    ///
+    /// The check and the clear run under one state lock, so a caller destroying
+    /// a menu handle can detach it from a live icon without ever clearing a
+    /// *different* menu that raced in between the inspection and the removal.
+    pub fn detach_menu_if(&self, menu: &Arc<TrayMenu>) -> bool {
+        let mut state = self.inner.lock_state();
+        let is_current = state
+            .menu
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, menu));
+        if is_current {
+            state.menu = None;
+            log::debug!("tray '{}' detached its menu", self.inner.name);
+        }
+        is_current
     }
 
     /// The current context menu, if one is attached. The backend re-exports a
@@ -1273,17 +1323,30 @@ impl TrayIcon {
     /// Answers from the capability set the backend published at registration, so
     /// the value always describes *this* icon's environment. Before a backend
     /// publishes, the answer stays [`SupportLevel::None`].
+    ///
+    /// A degradation the backend recorded at registration time
+    /// ([`TrayIconState::degraded`]) narrows the [`TrayFeature::Icon`] answer to
+    /// [`SupportLevel::Partial`] carrying the backend's reason: on Linux the
+    /// icon may be exported but never shown by the shell, and that is exactly
+    /// the "showing the icon" question this feature asks.
     #[must_use]
     pub fn support_level(&self, feature: TrayFeature) -> SupportLevel {
-        let capabilities = self.inner.lock_state().capabilities;
-        if !capabilities.contains(Capability::SYSTEM_TRAY) {
+        let state = self.inner.lock_state();
+        if !state.capabilities.contains(Capability::SYSTEM_TRAY) {
             return SupportLevel::None;
         }
         // `Icon` is the one feature every backend guarantees once an icon
         // exists; `Tooltip` rides along because every backend exposes hover text.
         match feature {
-            TrayFeature::Icon | TrayFeature::Tooltip => SupportLevel::Full,
-            other if capabilities.contains(feature_flag(other)) => SupportLevel::Full,
+            // A recorded degradation is a shell-side visibility problem, which
+            // is what `Icon` asks about; the exported properties and the menu
+            // keep working, so the other features stay `Full`.
+            TrayFeature::Icon => match &state.degraded {
+                Some(reason) => SupportLevel::Partial(reason.clone()),
+                None => SupportLevel::Full,
+            },
+            TrayFeature::Tooltip => SupportLevel::Full,
+            other if state.capabilities.contains(feature_flag(other)) => SupportLevel::Full,
             // An absent flag is a plain `None`; `Partial` is reserved for a
             // backend that publishes a degraded answer explicitly (e.g. Linux
             // double-click synthesis), together with the reason it is degraded.
@@ -1382,8 +1445,8 @@ mod tests {
     fn push_rejects_an_blank_label() {
         let menu = TrayMenu::new();
         match menu.push(MenuItem::text("   ")) {
-            Err(UdaError::NotSupported(_)) => {}
-            other => panic!("expected NotSupported, got {other:?}"),
+            Err(UdaError::InvalidArgument(_)) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
         assert!(menu.is_empty());
         // A separator has no label, so it must pass validation.
@@ -1673,8 +1736,8 @@ mod tests {
 
         let bad = TrayIconSource::Path(String::new());
         match icon.set_icon(bad) {
-            Err(UdaError::NotSupported(_)) => {}
-            other => panic!("expected NotSupported, got {other:?}"),
+            Err(UdaError::InvalidArgument(_)) => {}
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
         // The previous icon must survive a rejected update.
         let kept = icon.inner().lock_state().icon.clone();
@@ -1706,6 +1769,27 @@ mod tests {
     }
 
     #[test]
+    fn detach_menu_if_only_clears_the_menu_it_was_given() {
+        let icon = TrayIcon::from_inner(Arc::new(TrayIconInner::new("test".to_string())));
+        let first = Arc::new(TrayMenu::new());
+        let second = Arc::new(TrayMenu::new());
+        icon.set_menu(Arc::clone(&first));
+
+        // A different menu is never detached, so a racing attach cannot be
+        // destroyed by a concurrent handle cleanup.
+        assert!(!icon.detach_menu_if(&second));
+        assert!(icon
+            .menu()
+            .is_some_and(|attached| Arc::ptr_eq(&attached, &first)));
+
+        // The matching menu is detached exactly once.
+        assert!(icon.detach_menu_if(&first));
+        assert!(icon.menu().is_none());
+        assert!(!icon.detach_menu_if(&first));
+        assert!(icon.menu().is_none());
+    }
+
+    #[test]
     fn capabilities_stay_empty_until_a_backend_publishes() {
         let inner = Arc::new(TrayIconInner::new("test".to_string()));
         let icon = TrayIcon::from_inner(Arc::clone(&inner));
@@ -1725,6 +1809,70 @@ mod tests {
             icon.support_level(TrayFeature::DoubleClick),
             SupportLevel::None
         );
+    }
+
+    #[test]
+    fn a_recorded_degradation_reports_partial_for_the_icon_feature() {
+        let inner = Arc::new(TrayIconInner::new("degraded".to_string()));
+        let icon = TrayIcon::from_inner(Arc::clone(&inner));
+        inner.set_capabilities(Capability::SYSTEM_TRAY);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // What the backend recorded must reach the host verbatim: a watcher-less
+        // Linux session leaves the item exported but possibly invisible, and
+        // "showing the icon" is precisely the `Icon` question.
+        let reason = "no StatusNotifierWatcher is reachable on the session bus".to_string();
+        inner.set_degraded(Some(reason.clone()));
+        assert_eq!(
+            icon.support_level(TrayFeature::Icon),
+            SupportLevel::Partial(reason)
+        );
+
+        // The degradation is about shell-side visibility: the other exported
+        // features keep working, so they stay `Full`.
+        assert_eq!(icon.support_level(TrayFeature::Tooltip), SupportLevel::Full);
+
+        // Clearing the reason (a backend that recovered) restores `Full`.
+        inner.set_degraded(None);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+    }
+
+    #[test]
+    fn set_degraded_normalises_an_empty_reason_to_none() {
+        // `uda.h` promises that PARTIAL always carries a non-empty explanation,
+        // and `set_degraded` is the one place that promise is enforced. Neither
+        // `Some("")` nor a whitespace-only string is a reason: both must be
+        // stored as `None`, so the icon keeps answering `Full` instead of
+        // reporting a degradation nobody can explain.
+        let inner = Arc::new(TrayIconInner::new("blank".to_string()));
+        let icon = TrayIcon::from_inner(Arc::clone(&inner));
+        inner.set_capabilities(Capability::SYSTEM_TRAY);
+
+        inner.set_degraded(Some(String::new()));
+        assert_eq!(
+            inner.lock_state().degraded,
+            None,
+            "empty string is not a reason"
+        );
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        inner.set_degraded(Some("   \t\n".to_string()));
+        assert_eq!(
+            inner.lock_state().degraded,
+            None,
+            "a whitespace-only string is not a reason either"
+        );
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // A real reason still lands verbatim, and `None` clears it from there.
+        inner.set_degraded(Some("no StatusNotifierWatcher".to_string()));
+        assert_eq!(
+            icon.support_level(TrayFeature::Icon),
+            SupportLevel::Partial("no StatusNotifierWatcher".to_string())
+        );
+        inner.set_degraded(None);
+        assert_eq!(inner.lock_state().degraded, None);
+        assert_eq!(icon.support_level(TrayFeature::Icon), SupportLevel::Full);
     }
 
     #[test]

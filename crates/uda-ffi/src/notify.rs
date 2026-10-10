@@ -20,7 +20,19 @@
 //! notifier is created; a caller that leaves it empty gets the generic
 //! `UniDesktop.Notification` identity instead.
 
-use uda_core::notification::{Notification, NotificationManager, Urgency};
+// Only the shared blocking bridge below deals in futures; targets without a
+// backend never see it.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use std::future::Future;
+
+use uda_core::error::UdaError;
+use uda_core::notification::Notification;
+// `send` resolves through this trait on the targets that have a backend; the
+// static fallback below answers without it, so the import would be unused
+// (and warned about) everywhere else.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use uda_core::notification::NotificationManager;
+use uda_core::notification::Urgency;
 
 use crate::error::Failure;
 
@@ -67,6 +79,98 @@ fn build_notification(
     notification
 }
 
+/// Run `future` to completion from synchronous code, wherever the caller is.
+///
+/// The C ABI is synchronous while every platform backend is async, so the FFI
+/// layer has to bridge the two. A `block_on` on a runtime built here would panic
+/// if the caller already runs inside a tokio runtime (a tray worker thread, for
+/// example), because tokio refuses a nested `block_on`. The two situations are
+/// therefore split:
+///
+/// - **No ambient runtime:** a private current-thread runtime is built for this
+///   one call and dropped afterwards, so no worker thread stays parked for the
+///   lifetime of the process.
+/// - **Inside a runtime:** the future is moved onto a dedicated worker thread
+///   and polled there on its own runtime. The caller's runtime is never blocked
+///   from inside itself and stays free to service the very events (tray clicks,
+///   D-Bus signals) the future may be waiting for.
+///
+/// Every failure path returns [`UdaError::Internal`]; the helper contains no
+/// `unwrap`, `expect` or panic of its own. The `'static` bound is what the
+/// worker-thread branch needs: the future is moved onto a fresh thread, so it
+/// may not borrow from the caller's frame.
+///
+/// Shared with the wake-lock tier, so every synchronous export in this crate
+/// gets the same nesting behaviour.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(crate) fn run_sync<T>(future: impl Future<Output = T> + Send + 'static) -> Result<T, UdaError>
+where
+    T: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return run_sync_on_worker_thread(future);
+    }
+    Ok(blocking_runtime()?.block_on(future))
+}
+
+/// Build the private current-thread runtime both branches of [`run_sync`] poll
+/// on.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn blocking_runtime() -> Result<tokio::runtime::Runtime, UdaError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| UdaError::Internal(format!("could not start a tokio runtime: {error}")))
+}
+
+/// Execute `future` on a thread of its own for a caller already inside a
+/// runtime.
+///
+/// The worker builds its own current-thread runtime, so the `block_on` there
+/// can never nest into the caller's runtime, however long the future takes. The
+/// result is sent back on every path; a worker that dies before answering (a
+/// panic inside the future, say) closes the channel, which the caller reports
+/// as an internal error instead of unwinding through its own runtime.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn run_sync_on_worker_thread<T>(
+    future: impl Future<Output = T> + Send + 'static,
+) -> Result<T, UdaError>
+where
+    T: Send + 'static,
+{
+    use std::sync::mpsc;
+
+    let (sender, receiver) = mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("uda-ffi-block-on".to_string())
+        .spawn(move || {
+            // Sent on every path, so the caller never waits on a channel whose
+            // sender vanished without leaving an answer.
+            let _ = sender.send(blocking_runtime().map(|runtime| runtime.block_on(future)));
+        });
+
+    let worker = worker.map_err(|error| {
+        UdaError::Internal(format!(
+            "could not spawn a worker thread for a nested blocking call: {error}"
+        ))
+    })?;
+
+    let result = receiver.recv().map_err(|error| {
+        UdaError::Internal(format!(
+            "the blocking worker thread finished without a result: {error}"
+        ))
+    })?;
+
+    // The worker has already answered, so joining only reaps the thread that is
+    // on its way out; a failure here cannot invalidate the already-delivered
+    // result.
+    if worker.join().is_err() {
+        log::debug!("the blocking worker thread panicked after delivering its result");
+    }
+
+    result
+}
+
 /// Send a notification and write the server-assigned id into `out_id`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn notify(
@@ -79,45 +183,49 @@ pub(crate) fn notify(
 ) -> Result<(), Failure> {
     let notification = build_notification(app_name, title, body, icon, actions);
 
-    // The manager is built per call (Linux opens a session-bus connection,
-    // Windows resolves the process identity), so a fresh single-threaded
-    // runtime per notification keeps the ABI synchronous without parking a
-    // worker thread for the lifetime of the process.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            Failure::Uda(uda_core::error::UdaError::Internal(format!(
-                "could not start a runtime for the notification: {error}"
-            )))
-        })?;
+    // Targets with a backend drive the async `send` through the shared
+    // blocking bridge; everywhere else the backend *is* the static answer
+    // below, so no runtime is ever constructed. The two `?`s peel the bridge's
+    // own runtime failure first, then the send failure. The notification is
+    // moved into `send` because the worker-thread branch of the bridge needs
+    // an owning, `'static` future.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let id = run_sync(send(notification))??;
 
-    let id = runtime.block_on(send(&notification))?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let id = send(notification)?;
+
     *out_id = id;
     Ok(())
 }
 
 /// Deliver `notification` through the platform backend.
-async fn send(notification: &Notification) -> Result<u32, Failure> {
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+async fn send(notification: Notification) -> Result<u32, Failure> {
     #[cfg(target_os = "linux")]
     {
         let manager = uda_platform_linux::notification::LinuxNotificationManager::new().await?;
-        Ok(manager.send(notification).await?)
+        Ok(manager.send(&notification).await?)
     }
 
     #[cfg(target_os = "windows")]
     {
         let manager = uda_platform_windows::notification::WindowsNotificationManager::new();
-        Ok(manager.send(notification).await?)
+        Ok(manager.send(&notification).await?)
     }
+}
 
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    {
-        let _ = notification;
-        Err(Failure::Uda(uda_core::error::UdaError::NotSupported(
-            "no notification backend for this target".to_string(),
-        )))
-    }
+/// Deliver `notification` on a target that has no backend at all.
+///
+/// Kept synchronous: there is nothing to await, and the C ABI sees the same
+/// `UDA_ERR_NOT_SUPPORTED` the runtime-driven targets report for a missing
+/// backend.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn send(notification: Notification) -> Result<u32, Failure> {
+    let _ = notification;
+    Err(Failure::Uda(UdaError::NotSupported(
+        "no notification backend for this target".to_string(),
+    )))
 }
 
 #[cfg(test)]
@@ -192,5 +300,39 @@ mod tests {
     fn an_icon_path_is_kept_verbatim_for_the_backend() {
         let notification = build_notification("UDA", "t", "b", "/tmp/icon.png", "");
         assert_eq!(notification.app_icon, "/tmp/icon.png");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn run_sync_completes_a_standalone_future() {
+        // No ambient runtime here: the helper must build (and drop) its own.
+        let value = run_sync(async { 40 + 2 }).expect("a standalone runtime always works");
+        assert_eq!(value, 42);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn run_sync_survives_being_called_inside_a_runtime() {
+        // The regression this guards against: `block_on` from within a runtime
+        // used to panic with "Cannot start a runtime from within a runtime".
+        // A tray worker thread runs on exactly such a runtime, so the helper
+        // must take the worker-thread branch and answer normally.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the test runtime builds");
+
+        let outcome = runtime.block_on(async {
+            // `spawn_local`-style context checks aside, the mere fact that
+            // `try_current()` is `Ok` here proves the ambient runtime is the
+            // context `run_sync` runs in.
+            assert!(tokio::runtime::Handle::try_current().is_ok());
+            run_sync(async { "answered from the nested bridge" })
+        });
+
+        assert_eq!(
+            outcome.expect("a nested call must not panic"),
+            "answered from the nested bridge"
+        );
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! MPRIS has no "current player" registry. The convention is to scan the session
 //! bus for names starting with `org.mpris.MediaPlayer2.` and pick one, which is
-//! what [`LinuxMediaManager::active_player`] does: a player that reports
+//! what `LinuxMediaManager::active_player` does: a player that reports
 //! `Playing` wins, otherwise the first that answers is kept so a paused track is
 //! still visible.
 //!
@@ -22,16 +22,14 @@
 //! surface (a minimal `playerctld` clone, a browser that answers `Get` but not
 //! `GetAll`); `PropertiesProxy` issues a plain `org.freedesktop.DBus.Properties`
 //! call and the timeout bounds the wait, so an incomplete peer can only cost
-//! [`DBUS_TIMEOUT`] and never the caller's thread.
+//! `DBUS_TIMEOUT` and never the caller's thread.
 //!
 //! The connection is created *inside* the async block that uses it and is owned
-//! by the [`tokio::runtime::Builder::new_current_thread`] runtime built for that
-//! one call, mirroring the tray and wallpaper workers: no connection, proxy or
-//! runtime outlives the call that created it.
+//! by the future driven for that one call through `crate::sync::run_async`,
+//! which is safe to call from inside a tokio runtime as well (P1-15): no
+//! connection, proxy or runtime outlives the call that created it.
 //!
 //! See `docs/internals/media_specs.md` for the property mapping.
-
-use std::time::Duration;
 
 use uda_core::capability::Capability;
 use uda_core::error::UdaError;
@@ -40,12 +38,7 @@ use zbus::fdo::PropertiesProxy;
 use zbus::proxy::Builder as ProxyBuilder;
 use zbus::{Connection, Proxy};
 
-/// Hard ceiling for one D-Bus round trip to a media player.
-///
-/// Five seconds is far above the worst real latency (a loaded desktop answers in
-/// a few milliseconds) yet short enough that a wedged peer cannot stall a UI
-/// thread that called a synchronous export.
-const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::DBUS_TIMEOUT;
 
 /// Well-known object path every MPRIS player implements.
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
@@ -121,7 +114,7 @@ impl LinuxMediaManager {
     /// A `Playing` player always wins; otherwise the first player that answers a
     /// property read is kept, so a paused track is still reported. Every probe is
     /// failure-tolerant and time-bounded: an unreachable or silent candidate is
-    /// skipped after at most [`DBUS_TIMEOUT`], and the call ends with `None`
+    /// skipped after at most `DBUS_TIMEOUT`, and the call ends with `None`
     /// rather than an error when nothing answers.
     async fn active_player(connection: &Connection) -> Option<String> {
         let mut fallback: Option<String> = None;
@@ -229,7 +222,7 @@ async fn list_names(connection: &Connection) -> Result<Vec<String>, UdaError> {
 /// timed out": at this layer the three are indistinguishable to the caller, which
 /// only wants to know whether there is a usable value. The timeout is what makes
 /// the distinction survivable - a peer that never answers costs
-/// [`DBUS_TIMEOUT`] and nothing more.
+/// `DBUS_TIMEOUT` and nothing more.
 async fn read_optional_string(
     properties: &PropertiesProxy<'_>,
     interface: zbus::names::InterfaceName<'_>,
@@ -494,7 +487,7 @@ async fn read_position(properties: &PropertiesProxy<'_>) -> Option<u64> {
 ///
 /// MPRIS transport methods take no arguments and return nothing, so the reply is
 /// not inspected: an MPRIS player acknowledges by returning at all. The call is
-/// bounded by [`DBUS_TIMEOUT`] because a hung player must not pin the caller.
+/// bounded by `DBUS_TIMEOUT` because a hung player must not pin the caller.
 async fn call_method(connection: &Connection, name: &str, method: &str) -> Result<(), UdaError> {
     // The builder chain returns `zbus::Error`; mapping it to `UdaError` inside
     // the async block keeps the outer `match` arms symmetric.
@@ -525,23 +518,35 @@ async fn call_method(connection: &Connection, name: &str, method: &str) -> Resul
 
     match tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (), ()>(method, &())).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(UdaError::CommandFailed(format!("MPRIS {method}: {e}"))),
+        // An error reply is the player explicitly refusing the command (MPRIS
+        // players refuse what they cannot do, e.g. Next on a single-track
+        // queue). `include/uda.h` promises `UDA_ERR_NOT_SUPPORTED` for this -
+        // distinct from a wedged player, which stays a `CommandFailed` - so a
+        // binding can degrade gracefully instead of surfacing -5 (P1-10).
+        Ok(Err(e)) => Err(player_refused(method, &e.to_string())),
         Err(_) => Err(UdaError::CommandFailed(format!(
             "MPRIS {method} timed out after {DBUS_TIMEOUT:?}"
         ))),
     }
 }
 
+/// Wrap a player's explicit refusal of a transport command.
+///
+/// A refusal arrives as a method *error reply*, which is neither "no player"
+/// (also [`UdaError::NotSupported`], with a different message) nor "the player
+/// hung" ([`UdaError::CommandFailed`]). `include/uda.h` documents that a
+/// refusing player reports `UDA_ERR_NOT_SUPPORTED` (-2); the refusal reason
+/// stays in the message for `uda_last_error_message`.
+pub(crate) fn player_refused(method: &str, error: &str) -> UdaError {
+    UdaError::NotSupported(format!("player refused the command {method}: {error}"))
+}
+
 impl MediaManager for LinuxMediaManager {
     fn active_metadata(&self) -> Result<Option<MediaMetadata>, UdaError> {
-        // One current-thread runtime per call, built and dropped here: it owns
-        // the connection and every proxy, so nothing outlives the call.
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+        // The future owns the connection and every proxy, so nothing outlives
+        // the call; `crate::sync::run_async` keeps the bridge safe when the
+        // host itself runs inside a tokio runtime.
+        crate::sync::run_async(async {
             let connection = Self::connection().await?;
             let Some(name) = Self::active_player(&connection).await else {
                 // No player on the bus is a normal state, not a failure.
@@ -556,16 +561,11 @@ impl MediaManager for LinuxMediaManager {
                 return Ok(None);
             }
             Ok(Some(metadata))
-        })
+        })?
     }
 
     fn playback_status(&self) -> Result<PlaybackStatus, UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+        crate::sync::run_async(async {
             let connection = Self::connection().await?;
             let Some(name) = Self::active_player(&connection).await else {
                 return Ok(PlaybackStatus::Unknown);
@@ -578,16 +578,11 @@ impl MediaManager for LinuxMediaManager {
             Ok(read_status(&properties)
                 .await
                 .unwrap_or(PlaybackStatus::Unknown))
-        })
+        })?
     }
 
     fn send_command(&self, command: MediaCommand) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+        crate::sync::run_async(async move {
             let connection = Self::connection().await?;
             let Some(name) = Self::active_player(&connection).await else {
                 // Nothing to command. Reported as unsupported rather than success
@@ -598,7 +593,7 @@ impl MediaManager for LinuxMediaManager {
             };
 
             call_method(&connection, &name, method_for_command(command)).await
-        })
+        })?
     }
 
     fn capabilities(&self) -> Capability {
@@ -790,6 +785,25 @@ mod tests {
         assert_eq!(method_for_command(MediaCommand::Next), "Next");
         assert_eq!(method_for_command(MediaCommand::Previous), "Previous");
         assert_eq!(method_for_command(MediaCommand::Stop), "Stop");
+    }
+
+    #[test]
+    fn a_player_refusal_is_not_supported_not_a_command_failure() {
+        // `include/uda.h` promises `UDA_ERR_NOT_SUPPORTED` (-2) when the player
+        // refuses a command; `CommandFailed` would surface as -5 and bindings
+        // would report a graceful decline as an internal failure (P1-10).
+        let error = player_refused("Next", "nothing in the queue to skip to");
+
+        match error {
+            UdaError::NotSupported(message) => {
+                assert!(
+                    message.contains("player refused the command"),
+                    "message: {message}"
+                );
+                assert!(message.contains("Next"), "message: {message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
     }
 
     #[test]

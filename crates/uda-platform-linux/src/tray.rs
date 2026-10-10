@@ -20,12 +20,18 @@
 //! acquisition. Locking is always recovered from poisoning, as in
 //! [`uda_core::tray`].
 //!
+//! Spawning the worker is not the same as being registered: `create` blocks on
+//! a one-shot readiness channel until the worker has actually put the item on
+//! the session bus, so a worker that died at `Connection::session()` surfaces
+//! as an error instead of a full-capability icon that never appears.
+//!
 //! No `unwrap()`, `expect()`, `panic!`, `unreachable!` or `unsafe` in this
 //! module; every D-Bus call is fallible and every host-supplied buffer is
 //! validated before it is transcribed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::Hasher;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -184,6 +190,131 @@ fn rgba_to_argb(source: &TrayIconSource) -> Option<Vec<(i32, i32, Vec<u8>)>> {
 // Menu model -> com.canonical.dbusmenu
 // ---------------------------------------------------------------------------
 
+/// Persistent mapping from a row's identity to the dbusmenu id a shell sees.
+///
+/// An `Event` is addressed by dbusmenu id (the `Event` gotcha in
+/// `docs/internals/tray_specs.md` §1.5), so the same row must keep the same
+/// id for as long as it exists. The map is the bridge between the host's
+/// stable [`uda_core::tray::MenuItemId`] and the integer ids the protocol
+/// uses: a row is allocated one id on first sight, a removed row's id is
+/// retired, and a re-added row gets a fresh one - so a shell that still caches
+/// an old id can never trigger a different row.
+///
+/// The owning menu's identity is part of the key because two submenus are
+/// separate `TrayMenu`s whose core id counters both start at 1; keying on the
+/// core id alone would alias their rows.
+#[derive(Debug)]
+struct MenuIdMap {
+    /// `(owning menu, core MenuItemId)` -> dbusmenu id.
+    entries: HashMap<(usize, u64), i32>,
+    /// Next dbusmenu id to hand out. It only ever grows, which is what makes
+    /// retired ids unreusable.
+    next_id: i32,
+}
+
+impl MenuIdMap {
+    /// An empty map. Ids start at 1: 0 is the protocol's root sentinel.
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// The dbusmenu id of a row, allocating one on first sight. The counter
+    /// saturates rather than wrapping, since a wrapped counter would alias a
+    /// live row.
+    fn id_for(&mut self, menu: &Arc<uda_core::tray::TrayMenu>, core_id: u64) -> i32 {
+        let key = (Arc::as_ptr(menu) as usize, core_id);
+        if let Some(&id) = self.entries.get(&key) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        self.entries.insert(key, id);
+        id
+    }
+
+    /// Drop the mappings of rows that no longer exist. Their ids stay retired:
+    /// pruning cannot cause reuse because `next_id` never rewinds.
+    fn prune_absent(&mut self, live: &HashSet<(usize, u64)>) {
+        self.entries.retain(|key, _| live.contains(key));
+    }
+}
+
+/// A compact summary of the menu the shell should currently see. Two different
+/// fingerprints mean "the layout changed, tell the shell"; equal fingerprints
+/// mean "nothing to announce this tick".
+///
+/// The fingerprint is content-based because the host mutates the menu **in
+/// place** through a shared `Arc` - a pointer comparison cannot see those
+/// mutations at all. The owning menu's identity is folded in so a replacement
+/// menu always reads as a change even when its rows repeat the old labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MenuFingerprint(u64);
+
+/// A menu hasher, threaded through the fingerprint walk.
+type MenuHasher = std::collections::hash_map::DefaultHasher;
+
+/// Fingerprint a menu: structure, labels, enabled and checked state, plus the
+/// core ids. Swapped callbacks are deliberately invisible - actions are not
+/// exported over dbusmenu, so they cannot change what the shell renders.
+fn menu_fingerprint(menu: Option<&Arc<uda_core::tray::TrayMenu>>) -> MenuFingerprint {
+    let mut hasher = MenuHasher::new();
+    match menu {
+        None => hasher.write_u8(0),
+        Some(menu) => {
+            hasher.write_u8(1);
+            hasher.write_usize(Arc::as_ptr(menu) as usize);
+            fingerprint_menu(menu, &mut hasher);
+        }
+    }
+    MenuFingerprint(hasher.finish())
+}
+
+/// Walk one menu into the fingerprint hash, rows in export order.
+fn fingerprint_menu(menu: &uda_core::tray::TrayMenu, hasher: &mut MenuHasher) {
+    let entries = menu.entries();
+    hasher.write_usize(entries.len());
+    for (core_id, item) in entries {
+        hasher.write_u64(core_id.into_raw());
+        fingerprint_item(&item, hasher);
+    }
+}
+
+/// Walk one row into the fingerprint hash: kind, label, interaction state and,
+/// for a submenu, its nested rows.
+fn fingerprint_item(item: &MenuItem, hasher: &mut MenuHasher) {
+    match item {
+        MenuItem::Separator => hasher.write_u8(0),
+        MenuItem::Text { label, state, .. } => {
+            hasher.write_u8(1);
+            fingerprint_row(label, state, hasher);
+        }
+        MenuItem::Checkbox { label, state, .. } => {
+            hasher.write_u8(2);
+            fingerprint_row(label, state, hasher);
+        }
+        MenuItem::Submenu {
+            label,
+            state,
+            children,
+            ..
+        } => {
+            hasher.write_u8(3);
+            fingerprint_row(label, state, hasher);
+            fingerprint_menu(children, hasher);
+        }
+    }
+}
+
+/// Hash the parts of a row that are visible to the shell.
+fn fingerprint_row(label: &str, state: &uda_core::tray::MenuItemState, hasher: &mut MenuHasher) {
+    hasher.write(label.as_bytes());
+    hasher.write_u8(u8::from(state.enabled));
+    hasher.write_u8(u8::from(state.checked));
+}
+
 /// One menu row, flattened into the integer-keyed layout dbusmenu needs.
 #[derive(Debug, Clone)]
 struct MenuRow {
@@ -210,67 +341,73 @@ struct MenuRow {
 }
 
 impl MenuRow {
-    /// Map a [`MenuItem`] onto a row, allocating the dbusmenu id.
+    /// Map a [`MenuItem`] onto a row, taking its dbusmenu id from the
+    /// persistent `ids` map so a row keeps its id across snapshots.
     ///
-    /// `menuid` is a caller-owned counter so nested submenus allocate from one
-    /// monotonic sequence; it saturates rather than wrapping, since a wrapped
-    /// counter would alias a live row.
-    fn from_item(item: &MenuItem, menuid: &mut i32) -> Self {
-        let id = *menuid;
-        *menuid = menuid.saturating_add(1);
+    /// `menu` is the `TrayMenu` the row came from (it is part of the map key);
+    /// `core_id` is the row's [`uda_core::tray::MenuItemId`]. On a fresh map the
+    /// first allocation is contiguous in traversal order; after edits, stability
+    /// wins over contiguity by design.
+    fn from_item(
+        menu: &Arc<uda_core::tray::TrayMenu>,
+        core_id: u64,
+        item: &MenuItem,
+        ids: &mut MenuIdMap,
+        live: &mut HashSet<(usize, u64)>,
+    ) -> Self {
+        let id = ids.id_for(menu, core_id);
+        live.insert((Arc::as_ptr(menu) as usize, core_id));
         let state = item.state();
+
+        // Every row starts with the same id and interaction state; only the
+        // kind-specific fields are filled in by the match below.
+        let mut row = Self {
+            id,
+            label: None,
+            enabled: state.enabled,
+            checkbox: false,
+            checked: false,
+            separator: false,
+            children: Vec::new(),
+            action: None,
+        };
+
         match item {
-            MenuItem::Separator => Self {
-                id,
-                label: None,
-                enabled: false,
-                checkbox: false,
-                checked: false,
-                separator: true,
-                children: Vec::new(),
-                action: None,
-            },
-            MenuItem::Text { label, action, .. } => Self {
-                id,
-                label: Some(label.clone()),
-                enabled: state.enabled,
-                checkbox: false,
-                checked: false,
-                separator: false,
-                children: Vec::new(),
-                action: action.clone(),
-            },
-            MenuItem::Checkbox { label, action, .. } => Self {
-                id,
-                label: Some(label.clone()),
-                enabled: state.enabled,
-                checkbox: true,
-                checked: state.checked,
-                separator: false,
-                children: Vec::new(),
-                action: action.clone(),
-            },
+            MenuItem::Separator => {
+                // Never interactive and never labelled, whatever the state says.
+                row.enabled = false;
+                row.separator = true;
+            }
+            MenuItem::Text { label, action, .. } => {
+                row.label = Some(label.clone());
+                row.action = action.clone();
+            }
+            MenuItem::Checkbox { label, action, .. } => {
+                row.label = Some(label.clone());
+                row.checkbox = true;
+                row.checked = state.checked;
+                row.action = action.clone();
+            }
             MenuItem::Submenu {
                 label, children, ..
             } => {
-                // Children are snapshotted *after* the parent's id is allocated,
-                // so a submenu owns a contiguous id range.
-                let mut nested = Vec::new();
-                for (_, child) in children.entries() {
-                    nested.push(Self::from_item(&child, menuid));
-                }
-                Self {
-                    id,
-                    label: Some(label.clone()),
-                    enabled: state.enabled,
-                    checkbox: false,
-                    checked: false,
-                    separator: false,
-                    children: nested,
-                    action: None,
+                // A submenu is its own `TrayMenu`, whose core ids are
+                // independent of the parent's; `from_item` keys the nested rows
+                // on the submenu's identity, so they never alias the parent's.
+                row.label = Some(label.clone());
+                for (child_id, child) in children.entries() {
+                    row.children.push(Self::from_item(
+                        children,
+                        child_id.into_raw(),
+                        &child,
+                        ids,
+                        live,
+                    ));
                 }
             }
         }
+
+        row
     }
 
     /// The dbusmenu `type` property value.
@@ -325,12 +462,6 @@ type MenuChildren = Vec<zvariant::OwnedValue>;
 /// The standard dbusmenu layout node: `(ia{sv}av)`.
 type MenuNode = (i32, OwnedProps, MenuChildren);
 
-/// The cheap in-memory property map a row exposes: `'static` keys and borrowed
-/// values. [`owned_props`] converts it for the wire.
-fn row_properties(row: &MenuRow) -> HashMap<&'static str, zvariant::Value<'_>> {
-    row.properties()
-}
-
 /// Own the property values so they can travel back over D-Bus.
 ///
 /// `try_to_owned` reports the rare case where a payload cannot be cloned into a
@@ -347,6 +478,35 @@ fn owned_props(props: HashMap<&'static str, zvariant::Value<'_>>) -> OwnedProps 
         .collect()
 }
 
+/// Keep only the property names the shell asked for; an empty list asks for
+/// all of them, which is how both `GetGroupProperties` and `GetProperty`
+/// express "no filter".
+fn filtered_props<'a>(
+    props: HashMap<&'static str, zvariant::Value<'a>>,
+    wanted: &[&str],
+) -> HashMap<&'static str, zvariant::Value<'a>> {
+    if wanted.is_empty() {
+        return props;
+    }
+    props
+        .into_iter()
+        .filter(|(key, _)| wanted.contains(key))
+        .collect()
+}
+
+/// Encoded child variants for `rows` under the dbusmenu recursion depth:
+/// `-1` is the whole subtree, `0` excludes the children entirely, and `n`
+/// allows exactly `n` more levels below each child.
+fn children_variants(rows: &[MenuRow], depth: i32) -> Result<MenuChildren, zvariant::Error> {
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+    let child_depth = if depth < 0 { -1 } else { depth - 1 };
+    rows.iter()
+        .map(|row| zvariant::Value::new(subtree_node(row, child_depth)?).try_to_owned())
+        .collect()
+}
+
 /// A snapshot of the menu attached to an icon, taken per request, with callbacks
 /// captured so an `Event` never reaches back into the host's live menu tree.
 #[derive(Debug, Clone)]
@@ -354,16 +514,66 @@ struct MenuSnapshot {
     rows: Vec<MenuRow>,
 }
 
+/// Why a `GetLayout` node could not be built: the requested parent is not part
+/// of the current snapshot, or the payload failed to encode.
+#[derive(Debug)]
+enum LayoutRequestError {
+    UnknownParent(i32),
+    Encode(zvariant::Error),
+}
+
+/// The standard properties every dbusmenu root carries, whether or not rows are
+/// attached. They come from the com.canonical.dbusmenu protocol itself (the
+/// whole-menu side of the interface, not the row property table in
+/// `tray_specs.md` §1.5): the protocol version this backend implements, the
+/// text direction and the menu status.
+fn root_properties() -> HashMap<&'static str, zvariant::Value<'static>> {
+    HashMap::from([
+        ("Version", 3u32.into()),
+        ("TextDirection", "ltr".into()),
+        ("Status", "normal".into()),
+    ])
+}
+
+/// One standard root property, addressed by name. The root is not a row: it
+/// answers exactly these properties and nothing else.
+fn root_property(name: &str) -> Option<zvariant::OwnedValue> {
+    root_properties()
+        .remove(name)
+        .and_then(|value| value.try_to_owned().ok())
+}
+
+/// The root properties for `GetGroupProperties`, filtered like row properties.
+fn root_properties_filtered(wanted: &[&str]) -> OwnedProps {
+    owned_props(filtered_props(root_properties(), wanted))
+}
+
+/// The root node when no menu is attached: standard properties, no rows.
+fn empty_root_node() -> MenuNode {
+    (0, owned_props(root_properties()), Vec::new())
+}
+
 impl MenuSnapshot {
-    /// Snapshot the menu behind an `Option<Arc<TrayMenu>>`.
-    fn from_menu(menu: Option<&Arc<uda_core::tray::TrayMenu>>) -> Option<Self> {
+    /// Snapshot the menu behind an `Option<Arc<TrayMenu>>`, assigning dbusmenu
+    /// ids from `ids` so they survive menu edits. Mappings of rows that no
+    /// longer exist are pruned afterwards; their ids are never handed out again.
+    fn from_menu(
+        menu: Option<&Arc<uda_core::tray::TrayMenu>>,
+        ids: &mut MenuIdMap,
+    ) -> Option<Self> {
         let menu = menu?;
         let mut rows = Vec::new();
-        // dbusmenu ids start at 1; 0 is the protocol's "root" sentinel.
-        let mut menuid: i32 = 1;
-        for (_, item) in menu.entries() {
-            rows.push(MenuRow::from_item(&item, &mut menuid));
+        let mut live = HashSet::new();
+        for (core_id, item) in menu.entries() {
+            rows.push(MenuRow::from_item(
+                menu,
+                core_id.into_raw(),
+                &item,
+                ids,
+                &mut live,
+            ));
         }
+        ids.prune_absent(&live);
         Some(Self { rows })
     }
 
@@ -372,27 +582,35 @@ impl MenuSnapshot {
         MenuRow::find(&self.rows, id)
     }
 
-    /// Encode the root with each child represented as a complete node variant.
-    fn root_node(&self, recurse: bool) -> Result<MenuNode, zvariant::Error> {
-        let children = self
-            .rows
-            .iter()
-            .map(|row| zvariant::Value::new(layout_node(row, recurse)?).try_to_owned())
-            .collect::<Result<MenuChildren, _>>()?;
-        Ok((0, OwnedProps::new(), children))
+    /// The `GetLayout` reply node for `parent_id` at the requested recursion
+    /// depth. `parent_id` 0 is the root; any other id addresses a row of the
+    /// current snapshot, and an id that is not part of it is an error rather
+    /// than a silently wrong subtree.
+    fn layout_node(&self, parent_id: i32, depth: i32) -> Result<MenuNode, LayoutRequestError> {
+        if parent_id == 0 {
+            return self.root_node(depth).map_err(LayoutRequestError::Encode);
+        }
+        let row = self
+            .row(parent_id)
+            .ok_or(LayoutRequestError::UnknownParent(parent_id))?;
+        subtree_node(row, depth).map_err(LayoutRequestError::Encode)
     }
 
-    /// The owned id/property pairs for `GetGroupProperties`.
+    /// Encode the root: standard whole-menu properties plus the children the
+    /// depth allows (`-1` the whole subtree, `0` the root alone, `n` exactly `n`
+    /// child levels).
+    fn root_node(&self, depth: i32) -> Result<MenuNode, zvariant::Error> {
+        let children = children_variants(&self.rows, depth)?;
+        Ok((0, owned_props(root_properties()), children))
+    }
+
+    /// The owned id/property pairs for `GetGroupProperties`. Id 0 never
+    /// resolves to a row; the interface answers it from [`root_properties`].
     fn group_properties(&self, ids: &[i32], wanted: &[&str]) -> Vec<(i32, OwnedProps)> {
         ids.iter()
             .filter_map(|id| {
                 let row = self.row(*id)?;
-                let props = row_properties(row);
-                let filtered: HashMap<&'static str, zvariant::Value<'_>> = props
-                    .into_iter()
-                    .filter(|(key, _)| wanted.is_empty() || wanted.contains(key))
-                    .collect();
-                Some((*id, owned_props(filtered)))
+                Some((*id, owned_props(filtered_props(row.properties(), wanted))))
             })
             .collect()
     }
@@ -400,31 +618,53 @@ impl MenuSnapshot {
     /// One owned property of one row.
     fn property(&self, id: i32, name: &str) -> Option<zvariant::OwnedValue> {
         let row = self.row(id)?;
-        let props = row_properties(row);
+        let props = row.properties();
         let value = props.get(name)?;
         value.try_to_owned().ok()
     }
 }
 
-/// Encode a row into a layout node, recursing when asked.
-fn layout_node(row: &MenuRow, recurse: bool) -> Result<MenuNode, zvariant::Error> {
-    let children = if recurse {
-        row.children
-            .iter()
-            .map(|child| zvariant::Value::new(layout_node(child, true)?).try_to_owned())
-            .collect::<Result<MenuChildren, _>>()?
-    } else {
-        Vec::new()
-    };
-    Ok((row.id, owned_props(row_properties(row)), children))
+/// Encode a row into a layout node, including children per the dbusmenu
+/// recursion depth: `-1` is the whole subtree, `0` the row alone, `n` exactly
+/// `n` child levels below this row.
+fn subtree_node(row: &MenuRow, depth: i32) -> Result<MenuNode, zvariant::Error> {
+    let children = children_variants(&row.children, depth)?;
+    Ok((row.id, owned_props(row.properties()), children))
 }
 
 // ---------------------------------------------------------------------------
 // Shared worker state
 // ---------------------------------------------------------------------------
 
+/// Which mirrored parts of [`TrayShared`] moved during a
+/// [`TrayShared::sync_from`].
+///
+/// The menu is absent on purpose: its content is tracked by the worker's
+/// [`MenuFingerprint`], because the host mutates the shared `Arc` in place.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MirrorDelta {
+    /// The tooltip text changed.
+    tooltip: bool,
+    /// The icon source changed and the payload was rebuilt.
+    icon: bool,
+    /// The visibility changed.
+    visible: bool,
+}
+
+/// Whether two optional menu handles point at the same live menu.
+fn menus_are_the_same(
+    left: &Option<Arc<uda_core::tray::TrayMenu>>,
+    right: &Option<Arc<uda_core::tray::TrayMenu>>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// The state the D-Bus worker serves, copied out of the host's
-/// [`TrayIconInner`] on every mutation and answered from this mirror.
+/// `TrayIconInner` on every mutation and answered from this mirror.
 struct TrayShared {
     /// Application name; also the dbusmenu `Id`.
     name: String,
@@ -432,10 +672,16 @@ struct TrayShared {
     tooltip: String,
     /// Current icon payload.
     icon: IconPayload,
+    /// The icon source `icon` was built from. Kept beside the payload so a
+    /// sync only re-transcodes when the source actually changed: an idle tick
+    /// must not re-run the whole RGBA -> ARGB conversion every 200 ms.
+    icon_source: Option<TrayIconSource>,
     /// Whether the item is shown.
     visible: bool,
     /// The live menu, when one is attached.
     menu: Option<Arc<uda_core::tray::TrayMenu>>,
+    /// dbusmenu ids for the mirrored menu's rows, stable across snapshots.
+    menu_ids: MenuIdMap,
     /// Left-click handler.
     on_click: Option<uda_core::tray::TrayEventHandler>,
     /// Double-click handler, fed by the synthesised [`TrayEvent::DoubleClick`].
@@ -457,8 +703,10 @@ impl Default for TrayShared {
             name: String::new(),
             tooltip: String::new(),
             icon: IconPayload::None,
+            icon_source: None,
             visible: true,
             menu: None,
+            menu_ids: MenuIdMap::new(),
             on_click: None,
             on_double_click: None,
             host: None,
@@ -486,27 +734,41 @@ impl fmt::Debug for TrayShared {
 impl TrayShared {
     /// Copy the host-visible state into the mirror under exactly one lock, so
     /// this stays in step with the host without ever nesting locks.
-    fn sync_from(&mut self) {
-        let Some(host) = self.host.as_ref() else {
-            return;
+    ///
+    /// Returns which parts of the mirror moved. The icon source is compared
+    /// byte-for-byte *before* any transcode runs, so an idle tick neither
+    /// re-runs the RGBA -> ARGB conversion nor allocates a fresh payload; the
+    /// previous ARGB rows are reused untouched. The menu is re-pointed by
+    /// identity only; its *content* is tracked by the worker's fingerprint.
+    fn sync_from(&mut self) -> MirrorDelta {
+        let Some(host) = self.host.clone() else {
+            return MirrorDelta::default();
         };
-        let snapshot = {
+        let mut delta = MirrorDelta::default();
+        {
             let state = host.lock_state();
-            (
-                state.tooltip.clone(),
-                state.icon.clone(),
-                state.menu.clone(),
-                state.visible,
-            )
-        };
-        self.tooltip = snapshot.0;
-        self.icon = snapshot
-            .1
-            .as_ref()
-            .map(IconPayload::from_source)
-            .unwrap_or_default();
-        self.menu = snapshot.2;
-        self.visible = snapshot.3;
+            if state.tooltip != self.tooltip {
+                self.tooltip = state.tooltip.clone();
+                delta.tooltip = true;
+            }
+            if state.icon != self.icon_source {
+                self.icon_source = state.icon.clone();
+                self.icon = self
+                    .icon_source
+                    .as_ref()
+                    .map(IconPayload::from_source)
+                    .unwrap_or_default();
+                delta.icon = true;
+            }
+            if state.visible != self.visible {
+                self.visible = state.visible;
+                delta.visible = true;
+            }
+            if !menus_are_the_same(&self.menu, &state.menu) {
+                self.menu = state.menu.clone();
+            }
+        }
+        delta
     }
 
     /// Adopt the values collected from a config at registration time.
@@ -519,8 +781,10 @@ impl TrayShared {
                 .as_ref()
                 .map(IconPayload::from_source)
                 .unwrap_or_default(),
+            icon_source: config.icon.clone(),
             visible: true,
             menu: config.menu.clone(),
+            menu_ids: MenuIdMap::new(),
             on_click: None,
             on_double_click: None,
             host: None,
@@ -539,8 +803,11 @@ impl TrayShared {
     }
 
     /// A snapshot suitable for the menu interface handlers.
-    fn menu_snapshot(&self) -> Option<MenuSnapshot> {
-        MenuSnapshot::from_menu(self.menu.as_ref())
+    ///
+    /// Takes `&mut self`: snapshotting allocates dbusmenu ids for rows the map
+    /// has not seen yet, which is what keeps those ids stable across snapshots.
+    fn menu_snapshot(&mut self) -> Option<MenuSnapshot> {
+        MenuSnapshot::from_menu(self.menu.as_ref(), &mut self.menu_ids)
     }
 }
 
@@ -585,9 +852,11 @@ impl StatusNotifierItemInterface {
     ///
     /// Two activations inside [`DOUBLE_CLICK_WINDOW`] are reported as a
     /// [`TrayEvent::DoubleClick`] and routed to `on_double_click`; every other
-    /// activation is a plain [`TrayEvent::Click`]. The callback runs **without**
-    /// the state lock held, so host code may update the icon or the menu from
-    /// inside it.
+    /// activation is a plain [`TrayEvent::Click`]. When no double-click handler
+    /// is registered - the C ABI cannot register one at all - the second
+    /// activation falls back to `on_click` instead of being swallowed. The
+    /// callback runs **without** the state lock held, so host code may update
+    /// the icon or the menu from inside it.
     fn dispatch_activation(&mut self) {
         // One guard: read the timestamp, record the new one, take the handler.
         let (event, handler) = {
@@ -600,19 +869,55 @@ impl StatusNotifierItemInterface {
             // The window restarts, so a triple click reads as click-then-double.
             shared.last_activate = Some(now);
             if double_click {
-                (TrayEvent::DoubleClick, shared.on_double_click.take())
+                match shared.on_double_click.take() {
+                    Some(handler) => (TrayEvent::DoubleClick, Some(handler)),
+                    None => (TrayEvent::Click, shared.on_click.take()),
+                }
             } else {
                 (TrayEvent::Click, shared.on_click.take())
             }
         };
 
-        if let Some(mut handler) = handler {
-            handler(&event);
-            // Put the closure back even if it panicked: a handler that is never
-            // restored would silently stop receiving clicks. The lock was
-            // released before the call, so re-acquiring it here is safe.
+        if let Some(handler) = handler {
+            // The guard owns the handler for the duration of the call and puts
+            // it back on drop, so the callback survives a panic *and* a normal
+            // return: a handler that is never restored would silently stop
+            // receiving clicks. The panic is caught so one misbehaving host
+            // callback cannot kill the zbus task that dispatched it.
+            let mut guard = HandlerGuard {
+                shared: Arc::clone(&self.shared),
+                event,
+                handler: Some(handler),
+            };
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Some(handler) = guard.handler.as_mut() {
+                    handler(&guard.event);
+                }
+            }));
+            if outcome.is_err() {
+                log::warn!("tray activation handler panicked; it stays registered");
+            }
+            // Restores the handler under the state lock, with no callback running.
+            drop(guard);
+        }
+    }
+}
+
+/// Owns a taken activation handler while it runs and always puts it back on
+/// drop, whether the call returned normally or unwound.
+struct HandlerGuard {
+    shared: Arc<Mutex<TrayShared>>,
+    event: TrayEvent,
+    handler: Option<uda_core::tray::TrayEventHandler>,
+}
+
+impl Drop for HandlerGuard {
+    fn drop(&mut self) {
+        if let Some(handler) = self.handler.take() {
+            // The lock was released before the callback ran, so re-acquiring it
+            // here is safe; poisoning is recovered like everywhere else.
             let mut shared = lock_or_recover(&self.shared, "status notifier item");
-            match event {
+            match self.event {
                 TrayEvent::Click => shared.on_click = Some(handler),
                 TrayEvent::DoubleClick => shared.on_double_click = Some(handler),
             }
@@ -773,6 +1078,17 @@ impl StatusNotifierItemInterface {
     #[zbus(signal)]
     async fn new_attention_icon(signal_context: &SignalContext<'_>) -> zbus::Result<()>;
 
+    /// Emitted when the tooltip changed.
+    ///
+    /// Per the SNI spec `NewToolTip()` carries no payload: a host re-reads the
+    /// `ToolTip` property, which is served as a `v` - a variant over the
+    /// `(icon name, icon pixmap, title, description)` struct that `tool_tip`
+    /// above fills. zbus derives the signal member from this method's name, so
+    /// the name must stay `new_tool_tip` for the wire member to remain
+    /// `NewToolTip`.
+    #[zbus(signal)]
+    async fn new_tool_tip(signal_context: &SignalContext<'_>) -> zbus::Result<()>;
+
     /// Emitted when the status changed.
     #[zbus(signal)]
     async fn new_status(signal_context: &SignalContext<'_>, status: &str) -> zbus::Result<()>;
@@ -799,9 +1115,10 @@ impl DBusMenuInterface {
         Self { shared, revision }
     }
 
-    /// Snapshot the menu, dropping the state lock immediately.
+    /// Snapshot the menu, dropping the state lock immediately. Snapshotting
+    /// needs `&mut` because it may allocate dbusmenu ids for fresh rows.
     fn menu_snapshot(&self) -> Option<MenuSnapshot> {
-        let shared = lock_or_recover(&self.shared, "dbus menu");
+        let mut shared = lock_or_recover(&self.shared, "dbus menu");
         shared.menu_snapshot()
     }
 
@@ -814,42 +1131,69 @@ impl DBusMenuInterface {
 
 #[interface(name = "com.canonical.dbusmenu")]
 impl DBusMenuInterface {
-    /// Return the menu tree. A `recursion_depth` of 0 (or below) means
-    /// "unlimited", which is what the shells send.
+    /// Return the menu tree.
+    ///
+    /// `parent_id` addresses the subtree to export (0 is the root); an id that
+    /// is not part of the current layout is an `InvalidArgs` error rather than
+    /// a silently wrong reply. `recursion_depth` follows the dbusmenu
+    /// specification: `-1` is the whole subtree, `0` exports the requested node
+    /// alone, and `n` exports exactly `n` child levels below it.
     async fn get_layout(
         &self,
-        _parent_id: i32,
+        parent_id: i32,
         recursion_depth: i32,
         _property_names: Vec<String>,
     ) -> zbus::fdo::Result<(u32, MenuNode)> {
-        let recurse = recursion_depth <= 0 || recursion_depth > 1;
-        let root = match self.menu_snapshot() {
-            Some(snapshot) => snapshot
-                .root_node(recurse)
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
-            // No menu attached: report an empty root so the shell renders
-            // nothing instead of surfacing an error.
-            None => (0, HashMap::new(), Vec::new()),
+        let revision = self.revision();
+        let node = match self.menu_snapshot() {
+            Some(snapshot) => match snapshot.layout_node(parent_id, recursion_depth) {
+                Ok(node) => node,
+                Err(LayoutRequestError::UnknownParent(id)) => {
+                    return Err(zbus::fdo::Error::InvalidArgs(format!(
+                        "unknown menu item id {id}"
+                    )));
+                }
+                Err(LayoutRequestError::Encode(error)) => {
+                    return Err(zbus::fdo::Error::Failed(error.to_string()));
+                }
+            },
+            // No menu attached: the root still exists, it just has no rows.
+            None if parent_id == 0 => empty_root_node(),
+            None => {
+                return Err(zbus::fdo::Error::InvalidArgs(format!(
+                    "unknown menu item id {parent_id}"
+                )))
+            }
         };
-        Ok((self.revision(), root))
+        Ok((revision, node))
     }
 
-    /// Incremental property read for a set of ids.
+    /// Incremental property read for a set of ids. The root (id 0) is answered
+    /// with the standard whole-menu properties even when no rows are attached.
     async fn get_group_properties(
         &self,
         ids: Vec<i32>,
         property_names: Vec<String>,
     ) -> zbus::fdo::Result<Vec<(i32, OwnedProps)>> {
-        let snapshot = match self.menu_snapshot() {
-            Some(snapshot) => snapshot,
-            None => return Ok(Vec::new()),
-        };
         let wanted: Vec<&str> = property_names.iter().map(String::as_str).collect();
-        Ok(snapshot.group_properties(&ids, &wanted))
+        let mut results = Vec::new();
+        if ids.contains(&0) {
+            results.push((0, root_properties_filtered(&wanted)));
+        }
+        if let Some(snapshot) = self.menu_snapshot() {
+            results.extend(snapshot.group_properties(&ids, &wanted));
+        }
+        Ok(results)
     }
 
-    /// Single property read.
+    /// Single property read. The root (id 0) carries the standard dbusmenu
+    /// properties and is answerable whether or not rows are attached.
     async fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<zvariant::OwnedValue> {
+        if id == 0 {
+            return root_property(&name).ok_or_else(|| {
+                zbus::fdo::Error::InvalidArgs(format!("the menu root has no property '{name}'"))
+            });
+        }
         let snapshot = match self.menu_snapshot() {
             Some(snapshot) => snapshot,
             None => {
@@ -863,12 +1207,9 @@ impl DBusMenuInterface {
                 "unknown menu item id {id}"
             )));
         }
-        match snapshot.property(id, &name) {
-            Some(value) => Ok(value),
-            None => Err(zbus::fdo::Error::InvalidArgs(format!(
-                "item {id} has no property '{name}'"
-            ))),
-        }
+        snapshot.property(id, &name).ok_or_else(|| {
+            zbus::fdo::Error::InvalidArgs(format!("item {id} has no property '{name}'"))
+        })
     }
 
     /// A shell-reported interaction with a row, addressed by dbusmenu id. The
@@ -882,9 +1223,8 @@ impl DBusMenuInterface {
         }
 
         let action = {
-            let snapshot = match self.menu_snapshot() {
-                Some(snapshot) => snapshot,
-                None => return,
+            let Some(snapshot) = self.menu_snapshot() else {
+                return;
             };
             match snapshot.row(id) {
                 Some(row) => row.action.clone(),
@@ -917,6 +1257,10 @@ impl DBusMenuInterface {
     }
 
     /// Signal: some properties changed.
+    ///
+    /// TODO(tray): emit this for label/enabled/checked-only changes instead of
+    /// the full `LayoutUpdated`; a whole-layout announce is always correct for
+    /// the shells, just more talkative than the protocol requires.
     #[zbus(signal)]
     async fn items_properties_updated(
         signal_context: &SignalContext<'_>,
@@ -945,11 +1289,33 @@ impl DBusMenuInterface {
 // Worker lifecycle
 // ---------------------------------------------------------------------------
 
+/// What the worker tells [`LinuxTrayManager::create`] once the bus work is
+/// done: the item is live, live with a stated degradation, or dead.
+enum WorkerReady {
+    /// The item and its menu are exported and the bus name is held.
+    Ready,
+    /// The item is exported, but a non-fatal part of the registration failed;
+    /// the string is the human-readable reason.
+    Degraded(String),
+    /// Initialisation failed; the worker has exited or is on its way out.
+    Failed(String),
+}
+
+/// How long [`LinuxTrayManager::create`] waits for the worker's readiness
+/// report before giving up on the icon.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Everything the worker thread needs.
 ///
-/// There is deliberately no command enum: the worker's lifetime is bound to the
-/// host's icon handle, so a disconnected sender is the one and only shutdown
-/// signal.
+/// There is deliberately no command enum. Shutdown has two triggers and
+/// neither carries a payload: the *primary* one is the worker polling
+/// [`Self::host_released`], which reads the `shutdown` flag that
+/// `TrayIcon::drop` sets when the host releases its handle (the success path
+/// of `create` deliberately leaks the command sender, so the channel below
+/// never disconnects for a live icon); the *secondary* one is that same
+/// channel disconnecting, which happens only when `create` fails and its
+/// shutdown sender is dropped while the worker is still coming up. Both are
+/// observed in the poll loop of [`Self::run_async`].
 struct Worker {
     /// The unique bus name this item owns.
     bus_name: String,
@@ -959,11 +1325,15 @@ struct Worker {
     revision: Arc<Mutex<u32>>,
     /// Closed when the host drops the icon; the disconnect ends the worker.
     commands: std::sync::mpsc::Receiver<()>,
+    /// One-shot readiness report back to `create`, consumed on first send.
+    ready: Option<std::sync::mpsc::Sender<WorkerReady>>,
+    /// Fingerprint of the menu the shell was last told about.
+    last_menu: Option<MenuFingerprint>,
 }
 
 impl Worker {
     /// Run the worker until the host is gone or a shutdown is requested.
-    fn run(self) {
+    fn run(mut self) {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -971,10 +1341,24 @@ impl Worker {
             Ok(runtime) => runtime,
             Err(error) => {
                 log::error!("tray worker could not start a runtime: {error}");
+                self.report(WorkerReady::Failed(format!(
+                    "could not start the worker runtime: {error}"
+                )));
                 return;
             }
         };
         runtime.block_on(self.run_async());
+    }
+
+    /// Hand the readiness report to `create`. A gone receiver only means
+    /// `create` timed out and gave up; the worker learns about that through the
+    /// disconnected command channel instead. The sender is one-shot: it is
+    /// consumed on the first report, so later failures cannot overwrite the
+    /// verdict `create` already acted on.
+    fn report(&mut self, outcome: WorkerReady) {
+        if let Some(sender) = self.ready.take() {
+            let _ = sender.send(outcome);
+        }
     }
 
     async fn run_async(mut self) {
@@ -982,6 +1366,7 @@ impl Worker {
             Ok(connection) => connection,
             Err(error) => {
                 log::warn!("tray worker found no session bus: {error}");
+                self.report(WorkerReady::Failed(format!("no session bus: {error}")));
                 return;
             }
         };
@@ -989,6 +1374,10 @@ impl Worker {
         // A unique bus name keeps several icons in one process from colliding.
         if let Err(error) = connection.request_name(self.bus_name.as_str()).await {
             log::warn!("tray bus name '{}' was refused: {error}", self.bus_name);
+            self.report(WorkerReady::Failed(format!(
+                "the bus name {} was refused: {error}",
+                self.bus_name
+            )));
             return;
         }
 
@@ -998,17 +1387,38 @@ impl Worker {
         let server = connection.object_server();
         if let Err(error) = server.at(SNI_PATH, item).await {
             log::warn!("tray could not export {SNI_PATH}: {error}");
+            self.report(WorkerReady::Failed(format!(
+                "could not export {SNI_PATH}: {error}"
+            )));
             return;
         }
         if let Err(error) = server.at(MENU_PATH, menu).await {
             log::warn!("tray could not export {MENU_PATH}: {error}");
+            self.report(WorkerReady::Failed(format!(
+                "could not export {MENU_PATH}: {error}"
+            )));
             return;
         }
 
+        // Both paths are compile-time constants, so these contexts cannot fail
+        // to build; `SignalContext::new` would only re-parse the same strings.
+        let sni_context = SignalContext::from_parts(
+            connection.clone(),
+            zvariant::ObjectPath::from_static_str_unchecked(SNI_PATH),
+        );
+        let menu_context = SignalContext::from_parts(
+            connection.clone(),
+            zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH),
+        );
+
         // A missing watcher is not fatal: the item stays exported, so a watcher
-        // that starts later can still find it.
+        // that starts later can still find it. It is a degradation, though, and
+        // it is reported as one instead of being logged into silence.
         if let Err(error) = register_with_watcher(&connection, &self.bus_name).await {
             log::warn!("tray registered without a watcher ({error}); the shell may not show it");
+            self.report(WorkerReady::Degraded(error.to_string()));
+        } else {
+            self.report(WorkerReady::Ready);
         }
 
         log::info!("tray item '{}' is live", self.bus_name);
@@ -1022,66 +1432,93 @@ impl Worker {
             if self.host_released() {
                 break;
             }
-            if self.refresh(&connection).await {
-                self.bump_revision();
-            }
+            self.refresh(&sni_context, &menu_context).await;
             tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
         }
 
         self.shutdown(&connection).await;
     }
 
-    /// Copy the host's state into the mirror and announce any change.
+    /// Mirror the host state and announce whatever the shell must re-read.
     ///
-    /// Returns whether the menu layout changed, the only case that needs a
-    /// revision bump. The guard is dropped before any signal is emitted: holding
-    /// it across a signal could deadlock against a shell that calls back into
-    /// the item while we still own the lock.
-    async fn refresh(&mut self, connection: &Connection) -> bool {
-        let (previous, changed) = {
+    /// Icon, tooltip and visibility changes come from the mirror delta; menu
+    /// changes are detected by fingerprinting the live menu, because the host
+    /// mutates it in place through a shared `Arc` and a pointer compare is
+    /// blind to that. A detected change re-keys the snapshot, advances the
+    /// revision and emits a real `LayoutUpdated(revision, 0)` - the signal the
+    /// shells re-read on. Every signal is emitted without any state lock held:
+    /// holding it across a signal could deadlock against a shell calling back
+    /// into the item.
+    async fn refresh(
+        &mut self,
+        sni_context: &SignalContext<'static>,
+        menu_context: &SignalContext<'static>,
+    ) {
+        let (delta, visible, menu) = {
             let mut shared = lock_or_recover(&self.shared, "tray worker state");
-            let previous = (
-                shared.tooltip.clone(),
-                shared.icon.clone(),
-                shared.visible,
-                shared.menu.as_ref().map(Arc::as_ptr),
-            );
-            shared.sync_from();
-            let changed = (
-                shared.tooltip != previous.0,
-                shared.icon != previous.1,
-                shared.visible != previous.2,
-                shared.menu.as_ref().map(Arc::as_ptr) != previous.3,
-            );
-            (previous, changed)
-        };
-        let _ = previous;
-
-        let signal_context = match zbus::object_server::SignalContext::new(connection, SNI_PATH) {
-            Ok(context) => context,
-            Err(error) => {
-                log::debug!("tray could not build a signal context: {error}");
-                return changed.3;
-            }
+            let delta = shared.sync_from();
+            (delta, shared.visible, shared.menu.clone())
         };
 
-        if changed.0 {
-            let _ = StatusNotifierItemInterface::new_title(&signal_context).await;
+        let menu_changed = self.note_menu_fingerprint(menu_fingerprint(menu.as_ref()));
+        if menu_changed {
+            // Re-key the snapshot now, before anything is announced: this
+            // allocates ids for the new rows and retires the ids of removed
+            // ones (a row re-added before the next tick must get a fresh id),
+            // so the snapshot a shell reads after the signal is already in
+            // step and no lock is held across the signal itself.
+            let mut shared = lock_or_recover(&self.shared, "tray worker state");
+            let _ = shared.menu_snapshot();
         }
-        if changed.1 {
-            let _ = StatusNotifierItemInterface::new_icon(&signal_context).await;
+
+        if delta.tooltip {
+            // One mirrored field backs two properties: `title` serves the
+            // tooltip text as the item's Title, and `tool_tip` serves it as
+            // the third slot of the ToolTip struct. Both properties therefore
+            // change together, so both signals go out and a host listening to
+            // either one re-reads in step.
+            let _ = StatusNotifierItemInterface::new_title(sni_context).await;
+            let _ = StatusNotifierItemInterface::new_tool_tip(sni_context).await;
         }
-        if changed.2 {
+        if delta.icon {
+            let _ = StatusNotifierItemInterface::new_icon(sni_context).await;
+        }
+        if delta.visible {
             // A hidden icon is `"Passive"`, a visible one `"Active"`.
-            let visible = {
-                let shared = lock_or_recover(&self.shared, "tray worker state");
-                shared.visible
-            };
             let status = if visible { "Active" } else { "Passive" };
-            let _ = StatusNotifierItemInterface::new_status(&signal_context, status).await;
+            let _ = StatusNotifierItemInterface::new_status(sni_context, status).await;
         }
+        if menu_changed {
+            self.bump_revision_and_announce(menu_context).await;
+        }
+    }
 
-        changed.3
+    /// Record the fingerprint of the mirrored menu and report whether the
+    /// layout the shell should see changed. The first observation counts as a
+    /// change so the initial layout is announced like any other.
+    fn note_menu_fingerprint(&mut self, fingerprint: MenuFingerprint) -> bool {
+        let changed = self.last_menu != Some(fingerprint);
+        self.last_menu = Some(fingerprint);
+        changed
+    }
+
+    /// Advance the menu revision and return the new value. It saturates rather
+    /// than wrapping: a wrapped revision would re-announce a value the shell has
+    /// already seen.
+    fn advance_revision(&self) -> u32 {
+        let mut revision = lock_or_recover(&self.revision, "dbus menu revision");
+        *revision = revision.saturating_add(1);
+        *revision
+    }
+
+    /// Advance the menu revision and announce the new layout on the bus:
+    /// `LayoutUpdated(revision, 0)` - the whole menu changed, parent 0.
+    async fn bump_revision_and_announce(&self, menu_context: &SignalContext<'_>) {
+        let revision = self.advance_revision();
+        log::debug!("tray menu layout is now at revision {revision}");
+        if let Err(error) = DBusMenuInterface::layout_updated(menu_context, revision, 0).await {
+            log::debug!("tray could not announce the new menu layout: {error}");
+        }
     }
 
     /// Whether the host has dropped its icon: `TrayIcon::drop` sets `shutdown`
@@ -1094,16 +1531,6 @@ impl Worker {
             // leak a permanent ghost entry in the shell's tray.
             None => true,
         }
-    }
-
-    /// Advance the menu revision and announce the new layout.
-    fn bump_revision(&self) {
-        let revision = {
-            let mut revision = lock_or_recover(&self.revision, "dbus menu revision");
-            *revision = revision.saturating_add(1);
-            *revision
-        };
-        log::debug!("tray menu layout is now at revision {revision}");
     }
 
     /// Unregister everything: interfaces are removed before the bus name is
@@ -1164,14 +1591,45 @@ async fn register_with_watcher(connection: &Connection, service: &str) -> Result
 
 /// The Linux tray manager. Cheap to construct: no connection is opened until
 /// [`TrayManager::create`] runs, so probing capabilities never touches the bus.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LinuxTrayManager;
+///
+/// A manager remembers - weakly - every icon it created, so
+/// [`TrayManager::support_level`] can relay a degradation those icons recorded
+/// (a session without a `StatusNotifierWatcher`, for one). The references are
+/// `Weak`, so remembering never keeps an icon alive, and a dropped icon leaves
+/// the answer on its own; a manager that created nothing answers statically.
+#[derive(Debug, Default, Clone)]
+pub struct LinuxTrayManager {
+    /// Weak handles to the icons this manager created, pruned on access.
+    icons: Arc<Mutex<Vec<std::sync::Weak<uda_core::tray::TrayIconInner>>>>,
+}
 
 impl LinuxTrayManager {
     /// A new manager.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Remember an icon this manager created, dropping the entries whose icon
+    /// is already gone. The lock mirrors [`lock_or_recover`]: the vector is
+    /// pure data, so a poisoned lock is recovered rather than propagated.
+    fn remember(&self, inner: &Arc<uda_core::tray::TrayIconInner>) {
+        let mut icons = lock_or_recover(&self.icons, "tray manager icons");
+        icons.retain(|weak| weak.strong_count() > 0);
+        icons.push(Arc::downgrade(inner));
+    }
+
+    /// The degradation reason of the first live icon that recorded one, if any.
+    ///
+    /// Lock order note: this takes the manager's icon-list lock and, per
+    /// candidate, the icon's own state lock. No path ever takes the icon-list
+    /// lock while holding an icon state lock, so the order cannot invert.
+    fn recorded_degradation(&self) -> Option<String> {
+        let mut icons = lock_or_recover(&self.icons, "tray manager icons");
+        icons.retain(|weak| weak.strong_count() > 0);
+        icons
+            .iter()
+            .find_map(|weak| weak.upgrade()?.lock_state().degraded.clone())
     }
 
     /// The capability set this backend publishes for a registered item.
@@ -1215,11 +1673,22 @@ impl LinuxTrayManager {
 
     /// Start the worker thread that owns the D-Bus connection, returning the
     /// shutdown sender whose drop tells the worker to tear down.
+    ///
+    /// This blocks until the worker reports readiness: spawned is not
+    /// registered, and handing back a fully capable icon whose worker died at
+    /// `Connection::session()` is exactly the dishonest success the readiness
+    /// handshake exists to prevent.
+    ///
+    /// The readiness verdict travels back with the sender: `Ok(None)` - live
+    /// and healthy; `Ok(Some(reason))` - live but degraded, with the reason to
+    /// record on the icon before it reaches the host; `Err` - no icon to hand
+    /// over at all.
     fn spawn_worker(
         shared: Arc<Mutex<TrayShared>>,
         bus_name: String,
-    ) -> Result<std::sync::mpsc::Sender<()>, UdaError> {
+    ) -> Result<(std::sync::mpsc::Sender<()>, Option<String>), UdaError> {
         let revision = Arc::new(Mutex::new(0u32));
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = Worker {
             bus_name,
@@ -1229,18 +1698,56 @@ impl LinuxTrayManager {
             // endpoint: dropping it closes the channel, and `try_recv` then
             // reports a disconnect, which the worker treats as "shut down".
             commands: receiver,
+            ready: Some(ready_sender),
+            last_menu: None,
         };
 
         std::thread::Builder::new()
             .name("uda-tray-worker".to_string())
-            .spawn(move || {
-                worker.run();
-            })
+            .spawn(move || worker.run())
             .map_err(|error| {
                 UdaError::Internal(format!("could not spawn the tray worker: {error}"))
             })?;
 
-        Ok(sender)
+        // Returning `Err` here drops the shutdown sender, which disconnects the
+        // command channel and stops a worker that is still coming up; the icon
+        // handle the caller built is dropped with the failed `create`.
+        let degraded = readiness_outcome(ready_receiver.recv_timeout(READY_TIMEOUT))?;
+        Ok((sender, degraded))
+    }
+}
+
+/// Translate a readiness report into what [`LinuxTrayManager::create`] must
+/// act on: `Ok(None)` - ready; `Ok(Some(reason))` - live but degraded with the
+/// reason to surface to the host; `Err` - the item never made it onto the bus
+/// and there is no icon to hand over.
+///
+/// A degraded worker is not an error: the item answers on the bus, only its
+/// discoverability is reduced. The reason is therefore *returned* rather than
+/// dropped, so `create` can record it on the icon and `support_level` can
+/// relay it - a degradation that only ever reaches `log::warn!` is invisible
+/// to a host that embeds this library.
+fn readiness_outcome(
+    report: Result<WorkerReady, std::sync::mpsc::RecvTimeoutError>,
+) -> Result<Option<String>, UdaError> {
+    match report {
+        Ok(WorkerReady::Ready) => Ok(None),
+        Ok(WorkerReady::Degraded(reason)) => {
+            log::warn!("tray item is live but degraded: {reason}");
+            Ok(Some(reason))
+        }
+        // The worker could not put the item on the bus. There is no fallback
+        // tier for a tray, so this is the graceful tier-4 error, carrying the
+        // reason verbatim.
+        Ok(WorkerReady::Failed(reason)) => Err(UdaError::NotSupported(format!(
+            "system tray is unavailable: {reason}"
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(UdaError::Internal(format!(
+            "the tray worker did not report readiness within {READY_TIMEOUT:?}"
+        ))),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(UdaError::Internal(
+            "the tray worker exited before reporting readiness".to_string(),
+        )),
     }
 }
 
@@ -1281,9 +1788,20 @@ impl TrayManager for LinuxTrayManager {
         let shared = Arc::new(Mutex::new(shared_state));
         let bus_name = Self::bus_name(&config.name);
 
-        let shutdown = Self::spawn_worker(Arc::clone(&shared), bus_name)?;
+        // Blocks until the worker has exported the item on the session bus, so
+        // the capabilities published below describe a live icon, never a dead
+        // one. On failure this returns before any capability is published. A
+        // degradation travels back with the readiness verdict.
+        let (shutdown, degraded) = Self::spawn_worker(Arc::clone(&shared), bus_name)?;
 
         inner.set_capabilities(Self::advertised_capabilities());
+        // The handshake has completed by now, so the degradation - if any - is
+        // already decided: a host can never observe the icon claiming `Full`
+        // while the worker's verdict is still in flight.
+        inner.set_degraded(degraded);
+        // Remember the icon weakly, so this manager's `support_level` can
+        // relay the recorded degradation for as long as the icon lives.
+        self.remember(&inner);
 
         // The sender is deliberately leaked: dropping it would shut the worker
         // down immediately. The worker exits on its own once the host drops the
@@ -1302,6 +1820,19 @@ impl TrayManager for LinuxTrayManager {
         if !capabilities.contains(Capability::SYSTEM_TRAY) {
             return SupportLevel::None;
         }
+        // `TrayFeature` has no separate "will the shell display it" question:
+        // `Icon` is where shell-side visibility is answered. A watcher-less
+        // registration does not change what the code can do - the item stays
+        // exported and serviceable (`tray_specs.md` §1.6) - it degrades
+        // whether the shell will ever show the icon, and that is session state
+        // the static capability set cannot know. The manager therefore relays
+        // the degradation an icon it created has recorded; a manager that
+        // created no icon answers statically, exactly as before.
+        if feature == TrayFeature::Icon {
+            if let Some(reason) = self.recorded_degradation() {
+                return SupportLevel::Partial(reason);
+            }
+        }
         let flag = match feature {
             TrayFeature::Icon => Capability::TRAY_ICON,
             TrayFeature::Tooltip => Capability::TRAY_TOOLTIP,
@@ -1311,11 +1842,23 @@ impl TrayManager for LinuxTrayManager {
             TrayFeature::Checkbox => Capability::TRAY_CHECKBOX,
             TrayFeature::DynamicMenu => Capability::TRAY_DYNAMIC_MENU,
         };
-        // An unclaimed flag is a plain `None`: a backend either answers for a
-        // feature or does not, and `Partial` stays reserved for a backend that
-        // publishes a degraded answer explicitly, stated with its reason.
+        // An unclaimed flag is a plain `None`, with one exception below: a
+        // backend either answers for a feature or does not, and `Partial` is
+        // reserved for a degraded answer stated with its reason.
         if capabilities.contains(flag) {
             SupportLevel::Full
+        } else if feature == TrayFeature::DoubleClick {
+            // SNI has no native double-click signal, but two `Activate` calls
+            // inside the window *are* synthesised into one event. That is a
+            // real, degraded answer, so it is reported with its reason instead
+            // of as a plain `None`; the bit stays unadvertised because it is
+            // not a native capability. The window is read from the constant the
+            // synthesis actually uses, so the reason cannot drift from it.
+            SupportLevel::Partial(format!(
+                "double click is synthesised from two Activations inside a \
+                 {} ms window; SNI has no native double click",
+                DOUBLE_CLICK_WINDOW.as_millis()
+            ))
         } else {
             SupportLevel::None
         }
@@ -1486,13 +2029,16 @@ mod tests {
         menu
     }
 
+    /// Snapshot a menu with a throw-away id map, for tests that do not care
+    /// about id stability across snapshots.
+    fn snapshot_of(menu: &Arc<uda_core::tray::TrayMenu>) -> MenuSnapshot {
+        MenuSnapshot::from_menu(Some(menu), &mut MenuIdMap::new()).expect("a menu must snapshot")
+    }
+
     #[test]
     fn menu_rows_carry_the_documented_properties() {
         let menu = sample_menu();
-        let snapshot = match MenuSnapshot::from_menu(Some(&menu)) {
-            Some(snapshot) => snapshot,
-            None => panic!("a menu must snapshot"),
-        };
+        let snapshot = snapshot_of(&menu);
         assert_eq!(snapshot.rows.len(), 5);
 
         let text = &snapshot.rows[0];
@@ -1500,7 +2046,7 @@ mod tests {
         assert_eq!(text.label.as_deref(), Some("open"));
         assert!(text.enabled);
         assert!(!text.checkbox);
-        let props = row_properties(text);
+        let props = text.properties();
         assert_eq!(
             props.get("type").and_then(|v| <&str>::try_from(v).ok()),
             Some("standard")
@@ -1518,7 +2064,7 @@ mod tests {
         let checkbox = &snapshot.rows[2];
         assert!(checkbox.checkbox);
         assert!(checkbox.checked);
-        let props = row_properties(checkbox);
+        let props = checkbox.properties();
         assert_eq!(
             props
                 .get("toggle-type")
@@ -1535,7 +2081,8 @@ mod tests {
         let locked = &snapshot.rows[3];
         assert!(!locked.enabled);
         assert_eq!(
-            row_properties(locked)
+            locked
+                .properties()
                 .get("enabled")
                 .and_then(|v| <bool>::try_from(v).ok()),
             Some(false)
@@ -1545,7 +2092,8 @@ mod tests {
         assert_eq!(submenu.children.len(), 1);
         // A submenu is encoded through `children-display`, not `toggle-type`.
         assert_eq!(
-            row_properties(submenu)
+            submenu
+                .properties()
                 .get("children-display")
                 .and_then(|v| <&str>::try_from(v).ok()),
             Some("submenu")
@@ -1553,23 +2101,76 @@ mod tests {
     }
 
     #[test]
-    fn dbusmenu_ids_are_allocated_contiguously() {
+    fn fresh_ids_are_allocated_in_traversal_order() {
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
+        let snapshot = snapshot_of(&menu);
         // Top-level ids come first, then the nested child.
         let submenu = &snapshot.rows[4];
         assert_eq!(submenu.id, 5);
         assert_eq!(submenu.children[0].id, 6);
         assert_eq!(submenu.children[0].label.as_deref(), Some("inner"));
 
-        // Every id in the tree is unique, which is what lets an `Event` address
-        // exactly one row.
+        // On a fresh map the first allocation is contiguous from 1 and every id
+        // in the tree is unique, which is what lets an `Event` address exactly
+        // one row. After edits, stability wins over contiguity (see the
+        // stability test below).
         let mut ids = Vec::new();
         collect_ids(&snapshot.rows, &mut ids);
-        ids.sort_unstable();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (1..=6).collect::<Vec<i32>>());
         let before = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), before, "duplicate dbusmenu id allocated");
+    }
+
+    #[test]
+    fn dbusmenu_ids_are_stable_across_menu_mutations() {
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        let separator = menu.push(MenuItem::separator()).expect("push");
+        assert!(menu.push(MenuItem::text("open")).is_ok());
+        assert!(menu.push(MenuItem::text("quit")).is_ok());
+
+        let mut ids = MenuIdMap::new();
+        let first = MenuSnapshot::from_menu(Some(&menu), &mut ids).expect("a menu must snapshot");
+        let open_id = first.rows[1].id;
+        let quit_id = first.rows[2].id;
+        let separator_id = first.rows[0].id;
+
+        // Insert a row above "open" and drop the separator: neither "open" nor
+        // "quit" may be reallocated to a different dbusmenu id, or the shell's
+        // cached ids would fire the wrong rows (P1-18).
+        assert!(menu.insert(0, MenuItem::text("new")).is_ok());
+        assert!(menu.remove(separator));
+        let second = MenuSnapshot::from_menu(Some(&menu), &mut ids).expect("a menu must snapshot");
+
+        let relocated_open = second
+            .rows
+            .iter()
+            .find(|row| row.label.as_deref() == Some("open"))
+            .expect("open survives");
+        let relocated_quit = second
+            .rows
+            .iter()
+            .find(|row| row.label.as_deref() == Some("quit"))
+            .expect("quit survives");
+        assert_eq!(relocated_open.id, open_id);
+        assert_eq!(relocated_quit.id, quit_id);
+
+        // The fresh row got a fresh id: the retired separator id is never
+        // reused, so a shell that still caches it cannot trigger this row.
+        let fresh = &second.rows[0];
+        assert_eq!(fresh.label.as_deref(), Some("new"));
+        assert_ne!(fresh.id, separator_id);
+        assert!(fresh.id > open_id && fresh.id > quit_id && fresh.id > separator_id);
+
+        // The pruned map holds no stale rows and still has no duplicates.
+        let mut all = Vec::new();
+        collect_ids(&second.rows, &mut all);
+        all.sort_unstable();
+        let unique = all.len();
+        all.dedup();
+        assert_eq!(all.len(), unique);
     }
 
     fn collect_ids(rows: &[MenuRow], out: &mut Vec<i32>) {
@@ -1589,7 +2190,7 @@ mod tests {
             }))
             .is_ok());
 
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
+        let snapshot = snapshot_of(&menu);
         let id = snapshot.rows[0].id;
         let action = snapshot.row(id).and_then(|row| row.action.clone());
         let action = match action {
@@ -1608,8 +2209,8 @@ mod tests {
         use zvariant::Type;
         assert_eq!(MenuNode::signature().as_str(), "(ia{sv}av)");
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("menu");
-        let root = snapshot.root_node(true).expect("root");
+        let snapshot = snapshot_of(&menu);
+        let root = snapshot.root_node(-1).expect("root");
         for child in &root.2 {
             assert_eq!(child.value_signature().as_str(), "(ia{sv}av)");
         }
@@ -1639,7 +2240,17 @@ mod tests {
         let shared = Arc::new(Mutex::new(TrayShared::from_config(&TrayIconConfig::new(
             "LayoutTransportTest",
         ))));
-        let server = zbus::Connection::session().await?;
+        // The guard is the connection attempt itself, not an env-var guess, so
+        // it can only skip when no bus can be reached at all; every assertion
+        // below runs strictly after transport is proven to work and therefore
+        // still fails loudly when it should.
+        let server = match zbus::Connection::session().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                println!("skipping: no session bus on this host ({error})");
+                return Ok(());
+            }
+        };
         server
             .object_server()
             .at(
@@ -1723,6 +2334,10 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         }))?;
         lock_or_recover(&shared, "test menu").menu = Some(menu);
+
+        // The swapped-in menu has never been seen by the stable id map, so the
+        // id from the *previous* layout stays retired and must not fire: a
+        // click on the stale id 1 lands on no row at all.
         tokio::time::timeout(
             Duration::from_secs(3),
             client.call_method(
@@ -1734,30 +2349,223 @@ mod tests {
             ),
         )
         .await??;
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+
+        // A shell re-reads the layout after the change and clicks the id that
+        // read hands out - reading is also what re-keys the id map to the new
+        // menu, so this is exactly the id a real client would use.
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                menu_path.as_str(),
+                Some("com.canonical.dbusmenu"),
+                "GetLayout",
+                &(0i32, 1i32, Vec::<String>::new()),
+            ),
+        )
+        .await??;
+        let (_revision, root): (u32, WireNode) = reply.body().deserialize()?;
+        assert_eq!(root.2.len(), 1);
+        let open_id = WireNode::try_from(root.2[0].try_clone()?)?.0;
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            client.call_method(
+                Some(destination.as_str()),
+                menu_path.as_str(),
+                Some("com.canonical.dbusmenu"),
+                "Event",
+                &(open_id, "clicked", zvariant::Value::new(0i32), 0u32),
+            ),
+        )
+        .await??;
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Run inside `dbus-run-session`; skipped on hosts without a session bus.
+    ///
+    /// Pins the wire shape of the tooltip announcement: zbus derives the signal
+    /// member from the Rust method name, so the SNI-mandated `NewToolTip` only
+    /// exists for as long as the method is named `new_tool_tip`, and the spec's
+    /// payload-free form - a host re-reads the `ToolTip` property, a `v` over
+    /// the `(icon name, icon pixmap, title, description)` struct - must reach
+    /// the bus with an empty body.
+    #[tokio::test]
+    async fn the_tool_tip_announcement_reaches_the_bus_as_new_tool_tip(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Same skip rule as `get_layout_survives_session_bus_transport` above:
+        // a missing bus is an environment fact, not a regression, and the
+        // assertions only run once a connection actually exists.
+        let server = match zbus::Connection::session().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                println!("skipping: no session bus on this host ({error})");
+                return Ok(());
+            }
+        };
+        let unique_name = server
+            .unique_name()
+            .ok_or("session connection has no unique name")?
+            .to_string();
+
+        // Subscribe before emitting, or the broadcast could land between the
+        // emit and the match rule taking effect. A second connection plays the
+        // shell: the daemon forwards broadcast signals to every connection
+        // holding a matching rule, which is exactly how a host observes them.
+        let client = zbus::Connection::session().await?;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::MessageType::Signal)
+            .sender(unique_name.as_str())?
+            .interface("org.kde.StatusNotifierItem")?
+            .member("NewToolTip")?
+            .path(SNI_PATH)?
+            .build();
+        let mut stream = zbus::MessageStream::for_match_rule(rule, &client, None).await?;
+
+        let context = SignalContext::from_parts(
+            server.clone(),
+            zvariant::ObjectPath::from_static_str_unchecked(SNI_PATH),
+        );
+        StatusNotifierItemInterface::new_tool_tip(&context).await?;
+
+        // `MessageStream` is only a `Stream`; zbus re-exports the extension
+        // traits it itself uses, so no extra dependency is pulled in here.
+        use zbus::export::futures_util::StreamExt;
+        let received = tokio::time::timeout(Duration::from_secs(3), stream.next())
+            .await
+            .map_err(|_| "the NewToolTip signal did not arrive in time")?
+            .ok_or("the signal stream ended unexpectedly")??;
+
+        let header = received.header();
+        assert_eq!(header.message_type(), zbus::MessageType::Signal);
+        assert_eq!(
+            header.member().map(|member| member.as_str()),
+            Some("NewToolTip"),
+            "the wire member must keep the SNI spelling"
+        );
+        assert_eq!(
+            header.interface().map(|interface| interface.as_str()),
+            Some("org.kde.StatusNotifierItem")
+        );
+        assert_eq!(header.path().map(|path| path.as_str()), Some(SNI_PATH));
+        // No payload on the wire: the `v` over the tooltip struct is the
+        // `ToolTip` property a host re-reads, not the signal body.
+        assert_eq!(received.body().len(), 0);
         Ok(())
     }
 
     #[test]
     fn the_layout_root_carries_id_zero() {
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
-        let root = snapshot.root_node(true).expect("layout encoding");
+        let snapshot = snapshot_of(&menu);
+        let root = snapshot.root_node(-1).expect("layout encoding");
         assert_eq!(root.0, 0, "dbusmenu's root id is 0");
         assert_eq!(root.2.len(), 5);
-        let child = snapshot.root_node(false).expect("layout encoding");
-        // A non-recursive request must still name the children, so the shell can
-        // ask for a submenu on demand.
-        assert_eq!(child.2.len(), 5);
+        // The root carries the standard whole-menu properties, not row props.
+        assert!(root.1.contains_key("Version"));
+        assert!(root.1.contains_key("TextDirection"));
+        assert!(root.1.contains_key("Status"));
     }
 
     #[test]
     fn a_menu_without_rows_still_encodes() {
-        let snapshot = MenuSnapshot::from_menu(Some(&Arc::new(uda_core::tray::TrayMenu::new())))
-            .expect("an empty menu is a valid menu");
+        let snapshot = snapshot_of(&Arc::new(uda_core::tray::TrayMenu::new()));
         assert!(snapshot.rows.is_empty());
-        let root = snapshot.root_node(true).expect("layout encoding");
+        let root = snapshot.root_node(-1).expect("layout encoding");
         assert_eq!(root.2.len(), 0);
+        // Even a bare root answers the standard properties.
+        assert!(root.1.contains_key("Version"));
+    }
+
+    #[test]
+    fn recursion_depth_follows_the_dbusmenu_semantics() {
+        let menu = sample_menu();
+        let snapshot = snapshot_of(&menu);
+        let submenu_node = |parent: &MenuNode| -> MenuNode {
+            MenuNode::try_from(parent.2[4].try_clone().expect("clone variant")).expect("node")
+        };
+
+        // -1: the whole subtree, including the nested row.
+        let deep = snapshot.root_node(-1).expect("layout encoding");
+        assert_eq!(deep.2.len(), 5);
+        assert_eq!(submenu_node(&deep).2.len(), 1, "depth -1 recurses fully");
+
+        // 0: the requested node alone, no children anywhere.
+        let shallow = snapshot.root_node(0).expect("layout encoding");
+        assert!(shallow.2.is_empty(), "depth 0 excludes children");
+
+        // 1: exactly one child level, no grandchildren.
+        let one = snapshot.root_node(1).expect("layout encoding");
+        assert_eq!(one.2.len(), 5);
+        assert!(
+            submenu_node(&one).2.is_empty(),
+            "depth 1 stops after the first level"
+        );
+
+        // 2: two child levels.
+        let two = snapshot.root_node(2).expect("layout encoding");
+        let nested = submenu_node(&two);
+        assert_eq!(nested.2.len(), 1);
+        let leaf =
+            MenuNode::try_from(nested.2[0].try_clone().expect("clone variant")).expect("node");
+        assert!(leaf.2.is_empty(), "depth 2 stops after the second level");
+    }
+
+    #[test]
+    fn a_layout_is_addressed_by_parent_id() {
+        let menu = sample_menu();
+        let snapshot = snapshot_of(&menu);
+        let submenu_id = snapshot.rows[4].id;
+        let inner_id = snapshot.rows[4].children[0].id;
+
+        // A submenu id exports that subtree, not the root.
+        let subtree = match snapshot.layout_node(submenu_id, -1) {
+            Ok(node) => node,
+            Err(error) => panic!("a live row must resolve as a parent: {error:?}"),
+        };
+        assert_eq!(subtree.0, submenu_id);
+        assert_eq!(subtree.2.len(), 1);
+        let inner =
+            MenuNode::try_from(subtree.2[0].try_clone().expect("clone variant")).expect("node");
+        assert_eq!(inner.0, inner_id);
+
+        // A leaf with depth 0 exports itself alone.
+        let alone = match snapshot.layout_node(inner_id, 0) {
+            Ok(node) => node,
+            Err(error) => panic!("a live row must resolve as a parent: {error:?}"),
+        };
+        assert_eq!(alone.0, inner_id);
+        assert!(alone.2.is_empty());
+
+        // An unknown parent is a request error, not a silently wrong root.
+        match snapshot.layout_node(9_999, -1) {
+            Err(LayoutRequestError::UnknownParent(id)) => assert_eq!(id, 9_999),
+            other => panic!("expected UnknownParent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_root_answers_the_standard_dbusmenu_properties() {
+        let version = root_property("Version").and_then(|value| u32::try_from(value).ok());
+        assert_eq!(version, Some(3), "the dbusmenu protocol version is 3");
+        let direction =
+            root_property("TextDirection").and_then(|value| String::try_from(value).ok());
+        assert_eq!(direction.as_deref(), Some("ltr"));
+        let status = root_property("Status").and_then(|value| String::try_from(value).ok());
+        assert_eq!(status.as_deref(), Some("normal"));
+
+        // The root is not a row: it answers no row property at all.
+        assert!(root_property("label").is_none());
+        assert!(root_property("toggle-state").is_none());
+
+        // GetGroupProperties filters the root like any other entry.
+        assert_eq!(root_properties_filtered(&["Version"]).len(), 1);
+        let all = root_properties_filtered(&[]);
+        assert!(all.contains_key("Version"));
+        assert!(all.contains_key("TextDirection"));
+        assert!(all.contains_key("Status"));
     }
 
     #[test]
@@ -1825,9 +2633,21 @@ mod tests {
             manager.support_level(TrayFeature::Click),
             SupportLevel::Full
         );
+        // SNI has no native double click, but the synthesis is a real degraded
+        // answer, so it is reported as Partial with a reason, not as None. The
+        // reason names the window the synthesis actually uses.
+        let double_click = manager.support_level(TrayFeature::DoubleClick);
         assert_eq!(
-            manager.support_level(TrayFeature::DoubleClick),
-            SupportLevel::None
+            double_click,
+            SupportLevel::Partial(format!(
+                "double click is synthesised from two Activations inside a \
+                 {} ms window; SNI has no native double click",
+                DOUBLE_CLICK_WINDOW.as_millis()
+            ))
+        );
+        assert!(
+            double_click.reason().is_some(),
+            "a Partial answer must carry its reason"
         );
         assert_eq!(
             manager.capabilities(),
@@ -1886,6 +2706,319 @@ mod tests {
         state.sync_from();
         assert!(state.menu.is_some());
         assert!(state.menu_snapshot().is_some());
+    }
+
+    #[test]
+    fn the_menu_fingerprint_tracks_in_place_mutation() {
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        let untouched = menu_fingerprint(Some(&menu));
+
+        // Different menus with identical content are still different menus.
+        assert_ne!(untouched, menu_fingerprint(None));
+        assert_ne!(
+            untouched,
+            menu_fingerprint(Some(&Arc::new(uda_core::tray::TrayMenu::new())))
+        );
+
+        // A pushed row is a change even though the Arc pointer did not move -
+        // exactly the mutation a pointer comparison is blind to (P1-16).
+        assert!(menu.push(MenuItem::checkbox("pin")).is_ok());
+        let pushed = menu_fingerprint(Some(&menu));
+        assert_ne!(pushed, untouched);
+
+        // An unchanged menu must fingerprint identically, tick after tick.
+        assert_eq!(pushed, menu_fingerprint(Some(&menu)));
+
+        // Toggling the checkbox changes wire-visible state.
+        let (id, _) = menu.find_by_label("pin").expect("row exists");
+        assert!(menu.toggle(id));
+        let toggled = menu_fingerprint(Some(&menu));
+        assert_ne!(toggled, pushed);
+
+        // So does a relabel.
+        assert!(menu.set_label(id, "pinned"));
+        assert_ne!(menu_fingerprint(Some(&menu)), toggled);
+    }
+
+    #[test]
+    fn the_menu_fingerprint_tracks_nested_submenu_mutation() {
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        let child = Arc::new(uda_core::tray::TrayMenu::new());
+        assert!(menu
+            .push(MenuItem::submenu("more", Arc::clone(&child)))
+            .is_ok());
+        let before = menu_fingerprint(Some(&menu));
+
+        // The host mutates the nested menu through its own shared Arc; the
+        // top-level pointer never moves, yet the layout must read as changed.
+        assert!(child.push(MenuItem::text("inner")).is_ok());
+        assert_ne!(menu_fingerprint(Some(&menu)), before);
+    }
+
+    /// A worker wired to throw-away endpoints, for unit-testing the pieces of
+    /// the loop that need no bus.
+    fn test_worker(shared: Arc<Mutex<TrayShared>>) -> Worker {
+        Worker {
+            bus_name: "org.kde.StatusNotifierItem-test".to_string(),
+            shared,
+            revision: Arc::new(Mutex::new(0)),
+            commands: std::sync::mpsc::channel().1,
+            ready: None,
+            last_menu: None,
+        }
+    }
+
+    #[test]
+    fn a_worker_sees_only_real_menu_changes() {
+        let shared = Arc::new(Mutex::new(TrayShared::default()));
+        let menu = Arc::new(uda_core::tray::TrayMenu::new());
+        lock_or_recover(&shared, "test").menu = Some(Arc::clone(&menu));
+        let mut worker = test_worker(Arc::clone(&shared));
+
+        // The first observation announces the layout's existence...
+        assert!(worker.note_menu_fingerprint(menu_fingerprint(Some(&menu))));
+        // ...and an idle tick announces nothing.
+        assert!(!worker.note_menu_fingerprint(menu_fingerprint(Some(&menu))));
+
+        // An in-place mutation through the shared Arc must read as a change.
+        assert!(menu.push(MenuItem::text("row")).is_ok());
+        assert!(worker.note_menu_fingerprint(menu_fingerprint(Some(&menu))));
+    }
+
+    #[test]
+    fn the_revision_advances_monotonically() {
+        let worker = test_worker(Arc::new(Mutex::new(TrayShared::default())));
+        assert_eq!(worker.advance_revision(), 1);
+        assert_eq!(worker.advance_revision(), 2);
+    }
+
+    #[test]
+    fn sync_from_reuses_the_transcode_for_an_unchanged_icon_source() {
+        let inner = Arc::new(uda_core::tray::TrayIconInner::new("test".to_string()));
+        let icon = TrayIcon::from_inner(Arc::clone(&inner));
+        let config = TrayIconConfig {
+            name: "test".to_string(),
+            icon: Some(padded_rgba()),
+            tooltip: "tip".to_string(),
+            menu: None,
+            on_click: None,
+            on_double_click: None,
+        };
+        seed_host_state(&inner, &config);
+        let mut state = TrayShared::from_config(&config);
+        state.host = Some(Arc::clone(&inner));
+
+        // `from_config` already adopted the configured icon, so the first sync
+        // is a no-op, exactly like the worker's idle ticks.
+        assert!(!state.sync_from().icon);
+
+        // The adopted payload is a real transcoded pixmap, not a placeholder.
+        let payload = state.icon.clone();
+        assert!(matches!(payload, IconPayload::Pixmap(_)));
+
+        // An idle tick: the source is unchanged, so nothing is retranscoded and
+        // the delta reports no icon change (P2-38).
+        assert!(!state.sync_from().icon);
+        assert_eq!(state.icon, payload);
+
+        // Re-setting a byte-identical source is also a no-op...
+        icon.set_icon(padded_rgba()).expect("a valid icon");
+        assert!(!state.sync_from().icon);
+
+        // ...while a genuinely different source retranscodes exactly once.
+        icon.set_icon(TrayIconSource::Path("app.png".to_string()))
+            .expect("a valid icon");
+        let delta = state.sync_from();
+        assert!(delta.icon);
+        assert_eq!(state.icon, IconPayload::Name("app.png".to_string()));
+
+        // Tooltip and visibility ride the same delta.
+        icon.set_tooltip("updated");
+        let delta = state.sync_from();
+        assert!(delta.tooltip);
+        assert!(!delta.icon);
+        icon.hide();
+        let delta = state.sync_from();
+        assert!(delta.visible);
+        assert!(!delta.tooltip);
+    }
+
+    #[test]
+    fn a_panicking_click_handler_keeps_receiving_clicks() {
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let shared = Arc::new(Mutex::new(TrayShared {
+            on_click: Some(Box::new(|_| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                if CALLS.load(Ordering::SeqCst) == 1 {
+                    panic!("the first click handler explodes on purpose");
+                }
+            })),
+            ..TrayShared::default()
+        }));
+        let mut item = StatusNotifierItemInterface::new(Arc::clone(&shared));
+
+        item.dispatch_activation();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+        // The handler was put back after the panic: the second click still
+        // reaches host code instead of vanishing (P2-37).
+        item.dispatch_activation();
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_second_click_without_a_double_click_handler_still_reaches_on_click() {
+        static CLICKS: AtomicUsize = AtomicUsize::new(0);
+        let shared = Arc::new(Mutex::new(TrayShared {
+            on_click: Some(Box::new(|_| {
+                CLICKS.fetch_add(1, Ordering::SeqCst);
+            })),
+            ..TrayShared::default()
+        }));
+        let mut item = StatusNotifierItemInterface::new(Arc::clone(&shared));
+
+        item.dispatch_activation();
+        item.dispatch_activation();
+        // The C ABI cannot register on_double_click, so the second activation
+        // inside the window must fall back to the click handler (P1-22).
+        assert_eq!(CLICKS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_failed_readiness_report_surfaces_as_an_error() {
+        // A worker-reported failure means there is no icon to hand over; it
+        // surfaces as the graceful tier-4 error with the reason attached.
+        assert!(matches!(
+            readiness_outcome(Ok(WorkerReady::Failed(
+                "no session bus: refused".to_string()
+            ))),
+            Err(UdaError::NotSupported(_))
+        ));
+        // Timing out is a failure too: the worker never confirmed anything.
+        assert!(readiness_outcome(Err(std::sync::mpsc::RecvTimeoutError::Timeout)).is_err());
+        assert!(
+            readiness_outcome(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)).is_err(),
+            "a worker that died before reporting is an error, not a success"
+        );
+        // Live workers are handed over, degraded or not - but a degraded one
+        // must carry its reason out, or it would be invisible to the host.
+        assert!(
+            readiness_outcome(Ok(WorkerReady::Ready)).is_ok_and(|degraded| degraded.is_none()),
+            "a healthy worker reports no degradation"
+        );
+        assert_eq!(
+            readiness_outcome(Ok(WorkerReady::Degraded("no watcher".to_string())))
+                .expect("a degraded worker is not an error"),
+            Some("no watcher".to_string())
+        );
+    }
+
+    #[test]
+    fn a_recorded_degradation_flips_manager_support_level_to_partial() {
+        let manager = LinuxTrayManager::new();
+        // No icon, no degradation: the static answer stands.
+        assert_eq!(manager.support_level(TrayFeature::Icon), SupportLevel::Full);
+
+        // Inject the state without touching any bus: the manager only reads
+        // what the registration path would have recorded.
+        let inner = Arc::new(uda_core::tray::TrayIconInner::new("degraded".to_string()));
+        manager.remember(&inner);
+        assert_eq!(
+            manager.support_level(TrayFeature::Icon),
+            SupportLevel::Full,
+            "a remembered icon without a degradation answers statically"
+        );
+
+        inner.set_degraded(Some(
+            "no StatusNotifierWatcher is reachable on the session bus".to_string(),
+        ));
+        assert_eq!(
+            manager.support_level(TrayFeature::Icon),
+            SupportLevel::Partial(
+                "no StatusNotifierWatcher is reachable on the session bus".to_string()
+            )
+        );
+        // The degradation is about shell-side visibility only: the other
+        // features keep their static answers.
+        assert_eq!(
+            manager.support_level(TrayFeature::Tooltip),
+            SupportLevel::Full
+        );
+        assert!(
+            manager
+                .support_level(TrayFeature::DoubleClick)
+                .reason()
+                .is_some(),
+            "the synthesised double click keeps its own Partial reason"
+        );
+
+        // Dropping the icon must return the answer to the static one: the
+        // manager holds the icon weakly, so a gone icon cannot haunt the query.
+        drop(inner);
+        assert_eq!(manager.support_level(TrayFeature::Icon), SupportLevel::Full);
+    }
+
+    #[test]
+    fn a_watcherless_session_records_the_degradation_on_the_created_icon() {
+        // This is the transport-level half of the story: on the mock harness's
+        // isolated bus (test-linux-mock.sh runs the suite inside
+        // dbus-run-session) no StatusNotifierWatcher exists, so `create` takes
+        // the degraded path deterministically. A real desktop session usually
+        // owns the watcher name - and a host with no session bus at all fails
+        // `create` for a different reason entirely - so the test stands down
+        // in both cases instead of failing for the wrong environment.
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            log::debug!("no session bus; the watcher-less transport test is skipped");
+            return;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::debug!("no test runtime: {error}");
+                return;
+            }
+        };
+        let watcher_absent = runtime.block_on(async {
+            let Ok(connection) = Connection::session().await else {
+                return None;
+            };
+            let Ok(proxy) = zbus::Proxy::new(
+                &connection,
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+            )
+            .await
+            else {
+                return None;
+            };
+            let owned: Result<bool, _> = proxy.call("NameHasOwner", &WATCHER_SERVICE).await;
+            owned.ok().map(|owned| !owned)
+        });
+        if watcher_absent != Some(true) {
+            log::debug!("a watcher owns the tray name; the transport test is skipped");
+            return;
+        }
+
+        let manager = LinuxTrayManager::new();
+        let icon = manager
+            .create(TrayIconConfig::new("uda-tray-degraded-probe"))
+            .expect("the item must register even without a watcher");
+        match icon.support_level(TrayFeature::Icon) {
+            SupportLevel::Partial(reason) => {
+                assert!(
+                    !reason.trim().is_empty(),
+                    "a degradation must carry a readable reason"
+                );
+                assert!(
+                    reason.contains("StatusNotifierWatcher"),
+                    "the reason must name what is missing: {reason}"
+                );
+            }
+            other => panic!("a watcher-less session must degrade the icon, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1974,8 +3107,8 @@ mod tests {
     #[test]
     fn the_owned_properties_round_trip_through_a_variant() {
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
-        let props = owned_props(row_properties(&snapshot.rows[0]));
+        let snapshot = snapshot_of(&menu);
+        let props = owned_props(snapshot.rows[0].properties());
         // `OwnedValue` must be reconstructible from its inner value.
         // `OwnedValue` converts by value, so the owned clone is handed over
         // rather than a borrow.
@@ -1988,7 +3121,7 @@ mod tests {
     #[test]
     fn group_properties_filters_to_the_requested_names() {
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
+        let snapshot = snapshot_of(&menu);
         let all = snapshot.group_properties(&[1, 2], &[]);
         assert_eq!(all.len(), 2);
         assert!(all[0].1.contains_key("label"));
@@ -2006,7 +3139,7 @@ mod tests {
     #[test]
     fn a_single_property_read_is_reported_absent_when_unknown() {
         let menu = sample_menu();
-        let snapshot = MenuSnapshot::from_menu(Some(&menu)).expect("a menu must snapshot");
+        let snapshot = snapshot_of(&menu);
         let label = snapshot
             .property(1, "label")
             .and_then(|v| String::try_from(v).ok());
@@ -2017,7 +3150,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_without_a_menu_is_none() {
-        assert!(MenuSnapshot::from_menu(None).is_none());
+        assert!(MenuSnapshot::from_menu(None, &mut MenuIdMap::new()).is_none());
     }
 
     #[test]

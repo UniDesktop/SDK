@@ -11,7 +11,9 @@
  *     uda.dispose();
  *
  * 调用方看不到 `koffi.alloc` 出参槽、`BigInt` 句柄或十六进制状态码：指针槽位分配、
- * 字符串内存释放、函数指针保活全部封装在本模块内，失败时抛出带诊断消息的 `Error`。
+ * 字符串内存释放、函数指针保活全部封装在本模块内，失败时抛出携带状态码与诊断
+ * 消息的 `UdaError` —— 与 Python SDK（`examples/python/uda.py`）的异常语义一致，
+ * 宿主可按 `err.status` 分流（-1 参数错 / -2 不支持 / -5 内部错等）。
  *
  * `createTrayIcon()` 接受 `.png` 文件路径，SDK 内部读文件、解码成 RGBA、降采样后
  * 提交 —— Linux 的 `StatusNotifierItem` 把 `Path` 当作 freedesktop 图标主题名而不是
@@ -19,8 +21,8 @@
  *
  * 依赖仅 `koffi`（零编译 C-ABI 绑定库）；PNG 解码用 Node 内置 `zlib`。
  *
- * 动态库定位顺序：`UDA_LIBRARY` 环境变量 > `cargo metadata` 报告的 target 目录 >
- * 仓库内常见构建目录 > 系统动态库搜索路径。
+ * 动态库定位顺序：`new Uda(libraryPath)` 的显式路径 > `UDA_LIBRARY` 环境变量 >
+ * `cargo metadata` 报告的 target 目录 > 仓库内常见构建目录 > 系统动态库搜索路径。
  */
 
 'use strict';
@@ -29,6 +31,45 @@ const fs = require('node:fs');
 const path = require('node:path');
 const zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
+
+// ---------------------------------------------------------------------------
+// C-ABI 状态码与错误类型（与 include/uda.h 及 Python SDK 保持一致）
+// ---------------------------------------------------------------------------
+
+/** 调用成功。 */
+const OK = 0;
+/** 空指针、非法 UTF-8 或未知枚举值。 */
+const ERR_INVALID_ARGUMENT = -1;
+/** 当前平台或会话不支持该特性。 */
+const ERR_NOT_SUPPORTED = -2;
+/** 环境检测失败。 */
+const ERR_DETECTION_FAILED = -3;
+/** I/O 错误。 */
+const ERR_IO = -4;
+/** 内部错误。 */
+const ERR_INTERNAL = -5;
+/** panic 在 FFI 边界被捕获（正常不应出现）。 */
+const ERR_PANIC = -6;
+
+/**
+ * UDA 调用失败时抛出，携带状态码与诊断消息。
+ *
+ * 与 Python SDK（`examples/python/uda.py` 的 `UdaError(status, message)`）字段
+ * 语义一致：`status` 是上方 `ERR_*` 之一的 C-ABI 状态码，`message` 是诊断消息
+ * 本身（不含状态码前缀，对应 Python 的 `.message` 字段）。宿主按 `err.status`
+ * 分流，例如把 -2 渲染成"当前环境不支持"、-1 归为调用方参数错。
+ */
+class UdaError extends Error {
+  /**
+   * @param {number} status C-ABI 状态码，与 `include/uda.h` 的 UDA_ERR_* 一致。
+   * @param {string} message 诊断消息。
+   */
+  constructor(status, message) {
+    super(message);
+    this.name = 'UdaError';
+    this.status = status;
+  }
+}
 
 /** 主题名映射：C 状态码 -> SDK 字符串。 */
 const THEME_NAMES = { 0: 'unknown', 1: 'dark', 2: 'light' };
@@ -86,6 +127,17 @@ const WINDOWS_TARGET_TRIPLES = [
   'aarch64-pc-windows-msvc',
 ];
 
+/**
+ * 各平台 cargo 产物名（与 python 绑定的 `_LIBRARY_FILENAME_BY_PLATFORM` 一致）。
+ * 漏掉 darwin 的 `.dylib` 会让文档承诺的 `cargo build && node 07_session.js`
+ * 在 macOS 上直接加载失败；未列出的平台回落到 `libuda_ffi.so`。
+ */
+const LIBRARY_FILENAME_BY_PLATFORM = {
+  linux: 'libuda_ffi.so',
+  darwin: 'libuda_ffi.dylib',
+  win32: 'uda_ffi.dll',
+};
+
 // ---------------------------------------------------------------------------
 // 动态库定位与加载（内部）
 // ---------------------------------------------------------------------------
@@ -116,7 +168,7 @@ function candidateLibraries() {
 
   // 本文件位于 <repo>/examples/nodejs/，向上两级即仓库根目录。
   const repoRoot = path.resolve(__dirname, '..', '..');
-  const libName = process.platform === 'win32' ? 'uda_ffi.dll' : 'libuda_ffi.so';
+  const libName = LIBRARY_FILENAME_BY_PLATFORM[process.platform] ?? 'libuda_ffi.so';
 
   const cargoTarget = queryCargoTargetDirectory(repoRoot);
   const targetRoots = new Set();
@@ -143,44 +195,62 @@ function candidateLibraries() {
 /**
  * 加载 UDA 动态库并声明全部函数原型。
  *
- * @throws {Error} 当 koffi 未安装或找不到动态库时。
+ * @param {string} [libraryPath] 显式指定的动态库路径；省略时按默认候选顺序查找。
+ * @throws {UdaError} 当 koffi 未安装、指定路径加载失败或所有候选都不可用时
+ *   （状态码 `ERR_NOT_SUPPORTED`，与 Python 侧加载失败同码）。
  */
-function loadUda() {
+function loadUda(libraryPath) {
   let koffi;
   try {
     koffi = require('koffi');
   } catch {
-    throw new Error('未找到 koffi 依赖，请先执行 `npm install koffi`（koffi 为零编译 C-ABI 绑定库）');
-  }
-
-  let library = null;
-  const failures = [];
-
-  for (const candidate of candidateLibraries()) {
-    // 带路径分隔符的候选必须真实存在；裸库名交给 koffi 自行搜索。
-    const hasSeparator = candidate.includes('/') || candidate.includes('\\');
-    if (hasSeparator && !fs.existsSync(candidate)) {
-      failures.push(`${candidate}: 文件不存在`);
-      continue;
-    }
-    try {
-      library = koffi.load(candidate);
-      break;
-    } catch (error) {
-      failures.push(`${candidate}: ${error.message}`);
-    }
-  }
-
-  if (!library) {
-    throw new Error(
-      '无法加载 libuda_ffi；请先在仓库根目录执行 `cargo build -p uda-ffi`，' +
-        `或设置 UDA_LIBRARY 指向动态库。已尝试：${failures.join('; ')}`
+    throw new UdaError(
+      ERR_NOT_SUPPORTED,
+      '未找到 koffi 依赖，请先执行 `npm install koffi`（koffi 为零编译 C-ABI 绑定库）'
     );
   }
 
-  // 出参槽位：koffi 3.x 需要用 `alloc` 分配一块可写内存，调用后再 `decode` 读回。
+  let library = null;
+
+  if (libraryPath) {
+    // 显式路径必须一次成功：失败时直接报错而不是静默回落到候选搜索，
+    // 避免加载到与调用方意图不符的另一个动态库副本。
+    try {
+      library = koffi.load(libraryPath);
+    } catch (error) {
+      throw new UdaError(ERR_NOT_SUPPORTED, `无法加载指定的动态库 ${libraryPath}: ${error.message}`);
+    }
+  } else {
+    const failures = [];
+    for (const candidate of candidateLibraries()) {
+      // 带路径分隔符的候选必须真实存在；裸库名交给 koffi 自行搜索。
+      const hasSeparator = candidate.includes('/') || candidate.includes('\\');
+      if (hasSeparator && !fs.existsSync(candidate)) {
+        failures.push(`${candidate}: 文件不存在`);
+        continue;
+      }
+      try {
+        library = koffi.load(candidate);
+        break;
+      } catch (error) {
+        failures.push(`${candidate}: ${error.message}`);
+      }
+    }
+
+    if (!library) {
+      throw new UdaError(
+        ERR_NOT_SUPPORTED,
+        '无法加载 libuda_ffi；请先在仓库根目录执行 `cargo build -p uda-ffi`，' +
+          `或设置 UDA_LIBRARY 指向动态库。已尝试：${failures.join('; ')}`
+      );
+    }
+  }
+
+  // 出参槽位：koffi（本仓库锁定 2.x，实测 2.16.3）需要用 `alloc` 分配一块可写
+  // 内存，调用后再 `decode` 读回。省略 `length` 时按类型自身的宽度解码；长度为
+  // -1 表示读一个 NUL 结尾的 `char` 序列（解码裸字符串地址用，见 _lastErrorMessage）。
   const outSlot = (type) => koffi.alloc(type, 1);
-  const readSlot = (type, address) => koffi.decode(address, type);
+  const readSlot = (type, address, length) => koffi.decode(address, type, length);
 
   // 回调函数指针原型。koffi.proto() 注册的是全局命名类型，因此名字必须唯一。
   const TEXT_CALLBACK_TYPE = koffi.pointer(
@@ -202,7 +272,10 @@ function loadUda() {
         slot
       ),
     wakelockRelease: library.func('uda_wakelock_release', 'int32', ['uint64']),
-    lastErrorMessage: library.func('uda_last_error_message', 'char *', []),
+    // 返回 `void *` 而不是 `char *`：koffi 会把 `char *` 返回值直接解成 JS 字符串，
+    // 地址随之丢失，这次调用新分配的字符串就再也无法交给 uda_free_string 归还
+    // （见 _lastErrorMessage）。
+    lastErrorMessage: library.func('uda_last_error_message', 'void *', []),
     statusMessage: library.func('uda_status_message', 'const char *', ['int32']),
     // `uda_notify(app_name, title, body, icon, actions, out_id)`：app_name 是
     // Windows 的 toast 身份（AppUserModelID），未打包进程靠它才能弹 toast。
@@ -294,6 +367,11 @@ function loadUda() {
 
 // ---------------------------------------------------------------------------
 // PNG 解码（纯 Node 内置 zlib，无第三方依赖）
+//
+// 本节的抛错刻意**不**用 `UdaError`：解码发生在进入 FFI 之前，不携带任何
+// C-ABI 状态码，与 Python SDK 的独立 `PngError`（`examples/python/_png.py`）
+// 同类。宿主用 `err instanceof UdaError` 即可把"库调用失败"与本节的"图片
+// 文件本身有问题"区分开。
 // ---------------------------------------------------------------------------
 
 /** PNG 文件签名。 */
@@ -553,9 +631,9 @@ function loadIconRgba(filePath, maxExtent) {
 class Uda {
   /** @param {string} [libraryPath] 显式指定动态库路径；省略时按默认顺序查找。 */
   constructor(libraryPath) {
-    const loaded = libraryPath
-      ? loadUda(require('koffi').load(libraryPath))
-      : loadUda();
+    // 显式路径由 loadUda 优先尝试；koffi 依赖缺失等加载错误也统一在那里抛出，
+    // 这里不再直接 require('koffi')（裸 MODULE_NOT_FOUND 对调用方没有诊断价值）。
+    const loaded = loadUda(libraryPath);
 
     this._koffi = loaded.koffi;
     this._lib = loaded.lib;
@@ -576,19 +654,41 @@ class Uda {
 
   /** @returns {string} 线程本地的最新失败原因的诊断消息。 */
   _lastErrorMessage(action) {
-    const message = this._lib.lastErrorMessage();
-    if (message) {
-      return String(message);
+    // 该导出返回调用方所有的字符串，且调用本身会消费消息，所以只能调一次：
+    // `pointer` 已是字符数据的地址，按 `char` + 长度 -1（读到 NUL 为止）原地解码
+    // 后立刻 `uda_free_string` 归还。不能照搬壁纸出参的两次解码（那解的是
+    // `char **` 槽位）——把 `pointer` 再按 `char *` 解一次等于把首字符当指针读，
+    // 会直接崩溃；也不能调两次导出，第二次只会拿到 NULL（消息已被消费）。
+    // 解码失败也必须归还，因此 free 放进 finally（与 Python 侧同一纪律）。
+    const pointer = this._lib.lastErrorMessage();
+    if (pointer) {
+      try {
+        const message = String(this._lib.readSlot('char', pointer, -1));
+        if (message) {
+          return message;
+        }
+      } finally {
+        this._lib.freeString(pointer);
+      }
     }
     return `${action} 失败`;
   }
 
-  /** 状态码非 0 时抛出带诊断的异常。 */
+  /**
+   * 状态码非 0 时抛出携带状态码与诊断的 `UdaError`。
+   *
+   * 与 Python 侧 `_check` 同一语义：宿主可按 `error.status` 分流，例如
+   * -2（不支持）降级隐藏入口、-1（参数错）记为调用方 bug。
+   *
+   * @param {number} status C 导出返回的状态码。
+   * @param {string} action 动作名，仅在库未记录诊断消息时用于兜底文案。
+   * @throws {UdaError} 状态码非 0。
+   */
   _check(status, action) {
-    if (status === 0) {
+    if (status === OK) {
       return;
     }
-    throw new Error(this._lastErrorMessage(action));
+    throw new UdaError(status, this._lastErrorMessage(action));
   }
 
   /** @returns {'dark' | 'light' | 'unknown'} 系统深浅色。 */
@@ -644,7 +744,11 @@ class Uda {
   setWallpaper(wallpaperPath, fillMode = 'fill') {
     const code = FILL_CODES[fillMode];
     if (code === undefined) {
-      throw new Error(`未知填充模式 ${fillMode}；可选：${Object.keys(FILL_CODES).join(', ')}`);
+      // 与 Python 侧一致：本地参数校验失败用状态码 -1 抛 UdaError。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
+        `未知填充模式 ${fillMode}；可选：${Object.keys(FILL_CODES).join(', ')}`
+      );
     }
     this._check(this._lib.setWallpaper(wallpaperPath, code), `set_wallpaper(${wallpaperPath})`);
   }
@@ -652,31 +756,27 @@ class Uda {
   /**
    * 读取壁纸路径，并释放在 C 侧分配的缓冲区。
    *
-   * koffi 读 `char **out` 需要分两次调用：一次按 `char *` 解出字符串，一次按
-   * `void *` 拿原始地址交给 `uda_free_string` 释放。只按 `void *` 读再手动
-   * `decode` 会直接让进程崩溃（实测结论）。
+   * `uda_get_wallpaper` 只调用**一次**；koffi 读 `char **out` 需要把同一个出参
+   * 槽位按两种类型各解一次：一次按 `char *` 解出字符串，一次按 `void *` 拿原始
+   * 地址交给 `uda_free_string` 释放（与 now_playing 的 readAndFree 同一范式）。
+   * 只按 `void *` 读再手动 `decode` 会直接让进程崩溃（实测结论）；若按两种类型
+   * 各调一次导出，平台查询会执行两遍，且第一次的 CString 永远泄漏。
    *
    * @returns {string | null}
    * @private
    */
   _readWallpaper() {
     const charSlotType = 'char *';
-    const charSlot = this._lib.outSlot(charSlotType);
-    this._check(this._lib.getWallpaper(charSlot), 'get_wallpaper');
-    const text = this._lib.readSlot(charSlotType, charSlot);
-    if (!text) {
-      return null;
-    }
-
     const voidSlotType = 'void *';
-    const voidSlot = this._lib.outSlot(voidSlotType);
-    this._check(this._lib.getWallpaper(voidSlot), 'get_wallpaper (释放用)');
-    const pointer = this._lib.readSlot(voidSlotType, voidSlot);
+    const slot = this._lib.outSlot(charSlotType);
+    this._check(this._lib.getWallpaper(slot), 'get_wallpaper');
+
+    const text = this._lib.readSlot(charSlotType, slot);
+    const pointer = this._lib.readSlot(voidSlotType, slot);
     if (pointer) {
       this._lib.freeString(pointer);
     }
-
-    return String(text);
+    return text ? String(text) : null;
   }
 
   /**
@@ -710,6 +810,10 @@ class Uda {
 
   /**
    * 申请防休眠常亮锁。
+   *
+   * Linux 上若原生 IPC 不可用而走了 CLI 兜底（`systemd-inhibit`），该锁约有
+   * 1 小时的上界：到期由库回收退役，此后 `release()` 会以
+   * UDA_ERR_INVALID_ARGUMENT（-1）失败；需要更久的锁请在到期后重新申请。
    *
    * @returns {WakeLock} 调用 `release()` 释放；退出 `with` 块时自动释放。
    */
@@ -745,14 +849,19 @@ class Uda {
   _acquireLock(type, reason) {
     const code = WAKELOCK_CODES[type];
     if (code === undefined) {
-      throw new Error(`未知常亮锁类型 ${type}；可选：${Object.keys(WAKELOCK_CODES).join(', ')}`);
+      // 与 Python 侧一致：未知类型是参数错（-1）。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
+        `未知常亮锁类型 ${type}；可选：${Object.keys(WAKELOCK_CODES).join(', ')}`
+      );
     }
     const slot = this._lib.outSlot(this._types.uint64);
     this._check(this._lib.wakelockAcquire(code, reason, slot), `wakelock_acquire(${type})`);
 
     const handle = BigInt(this._lib.readSlot(this._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('wakelock_acquire 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'wakelock_acquire 返回了空句柄（违反 ABI 契约）');
     }
     this._locks.push(handle);
     return handle;
@@ -890,12 +999,15 @@ class MediaController {
    * 发送一条播控指令。
    *
    * @param {'play' | 'pause' | 'toggle' | 'next' | 'previous' | 'stop'} command
-   * @throws {Error} 指令名无法识别，或没有播放器可接收、播放器拒绝执行。
+   * @throws {UdaError} 指令名无法识别（-1），或没有播放器可接收、播放器拒绝
+   *   执行（-2）。
    */
   send(command) {
     const code = MEDIA_COMMAND_CODES[command];
     if (code === undefined) {
-      throw new Error(
+      // 与 Python 侧一致：未知指令是参数错（-1）。
+      throw new UdaError(
+        ERR_INVALID_ARGUMENT,
         `未知播控指令 ${command}；可选：${Object.keys(MEDIA_COMMAND_CODES).join(', ')}`
       );
     }
@@ -962,11 +1074,11 @@ class SessionController {
    * `{ lock: true, logout: true, suspend: true, hibernate: false,
    *    reboot: true, shutdown: true }`。
    *
-   * 该查询是**静态且无副作用**的：不会触碰机器的电源状态，因此可以随意调用来
-   * 决定界面上画哪些按钮——也必须在画出“关机”这类按钮之前调用。
+   * 该查询探测一次后缓存且无副作用：不会触碰机器的电源状态，因此可以随意调
+   * 用来决定界面上画哪些按钮——也必须在画出“关机”这类按钮之前调用。
    *
-   * 能力位表达“代码路径存在”，**不是**“当前账户被允许”：关掉休眠的机器依然
-   * `hibernate: true`，真正拒绝发生在调用时。Windows 的 `reboot` / `shutdown`
+   * 能力位表达“查询时有接收方可达”，**不是**“当前账户被允许”：关掉休眠的机
+   * 器依然 `hibernate: true`，真正拒绝发生在调用时。Windows 的 `reboot` / `shutdown`
    * 还需要 `SeShutdownPrivilege`，同样是运行时答案。
    *
    * @returns {{lock: boolean, logout: boolean, suspend: boolean,
@@ -986,7 +1098,7 @@ class SessionController {
    * @param {string} action 动作名：`lock` / `logout` / `suspend` /
    *   `hibernate` / `reboot` / `shutdown`。
    * @returns {boolean} `true` 表示后端存在该动作的代码路径。
-   * @throws {Error} 动作名无法识别时抛出（状态码 -1）。
+   * @throws {UdaError} 动作名无法识别时抛出（状态码 -1）。
    */
   supports(action) {
     const capability = this._capabilityOf(action);
@@ -1006,8 +1118,9 @@ class SessionController {
   _capabilityOf(action) {
     const capability = SESSION_ACTION_CAPABILITY[action];
     if (capability === undefined) {
+      // 与 Python 侧一致：未知动作名是参数错（-1），直接拒绝而不是猜一个。
       const known = Object.keys(SESSION_ACTION_CAPABILITY).join('、');
-      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+      throw new UdaError(ERR_INVALID_ARGUMENT, `未知的会话动作 '${action}'；可用动作：${known}`);
     }
     return capability;
   }
@@ -1020,8 +1133,9 @@ class SessionController {
    */
   _perform(action) {
     if (!SESSION_ACTIONS.includes(action)) {
+      // 与 Python 侧一致：未知动作名是参数错（-1）。
       const known = SESSION_ACTIONS.join('、');
-      throw new Error(`未知的会话动作 '${action}'；可用动作：${known}`);
+      throw new UdaError(ERR_INVALID_ARGUMENT, `未知的会话动作 '${action}'；可用动作：${known}`);
     }
     const entry = this._uda._lib[`session${action[0].toUpperCase()}${action.slice(1)}`];
     this._uda._check(entry(), `session_${action}`);
@@ -1161,7 +1275,8 @@ class TrayMenu {
 
     const handle = BigInt(uda._lib.readSlot(uda._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('uda_tray_menu_create 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_create 返回了空句柄（违反 ABI 契约）');
     }
 
     /** @type {bigint} */
@@ -1184,24 +1299,14 @@ class TrayMenu {
     const trampoline = callback ? this.uda._registerTextCallback(callback) : null;
     const slot = this.uda._lib.outSlot(this.uda._types.uint64);
 
-    let status;
-    try {
-      status = this.uda._lib.trayMenuAddText(this.handle, label, trampoline, null, slot);
-    } catch (error) {
-      if (trampoline) {
-        this.uda._unregisterCallback(trampoline);
-      }
-      throw error;
-    }
-    this.uda._check(status, `uda_tray_menu_add_text(${label})`);
-
-    if (trampoline) {
-      this.keepalives.push(trampoline);
-    }
+    this._createRow(`uda_tray_menu_add_text(${label})`, trampoline, () =>
+      this.uda._lib.trayMenuAddText(this.handle, label, trampoline, null, slot)
+    );
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
-      throw new Error('uda_tray_menu_add_text 返回了空 item id（违反 ABI 契约）');
+      // 与空句柄同一纪律：契约被破坏归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_add_text 返回了空 item id（违反 ABI 契约）');
     }
     return itemId;
   }
@@ -1219,33 +1324,59 @@ class TrayMenu {
     const trampoline = callback ? this.uda._registerCheckboxCallback(callback) : null;
     const slot = this.uda._lib.outSlot(this.uda._types.uint64);
 
-    let status;
-    try {
-      status = this.uda._lib.trayMenuAddCheckbox(
+    this._createRow(`uda_tray_menu_add_checkbox(${label})`, trampoline, () =>
+      this.uda._lib.trayMenuAddCheckbox(
         this.handle,
         label,
         checked ? 1 : 0,
         trampoline,
         null,
         slot
-      );
-    } catch (error) {
-      if (trampoline) {
-        this.uda._unregisterCallback(trampoline);
-      }
-      throw error;
-    }
-    this.uda._check(status, `uda_tray_menu_add_checkbox(${label})`);
-
-    if (trampoline) {
-      this.keepalives.push(trampoline);
-    }
+      )
+    );
 
     const itemId = BigInt(this.uda._lib.readSlot(this.uda._types.uint64, slot));
     if (itemId === 0n) {
-      throw new Error('uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
+      // 与空句柄同一纪律：契约被破坏归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_menu_add_checkbox 返回了空 item id（违反 ABI 契约）');
     }
     return itemId;
+  }
+
+  /**
+   * 调用一个创建行的导出，并按结果决定蹦床的归属。
+   *
+   * 文本行与复选框行的所有权规则完全一致，因此集中在一处：
+   * - 导出返回非零（如空标签）或 koffi 抛异常 ⇒ 行未创建，蹦床必须立即反注册，
+   *   否则 koffi 回调槽位（上限 8192）永久占用；
+   * - 成功 ⇒ 行已创建、回调已被 C 侧持有，蹦床进保活列表，此后任何失败都不得
+   *   反注册（菜单还握着这个指针）。
+   *
+   * 状态码校验必须与调用同处一个 try，否则失败的蹦床会走上"没有异常"的路径。
+   *
+   * @param {string} action 用于错误消息的导出名。
+   * @param {object | null} trampoline 本次为行注册的蹦床；无回调时为 null。
+   * @param {() => number} createRow 实际调用导出的闭包。
+   * @private
+   */
+  _createRow(action, trampoline, createRow) {
+    try {
+      this.uda._check(createRow(), action);
+      if (trampoline) {
+        this.keepalives.push(trampoline);
+      }
+    } catch (error) {
+      // 失败路径（koffi 抛异常或导出返回非零）：行未创建，指针必须立即归还。
+      if (trampoline) {
+        try {
+          this.uda._unregisterCallback(trampoline);
+        } catch (cleanupError) {
+          // 清理失败不应掩盖原始错误。
+          console.error(`[UDA tray] 反注册菜单回调失败: ${cleanupError.message}`);
+        }
+      }
+      throw error;
+    }
   }
 
   /**
@@ -1263,14 +1394,30 @@ class TrayMenu {
 
   /**
    * 销毁菜单句柄。重复调用是安全的（第二次为空操作）。
+   *
+   * **destroy 之后菜单不可再被图标引用由 FFI 保证解除**：`uda_tray_menu_destroy`
+   * 会先把菜单从所有仍持有它的托盘图标上摘除、释放携带 C 函数指针的行闭包，
+   * 然后本方法才反注册 koffi 蹦床。顺序不能颠倒——koffi 的 unregister 会立即
+   * 释放回调槽位（总量上限 8192，释放后可能被后续注册复用），若图标仍持有菜单，
+   * 下一次点击就会调用已释放的槽位（use-after-free，表现为崩溃或误触发另一个
+   * JS 回调）。
+   *
+   * 手工验证"建菜单 → setMenu → destroy → 点击"场景（修复前必崩/误触发）：
+   * 1. `cargo build -p uda-ffi` 后运行一段脚本：`uda.createTrayMenu()` →
+   *    `menu.addText(...)` 挂回调 → `icon.setMenu(menu)` → 立刻 `menu.destroy()`；
+   * 2. 图标保留在托盘上，右键点开菜单并点击原先添加的行；
+   * 3. 预期：菜单已被解除（不再显示旧行），进程不崩溃、JS 回调不被触发。
    */
   destroy() {
     if (this.destroyed) {
       return;
     }
     this.destroyed = true;
-    // 先反注册蹦床，再销毁句柄：反注册只是丢弃我们自己持有的 C 函数指针，
-    // 而销毁句柄才会移除注册表记录。顺序反了会让悬空指针短暂留在菜单里。
+    // 先销毁句柄：FFI 侧把菜单从所有仍引用它的图标上解除，并释放持有 C 函数
+    // 指针的行闭包；此后不再有任何 C 代码能触达这些回调槽位。
+    this.uda._check(this.uda._lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
+    // 再反注册蹦床：槽位已无人可达，释放是安全的。destroy 失败时在此抛出、
+    // keepalives 原样保留——宁可泄漏槽位，也不把可能仍被引用的指针释放掉。
     for (const trampoline of this.keepalives) {
       try {
         this.uda._unregisterCallback(trampoline);
@@ -1279,7 +1426,6 @@ class TrayMenu {
       }
     }
     this.keepalives = [];
-    this.uda._check(this.uda._lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
   }
 
   /** @returns {void} */
@@ -1304,7 +1450,8 @@ class TrayIcon {
 
     const handle = BigInt(uda._lib.readSlot(uda._types.uint64, slot));
     if (handle === 0n) {
-      throw new Error('uda_tray_create 返回了空句柄（违反 ABI 契约）');
+      // 与 Python 侧一致：空句柄说明契约被破坏，归为内部错误（-5）。
+      throw new UdaError(ERR_INTERNAL, 'uda_tray_create 返回了空句柄（违反 ABI 契约）');
     }
 
     /** @type {bigint} */
@@ -1386,8 +1533,9 @@ class TrayIcon {
   /**
    * 挂载菜单，替换此前的菜单。
    *
-   * 菜单句柄在本调用之后依然有效：图标持有自己的引用，因此 `destroy()` 菜单是
-   * 可选的，且不会清空托盘已渲染的行。
+   * 图标持有自己的菜单引用，因此不 `destroy()` 也能一直用；反过来，`destroy()`
+   * 菜单时 FFI 会自动把它从所有仍引用它的图标上解除（托盘恢复为无菜单状态），
+   * 不会留下悬空的回调指针。
    *
    * @param {TrayMenu} menu 菜单。
    */
@@ -1443,6 +1591,16 @@ class TrayIcon {
 
 module.exports = {
   Uda,
+  UdaError,
+  // 状态码常量随 UdaError 一并导出：宿主按 `error.status === ERR_NOT_SUPPORTED`
+  // 分流时不必硬编码 -1/-2/-5（与 Python 侧 `from uda import ERR_*` 对齐）。
+  OK,
+  ERR_INVALID_ARGUMENT,
+  ERR_NOT_SUPPORTED,
+  ERR_DETECTION_FAILED,
+  ERR_IO,
+  ERR_INTERNAL,
+  ERR_PANIC,
   WakeLock,
   TrayIcon,
   TrayMenu,
