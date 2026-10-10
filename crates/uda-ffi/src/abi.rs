@@ -151,6 +151,178 @@ mod tests {
         assert_eq!(UDA_ERR_PANIC, -6);
     }
 
+    /// Pull the identifier after a marker out of one source/header line.
+    fn identifier_after(line: &str, marker: &str) -> Option<String> {
+        let start = line.find(marker)? + marker.len();
+        let rest = &line[start..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// The exported C-ABI names this crate's sources declare, gathered by
+    /// scanning `src/*.rs` the way the safety-classification gate does.
+    fn exported_names_from_sources() -> (Vec<String>, Vec<String>, Vec<String>) {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut functions = Vec::new();
+        let mut constants = Vec::new();
+        let mut callbacks = Vec::new();
+        let mut pending_no_mangle = false;
+
+        for entry in std::fs::read_dir(&src).expect("the crate's src directory") {
+            let path = entry.expect("src entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("readable Rust source");
+            for line in source.lines() {
+                if line.trim() == "#[no_mangle]" {
+                    pending_no_mangle = true;
+                    continue;
+                }
+                if pending_no_mangle {
+                    pending_no_mangle = false;
+                    if let Some(name) = identifier_after(line, " fn ") {
+                        functions.push(name);
+                    }
+                }
+                if let Some(name) = identifier_after(line, "pub const UDA_") {
+                    constants.push(format!("UDA_{name}"));
+                }
+                // Only abi.rs's `pub type` aliases are C callback typedefs;
+                // other files define Rust-side type aliases (error.rs's
+                // `UdaStatus`, say) that never reach the header.
+                let is_abi = path.file_name().and_then(|n| n.to_str()) == Some("abi.rs");
+                if is_abi {
+                    if let Some(name) = identifier_after(line, "pub type ") {
+                        callbacks.push(name);
+                    }
+                }
+            }
+        }
+        (functions, constants, callbacks)
+    }
+
+    #[test]
+    fn the_generated_header_declares_exactly_the_exported_symbols() {
+        // `gen-header.sh --check` pins the header's *content* against a fresh
+        // cbindgen run, but only inside CI; a plain `cargo test` must catch a
+        // Rust-side export whose header counterpart went missing (or a hand
+        // edit that invented one) without any script running. Sets compare in
+        // both directions: adding an export without regenerating fails here,
+        // and so does deleting one the header still declares.
+        let header_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../include/uda.h");
+        let header = std::fs::read_to_string(&header_path).expect(
+            "include/uda.h sits at the repository root; run the tests from a full checkout",
+        );
+
+        let mut header_defines = Vec::new();
+        let mut header_callbacks = Vec::new();
+        // Function declarations can wrap across lines, so the function scan
+        // runs over the header with every comment stripped (doc mentions like
+        // `uda_free_string()` must not count as declarations) instead of over
+        // individual lines.
+        let mut code = String::new();
+        let mut in_block_comment = false;
+        for line in header.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#define UDA_") {
+                if let Some(name) = identifier_after(trimmed, "#define ") {
+                    // The include guard is header plumbing, not an ABI item.
+                    if name != "UDA_H_" {
+                        header_defines.push(name);
+                    }
+                }
+            }
+            if trimmed.starts_with("typedef") {
+                if let Some(name) = identifier_after(trimmed, "(*") {
+                    header_callbacks.push(name);
+                }
+            }
+
+            let mut rest = trimmed;
+            if in_block_comment {
+                match rest.find("*/") {
+                    Some(end) => {
+                        in_block_comment = false;
+                        rest = &rest[end + 2..];
+                    }
+                    None => continue,
+                }
+            }
+            loop {
+                match rest.find("/*") {
+                    Some(start) => {
+                        code.push_str(&rest[..start]);
+                        let after = &rest[start + 2..];
+                        match after.find("*/") {
+                            Some(end) => rest = &after[end + 2..],
+                            None => {
+                                in_block_comment = true;
+                                break;
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(start) = rest.find("//") {
+                            code.push_str(&rest[..start]);
+                        } else {
+                            code.push_str(rest);
+                        }
+                        code.push('\n');
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Every `uda_name(` outside a comment is a declaration; the header
+        // contains no calls.
+        let mut header_functions = Vec::new();
+        let mut search_from = 0;
+        while let Some(found) = code[search_from..].find("uda_") {
+            let absolute = search_from + found;
+            if let Some(name) = identifier_after(&code[absolute..], "uda_") {
+                let after_identifier = code[absolute + 4 + name.len()..].trim_start();
+                if after_identifier.starts_with('(') {
+                    header_functions.push(format!("uda_{name}"));
+                }
+            }
+            search_from = absolute + 4;
+        }
+
+        let (mut functions, mut constants, mut callbacks) = exported_names_from_sources();
+        functions.sort();
+        constants.sort();
+        callbacks.sort();
+        header_functions.sort();
+        header_defines.sort();
+        header_callbacks.sort();
+
+        assert_eq!(
+            functions, header_functions,
+            "the header's function declarations and this crate's #[no_mangle] \
+             exports disagree; re-run scripts/gen-header.sh"
+        );
+        assert_eq!(
+            constants, header_defines,
+            "the header's UDA_* defines and abi.rs's pub constants disagree; \
+             re-run scripts/gen-header.sh"
+        );
+        assert_eq!(
+            callbacks, header_callbacks,
+            "the header's callback typedefs and abi.rs's pub types disagree; \
+             re-run scripts/gen-header.sh"
+        );
+    }
+
     #[test]
     fn capability_bits_are_distinct_powers_of_two() {
         let bits = [

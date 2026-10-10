@@ -67,7 +67,11 @@ if [ "$installed" != "$CBINDGEN_VERSION" ]; then
     echo "         Consider: cargo install cbindgen --locked --version ${CBINDGEN_VERSION}" >&2
 fi
 
-output="$(mktemp)"
+# Keep the scratch file inside the workspace (`.tmp/` is gitignored): a
+# `$TMPDIR` write can trip strict sandboxing setups, and every other throwaway
+# artifact in this repo lands in `.tmp/` too.
+mkdir -p "$ROOT/.tmp"
+output="$(mktemp "$ROOT/.tmp/uda-header.XXXXXX")"
 trap 'rm -f "$output"' EXIT
 
 # Resolve the crate through the workspace so the call works from any directory.

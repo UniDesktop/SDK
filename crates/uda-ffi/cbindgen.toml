@@ -51,10 +51,10 @@ header = """/*
  *
  * Every function returns an `int32_t` status code (`0` = success, negative
  * = failure) except `uda_free_string`, which returns nothing, and the two
- * string-returning helpers below. Human-readable diagnostics for the most
- * recent failure are available from `uda_last_error_message()`, and
- * `uda_status_message()` renders any status code without a second FFI
- * round-trip.
+ * string-returning helpers, `uda_last_error_message()` (human-readable
+ * diagnostics for the most recent failure on this thread) and
+ * `uda_status_message()` (renders any status code without a second FFI
+ * round-trip).
  *
  * Memory ownership
  * ----------------

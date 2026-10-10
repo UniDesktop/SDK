@@ -391,6 +391,15 @@ fn dict_get<'d>(
 pub(crate) fn metadata_from_dict(dictionary: &zbus::zvariant::Dict<'_, '_>) -> MediaMetadata {
     // `dict_get` hands back an owned `Value`; the field readers deref-friendly
     // signatures accept it directly, so no explicit borrow is needed.
+    //
+    // `title` / `artist` go through tolerant readers (`.map(...)`) because the
+    // MPRIS spec allows those keys to arrive as arrays (Chromium-family
+    // players have shipped `xesam:title` as one), so a present key must keep
+    // converting into `Some` even when the value shape varies. `album` is a
+    // single string per spec, so a present key with an unexpected type folds
+    // to `None` (`.and_then(...)`) - a wrongly-typed album is not a value
+    // worth coercing. This asymmetry is deliberate; keep the two paths
+    // distinct when touching the readers.
     let title = dict_get(dictionary, "xesam:title").map(title_from_value);
     let artist =
         dict_get(dictionary, "xesam:artist").map(|value| join_artists(&artists_from_value(value)));
