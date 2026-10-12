@@ -1,4 +1,5 @@
 use crate::error::UdaError;
+use std::collections::HashMap;
 use std::sync::Arc;
 use uda_core::capability::Capability;
 use uda_core::notification::{Notification, NotificationManager};
@@ -25,7 +26,7 @@ trait Notifications {
         summary: &str,
         body: &str,
         actions: Vec<String>,
-        hints: Vec<(String, zbus::zvariant::Value<'_>)>,
+        hints: HashMap<String, zbus::zvariant::Value<'_>>,
         expire_timeout: i32,
     ) -> zbus::Result<u32>;
 }
@@ -62,13 +63,13 @@ impl NotificationManager for LinuxNotificationManager {
 
         // The FreeDesktop spec transports urgency as a hint of type Byte.
         let urgency = notification.urgency as u8;
-        let hints: Vec<(String, zbus::zvariant::Value<'_>)> = if urgency > 0 {
-            vec![(
+        let hints: HashMap<String, zbus::zvariant::Value<'_>> = if urgency > 0 {
+            HashMap::from([(
                 "urgency".to_string(),
                 zbus::zvariant::Value::<'_>::from(urgency),
-            )]
+            )])
         } else {
-            Vec::new()
+            HashMap::new()
         };
 
         let notification_id = proxy
@@ -149,5 +150,79 @@ mod tests {
         let notification = Notification::default();
         let urgency = notification.urgency as u8;
         assert_eq!(urgency, 1);
+    }
+
+    /// The `hints` argument must reach the bus as the FreeDesktop `a{sv}`
+    /// dictionary. A `Vec<(String, Value)>` serialises as an array of structs
+    /// (`a(sv)`), which the daemon rejects as an unknown method. Declaring the
+    /// mock server's parameter as a map makes the bus itself reject the wrong
+    /// encoding, so this fails loudly if the type ever regresses.
+    ///
+    /// Requires an isolated bus (`scripts/test-linux-mock.sh` runs the suite
+    /// under `dbus-run-session`). On a live desktop the real notification daemon
+    /// already owns the name, so the test skips instead of fighting it.
+    #[tokio::test]
+    async fn send_transports_hints_as_a_dictionary() -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Mutex;
+        use zbus::fdo::{RequestNameFlags, RequestNameReply};
+
+        struct MockNotifications {
+            received: Arc<Mutex<Option<HashMap<String, zbus::zvariant::OwnedValue>>>>,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.Notifications")]
+        impl MockNotifications {
+            #[allow(non_snake_case, clippy::too_many_arguments)]
+            fn Notify(
+                &self,
+                _app_name: &str,
+                _replaces_id: u32,
+                _app_icon: &str,
+                _summary: &str,
+                _body: &str,
+                _actions: Vec<String>,
+                hints: HashMap<String, zbus::zvariant::OwnedValue>,
+                _expire_timeout: i32,
+            ) -> u32 {
+                *self.received.lock().unwrap() = Some(hints);
+                42
+            }
+        }
+
+        let server = zbus::Connection::session().await?;
+        let received = Arc::new(Mutex::new(None));
+        let mock = MockNotifications {
+            received: Arc::clone(&received),
+        };
+        server
+            .object_server()
+            .at("/org/freedesktop/Notifications", mock)
+            .await?;
+
+        match server
+            .request_name_with_flags(
+                "org.freedesktop.Notifications",
+                RequestNameFlags::DoNotQueue.into(),
+            )
+            .await
+        {
+            Ok(RequestNameReply::PrimaryOwner) => {}
+            // A live desktop daemon already owns the name (`NameTaken`).
+            _ => return Ok(()),
+        }
+
+        let manager = LinuxNotificationManager::new().await?;
+        // The default notification carries normal urgency, so the urgency hint
+        // is populated and must survive as a dictionary entry.
+        assert_eq!(manager.send(&Notification::default()).await?, 42);
+        let received = received.lock().unwrap();
+        let hints = received
+            .as_ref()
+            .expect("the mock server received the Notify call");
+        assert!(
+            hints.contains_key("urgency"),
+            "the urgency hint must arrive as a dictionary entry, got {hints:?}"
+        );
+        Ok(())
     }
 }
