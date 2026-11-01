@@ -23,6 +23,7 @@ use uda_core::tray::{TrayIcon, TrayIconConfig};
 use uda_core::wakelock::WakeLockType;
 use uda_core::wallpaper::{FillMode, WallpaperManager, WallpaperOptions};
 
+use crate::abi::{UDA_THEME_DARK, UDA_THEME_LIGHT, UDA_THEME_UNKNOWN};
 use crate::error::Failure;
 
 /// Opaque wake-lock handle handed to the caller.
@@ -75,14 +76,14 @@ pub(crate) fn accent_color() -> Option<RgbaColor> {
 /// Translate a [`Theme`] into the C ABI code.
 fn theme_code(theme: Theme) -> i32 {
     match theme {
-        Theme::Dark => 1,
-        Theme::Light => 2,
+        Theme::Dark => UDA_THEME_DARK,
+        Theme::Light => UDA_THEME_LIGHT,
         // Neither an "auto" preference nor an undeterminable one has a positive
         // answer in the C ABI, so both report `UDA_THEME_UNKNOWN`.
-        Theme::Auto | Theme::Unknown => 0,
+        Theme::Auto | Theme::Unknown => UDA_THEME_UNKNOWN,
         // `Theme` is `#[non_exhaustive]`: a future appearance maps to the
         // same "no positive answer" code instead of breaking this crate.
-        _ => 0,
+        _ => UDA_THEME_UNKNOWN,
     }
 }
 
@@ -201,6 +202,7 @@ struct UnsupportedBackend;
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 impl UnsupportedBackend {
+    /// cbindgen:ignore
     const REASON: &'static str = "no backend for this target";
 
     fn not_supported() -> UdaError {
@@ -258,11 +260,14 @@ mod tests {
 
     #[test]
     fn theme_codes_match_the_c_header() {
-        assert_eq!(theme_code(Theme::Dark), 1);
-        assert_eq!(theme_code(Theme::Light), 2);
+        // Verifies the mapping uses the ABI constants; the numeric values of
+        // those constants are pinned as literals in `abi.rs`, so renumbering one
+        // cannot pass by comparing a constant to itself.
+        assert_eq!(theme_code(Theme::Dark), UDA_THEME_DARK);
+        assert_eq!(theme_code(Theme::Light), UDA_THEME_LIGHT);
         // Neither "auto" nor "undeterminable" has a positive C representation.
-        assert_eq!(theme_code(Theme::Auto), 0);
-        assert_eq!(theme_code(Theme::Unknown), 0);
+        assert_eq!(theme_code(Theme::Auto), UDA_THEME_UNKNOWN);
+        assert_eq!(theme_code(Theme::Unknown), UDA_THEME_UNKNOWN);
     }
 
     #[test]

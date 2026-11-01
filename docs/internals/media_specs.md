@@ -70,15 +70,23 @@ org.freedesktop.DBus -> ListNames()
   毫秒会让一首 3 分钟的歌唱成 50 小时。
 - `xesam:title` 可能是 **数组**（Chromium 系历史上这么发过）。取首个元素即可，
   否则标题整段丢失。
-- 任何键都可能缺席（直播流、无元数据的本地文件）。缺席 == 空字符串，不是错误。
+- 任何键都可能缺席（直播流、无元数据的本地文件）。缺席映射为 `None`（C-ABI
+  上是 NULL），不是错误；已发布但为空的值保持空字符串，两者可区分。这一
+  可区分性**仅 Linux 成立**：Windows 章节的 SMTC 没有线上"未发布"标记，
+  空读取同样折叠为 `None`（见 §3.4）。
 - `mpris:length` <= 0 表示直播或未知时长，映射为 `None` 而不是 0。
 
 ### 2.4 错误分层
 
 `zbus` 调用失败要分开对待：`ServiceUnknown`（播放器刚好退出）与
 `UnknownProperty`（该播放器没实现那个属性）都是**可预期的竞态**，降级为
-`Ok(None)` 或该字段为空；只有连 session bus 都连不上才是
+`Ok(None)` 或该字段未发布（`None`）；只有连 session bus 都连不上才是
 `UdaError::DetectionFailed`。
+
+命令路径同理：MPRIS 方法返回错误回复是播放器**显式拒绝**（单曲队列上按
+Next 就是典型场景），映射为 `UdaError::NotSupported`（`player_refused`），
+C-ABI 上即 `UDA_ERR_NOT_SUPPORTED`（-2）；只有等待超时才映射为
+`UdaError::CommandFailed`（-5）。
 
 ## 3. Windows：WinRT SMTC
 
@@ -113,10 +121,10 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 | 成员 | 说明 |
 |---|---|
 | `TryGetMediaPropertiesAsync().get()` | `GlobalSystemMediaTransportControlsSessionMediaProperties` |
-| `.Title` / `.Artist` / `.AlbumTitle` | `HSTRING`，可能为空 |
+| `.Title` / `.Artist` / `.AlbumTitle` | `HSTRING`，可能为空；空读取折叠为 `None`（C-ABI 上是 NULL） |
 | `.Duration` | `TimeSpan`（100ns 单位），`Duration::zero()` 表示未知 |
 | `GetPlaybackInfo()?.PlaybackStatus()` | 会话级播放状态 |
-| `TryTogglePlayPauseAsync()` | 返回 `bool`：**false 表示被拒**，不是错误 |
+| `TryTogglePlayPauseAsync()` | 返回 `bool`：**false 表示被拒**（映射为 `UDA_ERR_NOT_SUPPORTED`，见 §3.4），不是错误 |
 | `TryPlayAsync()` / `TryPauseAsync()` / `TryStopAsync()` | 同上 |
 | `TrySkipNextAsync()` / `TrySkipPreviousAsync()` | 同上 |
 
@@ -126,9 +134,17 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
   写成 `/1_000_000` 会把 3 分钟算成 18 秒。
 - **`Duration` 为 0 不代表 0 毫秒**：SMTC 用 `TimeSpan::zero()` 表达"未知
   时长"，必须映射为 `None`。直播流、无时长信息的来源都会给 0。
+- **空串即"未发布"**：SMTC 线上没有"属性未设置"的标记，`published_or_none`
+  把空读取折叠为 `None`（C-ABI 上是 NULL）。Linux MPRIS 章节的
+  "已发布但为空保持空字符串"可区分性在 Windows 上因此**不成立**，宿主必须
+  两个平台统一把 NULL 当作"跳过该字段"。
 - **控制方法是 `Try*`**：返回 `false` 说明播放器拒绝（例如已暂停时再次
-  Pause）。这是正常语义，映射为 `Ok(())` 而非错误；只有 HRESULT 失败才是
-  `UdaError::Internal`。
+  Pause）。实现把 `Ok(false)` 映射为 `UdaError::NotSupported`（见
+  `crates/uda-platform-windows/src/media.rs` 的 `command_refused`），C-ABI 上
+  即 `UDA_ERR_NOT_SUPPORTED`（-2）；只有 `Try*Async()` / `.get()` 本身失败
+  （HRESULT 错误）才映射为 `UdaError::CommandFailed`（-5）。这与 Linux 侧
+  MPRIS 错误回复的映射一致，也兑现 `include/uda.h` 对"播放器拒绝"的承诺。
+  非 `UDA_OK` 只表示"未确认成功"（见 §4.1），调用方不得据此判定命令未送达。
 - **没有 JIT 属性**：所有 SMTC 调用都是 WinRT 异步，Rust 侧统一 `.get()` 同步
   等待，避免把 async 泄漏到 C-ABI。
 
@@ -139,10 +155,30 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 | 函数 | 出参 | 说明 |
 |---|---|---|
 | `uda_media_get_status(out_status: *mut i32)` | `0..3` 状态码 | 无会话时写 `3`（`Unknown`）并返回 `UDA_OK` |
-| `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms: *mut u64)` | 三个字符串 + 时长 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据时写 NULL；`out_duration_ms` 写 0 表示未知 |
-| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；播放器拒绝仍返回 `UDA_OK` |
+| `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms, out_position_ms: *mut u64)` | 三个字符串 + 时长/进度槽 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据或字段未发布时写 NULL；`out_duration_ms` 写 0 表示未知；仅 `out_position_ms` 允许传 `NULL` 跳过 |
+| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；无播放器可寻址或播放器拒绝（`Ok(false)`）返回 `UDA_ERR_NOT_SUPPORTED`（-2） |
 
-`out_title` 等三个指针都允许传 `NULL`，此时跳过该字段，方便只要歌名的调用方。
+`uda_media_send_command` 返回非 `UDA_OK` 只表示未确认成功。超时或通信失败时，
+播放器可能已经执行命令，返回码不能证明命令未送达；调用方不得盲目重试
+`Next` / `Toggle` 等重复执行会再次切歌或切换状态的命令。
+
+`out_title` / `out_artist` / `out_album` / `out_duration_ms` 四个出参指针必须非空（传 `NULL` 返回 `UDA_ERR_INVALID_ARGUMENT`）；未发布的字段以 NULL 指针（字符串）/ 0（数值）回填，而非空字符串。"已发布但为空保持空字符串"的可区分性仅 Linux 成立——Windows SMTC 线上没有"未发布"标记，空读取同样回填 NULL（§3.4），宿主在两个平台上都应把 NULL 当作"跳过该字段"。
+
+### 4.1 状态码语义
+
+- **没有播放器 / 状态不可读不是失败**：`uda_media_get_status()` 写
+  `UDA_MEDIA_UNKNOWN`（3）并返回 `UDA_OK`；`uda_media_get_metadata()` 以
+  NULL / 0 回填并返回 `UDA_OK`。二者都表示"后端回答了，只是现在没有内容"，
+  调用方不得当作错误重试。
+- **负值 = 后端不可达**：例如 Linux 连不上 session bus（
+  `UDA_ERR_DETECTION_FAILED`），或 Windows 取不到 SMTC session manager
+  （`UDA_ERR_NOT_SUPPORTED` / `UDA_ERR_DETECTION_FAILED`）。这与"没有播放器"
+  是两回事；负值时出参不被写入。
+- **命令拒绝**：已选中播放器后它显式拒绝命令（Linux 的 MPRIS 错误回复、
+  Windows 的 `Ok(false)`）返回 `UDA_ERR_NOT_SUPPORTED`（-2），不是
+  `UDA_ERR_DETECTION_FAILED`；传输层失败（D-Bus 超时、SMTC HRESULT 失败）
+  才是 `CommandFailed`（-5）。两种情况都是"未确认成功"，且都可能已经执行
+  命令，不得盲目重试。
 
 ## 5. 能力与降级
 
@@ -151,10 +187,16 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 答案**而非失败，调用方必须按"现在没在放"处理，与 AGENTS.md Principle 1
 （Never Panic）一致。
 
+`MediaMetadata::is_empty()` 的语义是"所有字符串字段都未发布（`None`）且两个
+数值字段都未知"，全空的快照归一化为 `Ok(None)`（C 侧即 NULL / 0）。已发布
+但为空的值是 `Some("")`，**不**满足该判定，在 Linux 上以空字符串而非 NULL
+出现在 C-ABI 上（§3.4）。
+
 ## 6. 测试基线
 
 - 元数据解析（数组拼接、单位换算、空字段）必须是纯函数，可在无 D-Bus /
-  无 WinRT 的 CI 里测——`docs/../crates/uda-platform-linux/src/media.rs` 的
-  `metadata_from_dbus` 与 `crates/uda-platform-windows/src/media.rs` 的
-  `duration_from_ticks` 都是为此设计的。
+  无 WinRT 的 CI 里测：`crates/uda-platform-linux/src/media.rs` 的
+  `metadata_from_dict` / `duration_from_micros` 与
+  `crates/uda-platform-windows/src/media.rs` 的 `milliseconds_from_ticks`
+  即为此而设。
 - 无播放器场景：`active_metadata()` == `Ok(None)`，不 panic、不 unwrap。

@@ -51,6 +51,7 @@ use uda_core::wakelock::{WakeLockGuard, WakeLockType};
 use crate::dispatch::WakeLockHandle;
 use crate::error::Failure;
 
+/// cbindgen:ignore
 /// Lifetime, in seconds, granted to a CLI-tier lock.
 ///
 /// `systemd-inhibit --mode=block` returns as soon as its child exits, so the
@@ -58,14 +59,21 @@ use crate::error::Failure;
 /// indefinite; the cap is documented on `uda_wakelock_acquire` (a success
 /// return writes no `uda_last_error_message`). The constant stays available on
 /// every target because the reaper's retirement log names it there too.
+///
+/// Implementation detail, not C-ABI surface: the `cbindgen:ignore` above keeps
+/// cbindgen from scanning (and warning about) a private constant it would
+/// otherwise visit.
+/// cbindgen:ignore
 const CLI_LOCK_SECONDS: u64 = 3600;
 
 /// Bound authorization and startup before exposing a CLI lock handle.
+/// cbindgen:ignore
 #[cfg(target_os = "linux")]
 const CLI_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // systemd-inhibit starts this command only after acquiring its inhibition FD.
 // The shell acknowledges that boundary, then becomes the bounded lock holder.
+/// cbindgen:ignore
 #[cfg(target_os = "linux")]
 const CLI_HOLDER: &str = "printf R; exec sleep \"$1\"";
 
@@ -409,7 +417,7 @@ fn register(handle: WakeLockHandle, entry: LockEntry) -> Result<WakeLockHandle, 
 /// while releasing; the remaining entries are then swept, which makes every
 /// release also reap CLI children that exited in the meantime. Releasing an
 /// unknown or already-released handle is reported as
-/// [`UDA_ERR_INVALID_ARGUMENT`](crate::error::UDA_ERR_INVALID_ARGUMENT): the
+/// [`UDA_ERR_INVALID_ARGUMENT`](crate::abi::UDA_ERR_INVALID_ARGUMENT): the
 /// caller passed a handle this process does not own.
 pub(crate) fn release(handle: WakeLockHandle) -> Result<(), Failure> {
     let raw = handle.raw();

@@ -58,14 +58,20 @@ impl PlaybackStatus {
 /// Every field is owned and pre-joined for display: an MPRIS `xesam:artist` is a
 /// list, but a UI wants one string, so the backend does the join and the struct
 /// stays free of the wire types.
+///
+/// A string field is `None` when the player does not publish it at all, and
+/// `Some("")` when the player publishes it as an empty string, so the two stay
+/// distinguishable all the way to the C-ABI (which hands out NULL versus an
+/// empty string). On Windows SMTC cannot tell an absent property from an empty
+/// one, so the Windows backend maps an empty read to `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaMetadata {
-    /// Track title. Empty when the player publishes none.
-    pub title: String,
-    /// Artist(s), already joined for display.
-    pub artist: String,
-    /// Album name.
-    pub album: String,
+    /// Track title; `None` when the player publishes none.
+    pub title: Option<String>,
+    /// Artist(s), already joined for display; `None` when unpublished.
+    pub artist: Option<String>,
+    /// Album name; `None` when unpublished.
+    pub album: Option<String>,
     /// Track length in milliseconds, or `None` when unknown or unbounded
     /// (a live stream).
     pub duration_ms: Option<u64>,
@@ -75,13 +81,16 @@ pub struct MediaMetadata {
 }
 
 impl MediaMetadata {
-    /// Whether this snapshot carries no usable information at all, turning "the
-    /// player answered but said nothing" into the same `Ok(None)` a host with no
-    /// player gets.
+    /// Whether this snapshot carries no usable information at all: every string
+    /// field is unpublished (`None`) and both numeric fields are unknown
+    /// (`None`). A field published as an empty string is published - `Some("")`
+    /// therefore keeps the snapshot non-empty - so this predicate must not be
+    /// read as "all values are blank". Used to turn an all-unpublished read into
+    /// the same `Ok(None)` a host with no player gets.
     pub fn is_empty(&self) -> bool {
-        self.title.is_empty()
-            && self.artist.is_empty()
-            && self.album.is_empty()
+        self.title.is_none()
+            && self.artist.is_none()
+            && self.album.is_none()
             && self.duration_ms.is_none()
             && self.position_ms.is_none()
     }
@@ -145,10 +154,25 @@ pub trait MediaManager {
     /// be read rather than an error.
     fn playback_status(&self) -> Result<PlaybackStatus, UdaError>;
 
-    /// Send `command` to the active player. A player that refuses the command
-    /// (pausing an already-paused stream, for instance) is still a successful
-    /// call: the platform cannot distinguish "declined" from "done", and an error
-    /// would make a normal toggle look like a failure.
+    /// Send `command` to the active player.
+    ///
+    /// Failures before any player is addressed keep their own types, so a
+    /// non-`Ok` result does not always mean "the player declined": no player to
+    /// address, a missing SMTC manager, or a manager acquisition await that
+    /// fails is [`UdaError::NotSupported`]; a Linux session-bus connection
+    /// failure or a Windows SMTC manager `RequestAsync` failure is
+    /// [`UdaError::DetectionFailed`]; and runtime/proxy setup can be
+    /// [`UdaError::Internal`].
+    ///
+    /// Once a player has been selected, an explicit refusal (an MPRIS error
+    /// reply, an SMTC `Try*Async()` returning `false`) is
+    /// [`UdaError::NotSupported`] - `include/uda.h` promises
+    /// `UDA_ERR_NOT_SUPPORTED` for a player that declines a command - while a
+    /// transport failure (a D-Bus timeout, a failed SMTC call) is
+    /// [`UdaError::CommandFailed`]. After a timeout or communication failure
+    /// the player may already have executed the command, so callers must treat
+    /// a non-`Ok` result as "success was not confirmed" rather than retrying
+    /// blindly. See `docs/internals/media_specs.md` §3.4.
     fn send_command(&self, command: MediaCommand) -> Result<(), UdaError>;
 
     /// The capabilities this platform's media backend can honour.
@@ -225,7 +249,20 @@ mod tests {
     #[test]
     fn a_title_alone_is_enough_to_be_non_empty() {
         let metadata = MediaMetadata {
-            title: "Song".to_string(),
+            title: Some("Song".to_string()),
+            ..MediaMetadata::default()
+        };
+        assert!(!metadata.is_empty());
+    }
+
+    #[test]
+    fn a_published_empty_title_is_published_not_empty() {
+        // `is_empty` asks "all fields unpublished", not "all values blank": a
+        // player that publishes an empty title has still published something.
+        // On Linux the C ABI keeps that distinction as an empty string vs NULL;
+        // Windows SMTC has no unpublished marker and folds empty reads to NULL.
+        let metadata = MediaMetadata {
+            title: Some(String::new()),
             ..MediaMetadata::default()
         };
         assert!(!metadata.is_empty());

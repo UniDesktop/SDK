@@ -189,28 +189,45 @@ fn command_refused(command: MediaCommand) -> UdaError {
 ///
 /// `Ok(None)` covers both "no session is playing" and "the session published no
 /// usable fields", so a caller cannot distinguish them - and does not need to,
-/// because neither is a failure.
+/// because neither is a failure. A property read that fails after the session
+/// was selected (the `TryGetMediaPropertiesAsync` request or its awaited
+/// result) also reports `Ok(None)`: the session stopped answering mid-call,
+/// which is a normal race rather than a backend failure.
+///
+/// These read-failure branches cannot be injected from a unit test - they need
+/// a live SMTC session that fails between selection and the read - so they are
+/// verified by inspection only; the tests below cover the pure mapping helpers.
 async fn active_metadata_async() -> Result<Option<MediaMetadata>, UdaError> {
     let Some(session) = WindowsMediaManager::current_session().await? else {
         return Ok(None);
     };
 
-    let properties = session
-        .TryGetMediaPropertiesAsync()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC media properties: {e}")))?
-        .get()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC media properties: {e}")))?;
+    let properties = match session.TryGetMediaPropertiesAsync() {
+        Ok(operation) => match operation.get() {
+            Ok(properties) => properties,
+            Err(e) => {
+                log::debug!(
+                    "SMTC media properties could not be read ({e}); treating as no metadata"
+                );
+                return Ok(None);
+            }
+        },
+        Err(e) => {
+            log::debug!(
+                "SMTC media properties could not be requested ({e}); treating as no metadata"
+            );
+            return Ok(None);
+        }
+    };
 
     // `Artist` is a single string on Windows (MPRIS publishes a list, which is
-    // joined on the Linux side); no post-processing is needed here.
-    let title = string_from_hstring(properties.Title());
-    let artist = string_from_hstring(properties.Artist());
-    let album = string_from_hstring(properties.AlbumTitle());
-
+    // joined on the Linux side); no post-processing is needed here. An absent
+    // property arrives as an empty string - the wire has no separate "unset"
+    // value - so an empty read maps to `None` ("not published").
     let mut metadata = MediaMetadata {
-        title,
-        artist,
-        album,
+        title: published_or_none(string_from_hstring(properties.Title())),
+        artist: published_or_none(string_from_hstring(properties.Artist())),
+        album: published_or_none(string_from_hstring(properties.AlbumTitle())),
         duration_ms: None,
         position_ms: None,
     };
@@ -236,6 +253,19 @@ fn string_from_hstring(value: windows::core::Result<windows::core::HSTRING>) -> 
         .unwrap_or_default()
 }
 
+/// Map an SMTC string property onto the core's published/unpublished model.
+///
+/// SMTC has no "unset" marker: a property the session does not publish reads
+/// back as an empty string, so empty is the wire's only spelling of "not
+/// published" and maps to `None`.
+fn published_or_none(text: String) -> Option<String> {
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
 /// Read the tick count of a timeline value, tolerating a failed read.
 ///
 /// A session that fails to publish a timeline value reports zero ticks, which
@@ -247,19 +277,36 @@ fn ticks_of(timespan: windows::core::Result<windows::Foundation::TimeSpan>) -> i
 /// Read the playback status of the current session.
 ///
 /// With no session the status is `Unknown` rather than `Stopped`: nothing is
-/// loaded, which is exactly what `Stopped` would claim to know.
+/// loaded, which is exactly what `Stopped` would claim to know. A selected
+/// session whose `GetPlaybackInfo()` or `PlaybackStatus()` read fails also
+/// reports `Unknown` with `Ok`: the session stopped answering mid-call, which
+/// is a normal race, not a backend failure. Those branches cannot be injected
+/// from a unit test without a live SMTC session that fails mid-read, so they
+/// are verified by inspection; the tests below cover `status_from_smtc`.
 async fn playback_status_async() -> Result<PlaybackStatus, UdaError> {
     let Some(session) = WindowsMediaManager::current_session().await? else {
         return Ok(PlaybackStatus::Unknown);
     };
 
-    let info = session
-        .GetPlaybackInfo()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC playback info: {e}")))?;
+    // A session that stops answering between the two calls has not published a
+    // readable state; report "cannot tell" (`Unknown`) with a successful call
+    // rather than turning a normal race into a failure. Only the absence of the
+    // SMTC backend itself (in `session_manager`) is `NotSupported`.
+    let info = match session.GetPlaybackInfo() {
+        Ok(info) => info,
+        Err(e) => {
+            log::debug!("SMTC playback info could not be read ({e}); reporting Unknown");
+            return Ok(PlaybackStatus::Unknown);
+        }
+    };
 
-    let status = info
-        .PlaybackStatus()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC playback status: {e}")))?;
+    let status = match info.PlaybackStatus() {
+        Ok(status) => status,
+        Err(e) => {
+            log::debug!("SMTC playback status could not be read ({e}); reporting Unknown");
+            return Ok(PlaybackStatus::Unknown);
+        }
+    };
 
     Ok(status_from_smtc(status))
 }
@@ -352,21 +399,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_command_with_no_session_to_address_is_an_error() {
-        // The asymmetry: a read has nothing to say, but a command has nothing to
-        // send *to*. Reporting success there would let a caller believe it paused
-        // something.
-        let outcome: Result<(), UdaError> = Err(UdaError::NotSupported(
-            "no media session is currently playing".to_string(),
-        ));
+    // No unit test covers the "no session to address" branch of
+    // `send_smtc_command`: exercising it needs a live SMTC manager, and on a
+    // machine with a player the call would execute the command instead of
+    // taking that branch. The branch itself is a direct
+    // `Err(UdaError::NotSupported(..))`; its contract is stated in the
+    // function's doc.
 
-        match outcome {
-            Err(UdaError::NotSupported(message)) => {
-                assert!(message.contains("no media session"), "message: {message}");
-            }
-            other => panic!("expected NotSupported, got {other:?}"),
-        }
+    #[test]
+    fn an_empty_smtc_property_reads_as_unpublished() {
+        // SMTC has no "unset" marker: a property the session does not publish
+        // reads back as an empty string, which must become `None` (NULL on the
+        // C ABI) rather than an empty string.
+        assert_eq!(published_or_none(String::new()), None);
+        assert_eq!(
+            published_or_none("Album".to_string()),
+            Some("Album".to_string())
+        );
     }
 
     #[test]

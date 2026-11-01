@@ -982,10 +982,13 @@ class Uda:
 
 
 def _decode_or_empty(pointer: ctypes.c_char_p) -> str:
-    """把库返回的 ``char *`` 解成 Python 字符串；``NULL`` 视为空串。
+    """把库返回的 ``char *`` 解成 Python 字符串；``NULL`` 与空串都得到空串。
 
-    媒体元数据的每个字段都是独立分配的可空指针：播放器没发布该字段（例如电台
-    流没有专辑）时是 ``NULL``，而不是空字符串。业务侧判断 ``if track.album``
+    媒体元数据的每个字段都是独立分配的可空指针，C-ABI 契约（见
+    ``docs/internals/media_specs.md``）区分两种情况：播放器没发布该字段（例如
+    电台流没有专辑）时是 ``NULL``；播放器发布了一个空值则是空 C 串。该区分
+    仅在 Linux 成立——Windows SMTC 线上没有"未发布"标记，空读取由库折叠成
+    ``NULL``——且本绑定把两者一并呈现为空串：业务侧判断 ``if track.album``
     即可，不必关心指针是否为空。
     """
     if not pointer.value:
@@ -1044,6 +1047,11 @@ class _MediaController:
     def now_playing(self) -> MediaTrack | None:
         """当前播放的曲目快照；没有播放器运行时返回 ``None``。
 
+        每个字段按 C-ABI 的 NULL/空串契约解码：未发布字段（``NULL``）与发布为
+        空的字段都表现为空串。三个字段都为空、时长与进度都是 0 的快照与"没有
+        播放器"在绑定层无法区分，因此也归一成 ``None``；只要进度非 0，返回的
+        就是真实的播放器快照。
+
         示例::
 
             track = uda.media.now_playing
@@ -1072,14 +1080,19 @@ class _MediaController:
             artist_text = _decode_or_empty(artist)
             album_text = _decode_or_empty(album)
 
-            # 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个
-            # NULL + 时长 0），SDK 必须同样归一成 None：否则调用方拿到一个空壳
-            # 对象，无法与"没有播放器"区分，示例里就会打印出一堆"(未发布)"。
+            # "无播放器"与"所有字段（含进度）都未发布"在库端都是三个 NULL +
+            # 时长/进度 0。播放器把每个字段都发布成空串时，库端会保留空 C 串
+            # 以便与 NULL 区分，但这仅 Linux 成立；Windows 上 SMTC 无法区分，
+            # 库端已折叠为 NULL。绑定层仍把"全空"归一成 None：示例只关心"有
+            # 没有可展示的元数据"，否则调用方拿到一个空壳对象，打印出一堆
+            # "(未发布)"；只有进度（position_ms）非 0 的快照仍是播放器快照，
+            # 不能因为标题等字段为空就判定为无播放器。
             if (
                 not title_text
                 and not artist_text
                 and not album_text
                 and duration.value == 0
+                and position.value == 0
             ):
                 return None
 
@@ -1116,8 +1129,13 @@ class _MediaController:
             command: :class:`MediaCommand` 常量之一。
 
         Raises:
-            UdaError: 指令名无法识别（状态码 -1），或没有播放器可接收、播放器
-                拒绝执行（状态码 -2）。
+            UdaError: 指令名无法识别（状态码 -1，``ERR_INVALID_ARGUMENT``）；
+                没有播放器可接收，或已选中的播放器明确拒绝执行（状态码 -2，
+                ``ERR_NOT_SUPPORTED``；Windows 上 SMTC 会话管理器不可用同样报
+                此码）；后端整体不可达——Linux 连不上 session bus，或 Windows 的
+                SMTC 管理器请求本身失败（状态码 -3，``ERR_DETECTION_FAILED``）；
+                已选中播放器后的传输失败，例如代理构建失败、调用超时或 WinRT
+                调用失败（状态码 -5，``ERR_INTERNAL``）。
         """
         try:
             code = _MEDIA_COMMAND_CODES[command]

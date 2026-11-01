@@ -951,8 +951,11 @@ class MediaController {
   /**
    * 当前播放的曲目快照。
    *
-   * 没有播放器运行时返回 `null`（而非抛错），某字段播放器未发布时是空串，例如电台流
-   * 通常没有专辑名。
+   * 没有播放器运行时返回 `null`（而非抛错）。每个字段按 C-ABI 的 NULL/空串契约
+   * 解码：未发布字段（`NULL`）与发布为空的字段都表现为空串，例如电台流通常没有
+   * 专辑名。三个字段都为空、时长与进度都是 0 的快照与"没有播放器"在绑定层无法
+   * 区分，因此也归一成 `null`；只要 `positionMs` 非 0，返回的就是真实的播放器
+   * 快照。
    *
    * @returns {{ title, artist, album, durationMs, positionMs } | null}
    */
@@ -976,6 +979,10 @@ class MediaController {
 
     // koffi 读 `char **out` 需要分两次调用：一次按 `char *` 解出字符串，一次按
     // `void *` 拿原始地址交给 `uda_free_string` 释放（与 _readWallpaper 同理）。
+    // `readSlot('char *')` 对 NULL 返回 null、对空 C 串返回 ''；库契约里前者是
+    // "未发布/无播放器"，后者是"已发布但为空"（仅 Linux 可区分，Windows 的空
+    // 读取由库折叠成 NULL）。绑定层把两者一并呈现为空串，因此用 `text ? … : ''`
+    // 不会丢掉任何下游可见的区别；`uda_free_string(NULL)` 是空操作，可无条件释放。
     const charSlotType = 'char *';
     const voidSlotType = 'void *';
     const readAndFree = (valueSlot) => {
@@ -993,10 +1000,13 @@ class MediaController {
     const durationMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, durationSlot));
     const positionMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, positionSlot));
 
-    // 库端已把"元数据全空"归一成与"无播放器"完全相同的返回值（三个 NULL +
-    // 时长 0），SDK 必须同样归一成 null：否则调用方拿到一个空壳对象，无法与
-    // "没有播放器"区分，示例里就会打印出一堆"(未发布)"。
-    if (!title && !artist && !album && durationMs === 0) {
+    // "无播放器"与"所有字段（含进度）都未发布"在库端都是三个 NULL + 时长/进度
+    // 0；播放器把每个字段都发布成空串时，库端会保留空 C 串以便与 NULL 区分，
+    // 但这仅 Linux 成立；Windows 上 SMTC 无法区分，库端已折叠为 NULL。绑定层
+    // 仍把"全空"归一成 null：示例只关心"有没有可展示的元数据"，否则调用方拿
+    // 到一个空壳对象，打印出一堆"(未发布)"；只有进度（positionMs）非 0 的快照
+    // 仍是播放器快照，不能因为标题等字段为空就判定为无播放器。
+    if (!title && !artist && !album && durationMs === 0 && positionMs === 0) {
       return null;
     }
 
@@ -1019,9 +1029,17 @@ class MediaController {
   /**
    * 发送一条播控指令。
    *
+   * 失败时抛出携带状态码的 `UdaError`：
+   * - `ERR_INVALID_ARGUMENT`（-1）：指令名无法识别，什么都没发送；
+   * - `ERR_NOT_SUPPORTED`（-2）：没有播放器可接收，或已选中的播放器明确拒绝
+   *   执行；Windows 上 SMTC 会话管理器不可用同样报此码；
+   * - `ERR_DETECTION_FAILED`（-3）：后端整体不可达——Linux 连不上 session bus，
+   *   Windows 的 SMTC 管理器请求本身失败；
+   * - `ERR_INTERNAL`（-5）：已选中播放器后的传输失败，例如代理构建失败、调用
+   *   超时或 WinRT 调用失败。
+   *
    * @param {'play' | 'pause' | 'toggle' | 'next' | 'previous' | 'stop'} command
-   * @throws {UdaError} 指令名无法识别（-1），或没有播放器可接收、播放器拒绝
-   *   执行（-2）。
+   * @throws {UdaError} 见上，状态码取自 `err.status`。
    */
   send(command) {
     const code = MEDIA_COMMAND_CODES[command];

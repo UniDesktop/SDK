@@ -58,20 +58,20 @@ use uda_core::tray::{
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 use uda_core::tray::TrayManager as _;
 
+use crate::abi::{
+    UdaTrayCheckboxCallback, UdaTrayTextCallback, UDA_TRAY_SUPPORT_LEVEL_FULL,
+    UDA_TRAY_SUPPORT_LEVEL_NONE, UDA_TRAY_SUPPORT_LEVEL_PARTIAL,
+};
+// The capability bits are part of the header, so their literal values live in
+// `crate::abi`; this module only consumes them, and only in tests.
+#[cfg(test)]
+use crate::abi::{
+    DOCUMENTED_TRAY_CAPABILITIES, UDA_TRAY_CAP_CHECKBOX, UDA_TRAY_CAP_CLICK,
+    UDA_TRAY_CAP_CONTEXT_MENU, UDA_TRAY_CAP_DOUBLE_CLICK, UDA_TRAY_CAP_DYNAMIC_MENU,
+    UDA_TRAY_CAP_ICON, UDA_TRAY_CAP_SYSTEM_TRAY, UDA_TRAY_CAP_TOOLTIP,
+};
 use crate::dispatch;
 use crate::error::Failure;
-
-/// Raw C callback invoked when a plain text row is activated.
-///
-/// Arguments are the row's item id as returned by `uda_tray_menu_add_text` and
-/// the `user_data` pointer registered alongside it.
-pub type TextCallback = extern "C" fn(u64, *mut c_void);
-
-/// Raw C callback invoked when a checkbox row is toggled.
-///
-/// Arguments are the row's item id, the **new** checked state (`0` or `1`) after
-/// the toggle has been applied, and the `user_data` pointer.
-pub type CheckboxCallback = extern "C" fn(u64, i32, *mut c_void);
 
 /// A `*mut c_void` opaque payload that may cross a thread boundary.
 ///
@@ -99,59 +99,6 @@ impl SendVoidPtr {
         self.0
     }
 }
-
-/// Capability bit: a tray backend exists at all (`SYSTEM_TRAY` in `uda-core`).
-pub const UDA_TRAY_CAP_SYSTEM_TRAY: u32 = 1 << 7;
-/// Capability bit: the icon can be shown, hidden and swapped at runtime.
-pub const UDA_TRAY_CAP_ICON: u32 = 1 << 8;
-/// Capability bit: the tray exposes hover text.
-pub const UDA_TRAY_CAP_TOOLTIP: u32 = 1 << 9;
-/// Capability bit: the tray reports a single primary click.
-///
-/// Reserved: the C ABI has no click-callback registration, so
-/// `uda_tray_capabilities` always clears this bit. It stays defined for a
-/// future click API; do not infer click events from the bitmask today.
-pub const UDA_TRAY_CAP_CLICK: u32 = 1 << 10;
-/// Capability bit: the tray reports a native double click (never true on Linux
-/// SNI, where it would have to be synthesised).
-///
-/// Reserved for the same reason as [`UDA_TRAY_CAP_CLICK`]: the C ABI cannot
-/// register a click callback, so `uda_tray_capabilities` always clears it.
-pub const UDA_TRAY_CAP_DOUBLE_CLICK: u32 = 1 << 11;
-/// Capability bit: the tray exposes a context menu.
-pub const UDA_TRAY_CAP_CONTEXT_MENU: u32 = 1 << 12;
-/// Capability bit: menu rows can render a checkbox state.
-pub const UDA_TRAY_CAP_CHECKBOX: u32 = 1 << 13;
-/// Capability bit: menu rows can be added at runtime; the C ABI does not
-/// expose removal or relabelling (the Rust core supports both).
-pub const UDA_TRAY_CAP_DYNAMIC_MENU: u32 = 1 << 14;
-
-/// Support-level code: the backend never claimed a tray at all.
-///
-/// Unreachable through handles `uda_tray_create` handed out - every created
-/// icon publishes the backend's capability set - but the mapping stays total,
-/// so a fabricated or half-registered icon cannot be read as healthy.
-pub const UDA_TRAY_SUPPORT_LEVEL_NONE: i32 = 0;
-/// Support-level code: the icon is live, but registration recorded a
-/// degradation (on Linux: no `StatusNotifierWatcher`, so the shell may never
-/// display the item). `uda_tray_support_reason` explains it.
-pub const UDA_TRAY_SUPPORT_LEVEL_PARTIAL: i32 = 1;
-/// Support-level code: the icon is live and nothing degraded.
-pub const UDA_TRAY_SUPPORT_LEVEL_FULL: i32 = 2;
-
-/// Every tray capability bit the C ABI documents.
-///
-/// Used by the drift tests in this module and in [`crate::tests`], so the list
-/// exists once.
-#[cfg(test)]
-pub(crate) const DOCUMENTED_TRAY_CAPABILITIES: u32 = UDA_TRAY_CAP_SYSTEM_TRAY
-    | UDA_TRAY_CAP_ICON
-    | UDA_TRAY_CAP_TOOLTIP
-    | UDA_TRAY_CAP_CLICK
-    | UDA_TRAY_CAP_DOUBLE_CLICK
-    | UDA_TRAY_CAP_CONTEXT_MENU
-    | UDA_TRAY_CAP_CHECKBOX
-    | UDA_TRAY_CAP_DYNAMIC_MENU;
 
 /// The tray features the active platform backend advertises, as a bitmask.
 ///
@@ -542,6 +489,27 @@ pub(crate) fn set_icon_rgba(
             "`data` must not be null".to_string(),
         ));
     }
+    // Validate the geometry here so a malformed icon is an invalid-argument
+    // status (-1) rather than the "not supported" (-2) that uda-core's
+    // TrayIcon::set_icon would return: the caller violated the contract, the
+    // platform is fine. These checks mirror
+    // `TrayIconSource::validate` in uda-core, which re-validates before the OS
+    // sees any pixels, so the two copies must stay in sync; the duplication is
+    // deliberate (this one owns the -1 vs -2 status and the message), not an
+    // oversight to refactor away.
+    if width == 0 || height == 0 {
+        return Err(Failure::InvalidArgument(
+            "icon width and height must both be non-zero".to_string(),
+        ));
+    }
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| Failure::InvalidArgument("icon width * 4 overflows".to_string()))?;
+    if stride < row_bytes {
+        return Err(Failure::InvalidArgument(format!(
+            "icon stride is smaller than width * 4: {stride} < {row_bytes} bytes"
+        )));
+    }
     let needed = stride
         .checked_mul(height)
         .ok_or_else(|| Failure::InvalidArgument("icon stride * height overflows".to_string()))?
@@ -605,7 +573,7 @@ pub(crate) fn create_menu() -> Result<u64, Failure> {
 pub(crate) fn menu_add_text(
     menu_handle: u64,
     label: &str,
-    callback: Option<TextCallback>,
+    callback: UdaTrayTextCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let (menu, callbacks) = TrayRegistry::global().menu(menu_handle)?;
@@ -685,7 +653,7 @@ pub(crate) fn menu_add_checkbox(
     menu_handle: u64,
     label: &str,
     checked: bool,
-    callback: Option<CheckboxCallback>,
+    callback: UdaTrayCheckboxCallback,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let (menu, callbacks) = TrayRegistry::global().menu(menu_handle)?;
@@ -819,7 +787,7 @@ mod tests {
     fn registry_text(
         menu: u64,
         label: &str,
-        callback: Option<TextCallback>,
+        callback: UdaTrayTextCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_text(menu, label, callback, user_data)
@@ -830,7 +798,7 @@ mod tests {
         menu: u64,
         label: &str,
         checked: bool,
-        callback: Option<CheckboxCallback>,
+        callback: UdaTrayCheckboxCallback,
         user_data: *mut c_void,
     ) -> Result<u64, Failure> {
         menu_add_checkbox(menu, label, checked, callback, user_data)
@@ -1062,6 +1030,36 @@ mod tests {
             menu_add_separator(menu).is_err(),
             "a destroyed menu must reject further rows"
         );
+    }
+
+    #[test]
+    fn malformed_icon_geometry_is_rejected_as_invalid_argument() {
+        let _guard = registry_guard();
+        let pixels = [0u8; 16];
+        // Handle 0 would also be rejected as an unknown handle with the same
+        // `InvalidArgument` status, so checking the status alone would pass
+        // even if the geometry checks never ran. Each case therefore also pins
+        // the geometry-specific fragment of the message, which the
+        // unknown-handle path cannot produce.
+        for (width, height, stride, len, fragment) in [
+            (0, 1, 4, 16, "width and height"),  // zero width
+            (1, 0, 4, 16, "width and height"),  // zero height
+            (2, 1, 4, 16, "stride is smaller"), // stride < width * 4
+            (1, 1, 4, 3, "shorter than"),       // len < stride * height
+        ] {
+            let result = set_icon_rgba(0, width, height, stride, pixels.as_ptr(), len);
+            let failure = result.expect_err("malformed icon geometry must be rejected");
+            assert!(
+                matches!(&failure, Failure::InvalidArgument(_)),
+                "({width}x{height}, stride {stride}, len {len}) must be invalid: {failure:?}"
+            );
+            assert!(
+                failure.message().contains(fragment),
+                "({width}x{height}, stride {stride}, len {len}) must fail the geometry check \
+                 ({fragment:?}), not some other validation; got: {}",
+                failure.message()
+            );
+        }
     }
 
     #[test]
